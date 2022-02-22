@@ -1,5 +1,5 @@
 [package]
-name = "GaugeTheoryMC"
+name = "gaugemc"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,8 +7,8 @@ edition = "2021"
 
 [dependencies]
 rayon = ">=1.5"
-rand = ">=0.8"
 num-traits = ">=0.2"
+ndarray-rand = ">=0.14"
 
 [dependencies.ndarray]
 version = ">= 0.13"
