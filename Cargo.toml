@@ -3,12 +3,19 @@ name = "gaugemc"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["gpu"]
+gpu = ["wgpu", "bytemuck", "pollster", "log", "env_logger"]
 
 [dependencies]
 rayon = ">=1.5"
 num-traits = ">=0.2"
 ndarray-rand = ">=0.14"
+wgpu = {version="^0.12", optional=true}
+bytemuck = { version = "^1.7", features = [ "derive" ],optional=true }
+pollster = {version="^0.2",optional=true }
+log = {version="0.4",optional=true }
+env_logger = {version="0.7",optional=true }
 
 [dependencies.ndarray]
 version = ">= 0.13"
