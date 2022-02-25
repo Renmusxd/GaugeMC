@@ -1,26 +1,31 @@
 use gaugemc;
-use gaugemc::Dimension;
+use gaugemc::{Dimension, NDDualGraph};
 use log;
 use num_traits::Zero;
 
 fn main() {
     env_logger::init();
-    let (t, x, y, z) = (2, 2, 2, 2);
+    let (t, x, y, z) = (16, 16, 16, 16);
     let mut state = pollster::block_on(gaugemc::GPUBackend::new_async(
         t,
         x,
         y,
         z,
-        vec![0.0, 1.0, 4.0, 9.0],
+        (0..20u32)
+            .map(|i| f32::from(u16::try_from(i.pow(2)).unwrap()))
+            .collect(),
+        None,
     ));
-    state.run_local_sweep(
-        &[Dimension::T, Dimension::X, Dimension::Y],
-        Dimension::Z,
-        false,
-    );
+    for _ in 0..100 {
+        NDDualGraph::get_cube_dim_and_offset_iterator().for_each(|(dims, offset)| {
+            let leftover = NDDualGraph::get_leftover_dim(&dims);
+            state.run_local_sweep(&dims, leftover, offset);
+        })
+    }
     let read_state = state.get_state();
     for (i, s) in read_state
-        .into_iter()
+        .iter()
+        .cloned()
         .enumerate()
         .filter(|(_, c)| !c.is_zero())
     {
@@ -39,4 +44,9 @@ fn main() {
             s
         );
     }
+    println!(
+        "{}/{}",
+        read_state.iter().cloned().filter(|c| !c.is_zero()).count(),
+        read_state.len()
+    );
 }

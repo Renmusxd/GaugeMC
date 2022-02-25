@@ -1,5 +1,7 @@
 use crate::{Dimension, SiteIndex};
 use bytemuck;
+use ndarray_rand::rand::rngs::SmallRng;
+use ndarray_rand::rand::{Rng, SeedableRng};
 use std::borrow::Cow;
 use wgpu;
 use wgpu::util::DeviceExt;
@@ -10,6 +12,7 @@ pub struct GPUBackend {
     queue: wgpu::Queue,
     state_buffer: wgpu::Buffer,
     vn_buffer: wgpu::Buffer,
+    pcgstate_buffer: wgpu::Buffer,
     localupdate: LocalUpdatePipeline,
 }
 
@@ -20,7 +23,14 @@ struct LocalUpdatePipeline {
 }
 
 impl GPUBackend {
-    pub async fn new_async(t: usize, x: usize, y: usize, z: usize, vn: Vec<f32>) -> Self {
+    pub async fn new_async(
+        t: usize,
+        x: usize,
+        y: usize,
+        z: usize,
+        vn: Vec<f32>,
+        seed: Option<u64>,
+    ) -> Self {
         let bounds = SiteIndex { t, x, y, z };
         let n_faces = t * x * y * z * 6;
 
@@ -89,6 +99,18 @@ impl GPUBackend {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                ((n_faces / 2) * int_size) as _,
+                            ),
+                        },
+                        count: None,
+                    },
                 ],
                 label: None,
             });
@@ -122,6 +144,17 @@ impl GPUBackend {
             contents: bytemuck::cast_slice(&vec![0_u32; 9]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        let mut rng = if let Some(seed) = seed {
+            SmallRng::seed_from_u64(seed)
+        } else {
+            SmallRng::from_entropy()
+        };
+        let contents = (0..n_faces / 2).map(|_| rng.gen()).collect::<Vec<u32>>();
+        let pcgstate_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("PCG Buffer"),
+            contents: bytemuck::cast_slice(&contents),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         // create two bind groups, one for each buffer as the src
         // where the alternate buffer is used as the dst
@@ -135,11 +168,15 @@ impl GPUBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: index_buffer.as_entire_binding(),
+                    resource: vn_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: index_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pcgstate_buffer.as_entire_binding(),
                 },
             ],
             label: None,
@@ -151,6 +188,7 @@ impl GPUBackend {
             queue,
             state_buffer,
             vn_buffer,
+            pcgstate_buffer,
             localupdate: LocalUpdatePipeline {
                 index_buffer,
                 localupdate_pipeline,
@@ -192,8 +230,14 @@ impl GPUBackend {
                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             cpass.set_pipeline(&self.localupdate.localupdate_pipeline);
             cpass.set_bind_group(0, &self.localupdate.bindgroup, &[]);
-            // cpass.dispatch(rho * mu * nu * (sigma / 2), 1, 1);
-            cpass.dispatch(1, 1, 1);
+
+            let nneeded = rho * mu * nu * (sigma / 2);
+            let ndispatch = if nneeded % 256 == 0 {
+                nneeded / 256
+            } else {
+                nneeded / 256 + 1
+            };
+            cpass.dispatch(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
 
