@@ -1,6 +1,5 @@
 use crate::dualgraph::Sign::Negative;
 use ndarray::{Array4, Array5};
-use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::Rng;
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::{rand, RandomExt};
