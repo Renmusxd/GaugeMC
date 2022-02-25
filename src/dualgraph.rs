@@ -1,8 +1,9 @@
 use crate::dualgraph::Sign::Negative;
 use ndarray::{Array4, Array5};
+use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::Rng;
 use ndarray_rand::rand_distr::Uniform;
-use ndarray_rand::RandomExt;
+use ndarray_rand::{rand, RandomExt};
 use num_traits::float::Float;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -192,7 +193,7 @@ impl NDDualGraph {
                 self.currents.remove(&(site, second));
             }
 
-            assert_eq!(self.get_edges_with_violations(), vec![]);
+            debug_assert_eq!(self.get_edges_with_violations(), vec![]);
         }
     }
 
@@ -322,7 +323,7 @@ impl NDDualGraph {
         poss[1] = negs[1].clone();
         negs[1] = t;
 
-        assert_ne!(poss, negs);
+        debug_assert_ne!(poss, negs);
         (poss, negs)
     }
 
@@ -459,10 +460,10 @@ impl NDDualGraph {
             );
 
             let cube_bounds = Self::get_cube_update_shape(bounds, dims, leftover);
-            assert!(cube_index.0 < cube_bounds.0);
-            assert!(cube_index.1 < cube_bounds.1);
-            assert!(cube_index.2 < cube_bounds.2);
-            assert!(cube_index.3 < cube_bounds.3);
+            debug_assert!(cube_index.0 < cube_bounds.0);
+            debug_assert!(cube_index.1 < cube_bounds.1);
+            debug_assert!(cube_index.2 < cube_bounds.2);
+            debug_assert!(cube_index.3 < cube_bounds.3);
 
             // Now we know the cube location, time to lookup.
             // Only nontrivial value is the collapsed dimension, which is 2*x + 0/1
@@ -516,7 +517,7 @@ impl NDDualGraph {
         self.bounds.clone()
     }
 
-    fn update_cubes_for_dim<R>(&mut self, dims: &[Dimension; 3], offset: bool, rng: &mut R)
+    fn update_cubes_for_dim<R>(&mut self, dims: &[Dimension; 3], offset: bool, rng: Option<&mut R>)
     where
         R: Rng,
     {
@@ -527,20 +528,34 @@ impl NDDualGraph {
         let leftover = Self::get_leftover_dim(dims);
         let shape = Self::get_cube_update_shape(&self.bounds, dims, leftover);
         let mut cube_choices = Array4::<i32>::zeros(shape);
-        let rands = Array4::random_using(shape, Uniform::new(0.0, 1.0), rng);
 
-        // Pick all cube deltas.
-        cube_choices
-            .indexed_iter_mut()
-            .par_bridge()
-            .for_each(|((rho, mu, nu, sigma), c)| {
-                let rand_num = rands[(rho, mu, nu, sigma)];
-                let cube_choice =
-                    self.get_cube_choice([rho, mu, nu, sigma], dims, leftover, off, rand_num);
-                if let Some(delta) = cube_choice {
-                    *c = delta;
-                }
-            });
+        // Pick all cube deltas, either using a single rng or a thread specific one
+        if let Some(rng) = rng {
+            let rands = Array4::random_using(shape, Uniform::new(0.0, 1.0), rng);
+            cube_choices
+                .indexed_iter_mut()
+                .par_bridge()
+                .for_each(|((rho, mu, nu, sigma), c)| {
+                    let rand_num = rands[(rho, mu, nu, sigma)];
+                    let cube_choice =
+                        self.get_cube_choice([rho, mu, nu, sigma], dims, leftover, off, rand_num);
+                    if let Some(delta) = cube_choice {
+                        *c = delta;
+                    }
+                });
+        } else {
+            cube_choices
+                .indexed_iter_mut()
+                .par_bridge()
+                .for_each(|((rho, mu, nu, sigma), c)| {
+                    let rand_num = rand::thread_rng().gen();
+                    let cube_choice =
+                        self.get_cube_choice([rho, mu, nu, sigma], dims, leftover, off, rand_num);
+                    if let Some(delta) = cube_choice {
+                        *c = delta;
+                    }
+                });
+        }
 
         // Apply all cube deltas.
         Self::apply_cube_updates(
@@ -553,7 +568,7 @@ impl NDDualGraph {
         );
 
         // Debug check that no edges have violations.
-        assert_eq!(self.get_edges_with_violations(), vec![]);
+        debug_assert_eq!(self.get_edges_with_violations(), vec![]);
     }
 
     pub fn get_cube_dim_iterator() -> impl Iterator<Item = [Dimension; 3]> {
@@ -582,10 +597,15 @@ impl NDDualGraph {
         Self::get_cube_dim_iterator().flat_map(|d| [(d, false), (d, true)])
     }
 
-    pub fn local_update_sweep<R: Rng>(&mut self, rng: &mut R) {
+    pub fn local_update_sweep<R: Rng>(&mut self, rng: Option<&mut R>) {
         // Go through all possible cube
-        Self::get_cube_dim_and_offset_iterator()
-            .for_each(|(dims, offset)| self.update_cubes_for_dim(&dims, offset, rng));
+        if let Some(rng) = rng {
+            Self::get_cube_dim_and_offset_iterator()
+                .for_each(|(dims, offset)| self.update_cubes_for_dim(&dims, offset, Some(rng)));
+        } else {
+            Self::get_cube_dim_and_offset_iterator()
+                .for_each(|(dims, offset)| self.update_cubes_for_dim::<R>(&dims, offset, None));
+        }
     }
 
     pub fn clone_graph(&self) -> Array5<i32> {
