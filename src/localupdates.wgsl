@@ -194,12 +194,14 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let sub_one_p = exp(-sub_one_dv);
 
     pcgstate.state[global_id.x] = pcg_hash(pcgstate.state[global_id.x]);
+    // u32 to i32, cast to f32 and divide by 2^31, then shift to 0-1
     let random_float: f32 = f32(i32(pcgstate.state[global_id.x])) * 2.32830643653869628906e-010 + 0.5;
     let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
 
     if (random_float < 0.0) {
         return;
     }
+
     // select(t,f,condition)
     let choice = select(-1, 1, random_float < add_one_p);
     let index = pos_indices[0];

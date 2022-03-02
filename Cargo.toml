@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["gpu"]
-gpu = ["wgpu", "bytemuck", "pollster", "log", "env_logger"]
+default = []
+gpu-wgpu = ["wgpu", "bytemuck", "pollster", "log", "env_logger"]
 
 [dependencies]
 rayon = ">=1.5"
