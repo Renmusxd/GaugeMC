@@ -607,6 +607,76 @@ impl NDDualGraph {
         }
     }
 
+    pub fn global_update_sweep<R: Rng>(&mut self, rng: Option<&mut R>) {
+        // We can update all planes at once, nothing overlaps.
+        // There are 6 planar dims, for each the number of planes is the product of remaining two
+        // dimensions: # = y*z + x*z + x*y + t*z + t*y + t*x
+        //               = t*(x+y+z) + x*(y+z) + y*z
+        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let tnums = t * (x + y + z);
+        let xnums = x * (y + z);
+        let yz = y * z;
+        let num_planes = tnums + xnums + yz;
+        (0..num_planes).into_par_iter().for_each(|plane| {
+            let (plane_dims, remaining_dims, mu, nu) = match plane {
+                p if p < t * x => (
+                    [Dimension::Y, Dimension::Z],
+                    [Dimension::T, Dimension::X],
+                    p / x,
+                    p % x,
+                ),
+                p if p < t * (x + y) => {
+                    let p = p - t * x;
+                    (
+                        [Dimension::X, Dimension::Z],
+                        [Dimension::T, Dimension::Y],
+                        p / y,
+                        p % y,
+                    )
+                }
+                p if p < tnums => {
+                    let p = p - t * (x + y);
+                    (
+                        [Dimension::X, Dimension::Y],
+                        [Dimension::T, Dimension::Z],
+                        p / z,
+                        p % z,
+                    )
+                }
+                p if p < tnums + x * y => {
+                    let p = p - tnums;
+                    (
+                        [Dimension::T, Dimension::Z],
+                        [Dimension::X, Dimension::Y],
+                        p / y,
+                        p % y,
+                    )
+                }
+                p if p < tnums + x * (y + z) => {
+                    let p = p - (tnums + x * y);
+                    (
+                        [Dimension::T, Dimension::Y],
+                        [Dimension::X, Dimension::Z],
+                        p / z,
+                        p % z,
+                    )
+                }
+                p => {
+                    let p = p - (tnums + xnums);
+                    (
+                        [Dimension::T, Dimension::X],
+                        [Dimension::Y, Dimension::Z],
+                        p / z,
+                        p % z,
+                    )
+                }
+            };
+            let p = Self::dim_dim_to_plaquette_subindex(plane_dims[0], plane_dims[1]);
+            // TODO iterate over plaquettes in plane (mu, nu, [p])
+            // sum up energy costs for +1 and -1, then decide fate.
+        });
+    }
+
     pub fn clone_graph(&self) -> Array5<i32> {
         self.np.clone()
     }
