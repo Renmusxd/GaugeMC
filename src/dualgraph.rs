@@ -606,7 +606,124 @@ impl NDDualGraph {
         }
     }
 
-    pub fn global_update_sweep<R: Rng>(&mut self, rng: Option<&mut R>) {
+    pub fn num_planes(&self) -> usize {
+        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let tnums = t * (x + y + z);
+        let xnums = x * (y + z);
+        tnums + xnums + y * z
+    }
+
+    pub fn apply_global_updates<T>(&mut self, choices: &[T])
+    where
+        T: Into<i32> + Send + Sync + Clone,
+    {
+        let (bt, bx, by, bz) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let tnums = bt * (bx + by + bz);
+        let xnums = bx * (by + bz);
+        debug_assert_eq!(choices.len(), self.num_planes());
+        self.np
+            .indexed_iter_mut()
+            .par_bridge()
+            .for_each(|((t, x, y, z, p), n)| {
+                let indx = match p {
+                    0 => {
+                        // base index is: t(x+y+z) + x(y+z)
+                        let base = tnums + xnums;
+                        base + y * bz + z
+                    }
+                    1 => {
+                        let base = tnums + bx * by;
+                        base + x * bz + z
+                    }
+                    2 => {
+                        let base = tnums;
+                        base + x * by + y
+                    }
+                    3 => {
+                        let base = bt * (bx + by);
+                        base + t * bz + z
+                    }
+                    4 => {
+                        let base = bt * bx;
+                        base + t * by + y
+                    }
+                    5 => t * bx + x,
+                    _ => unreachable!(),
+                };
+                *n += choices[indx].clone().into();
+            });
+    }
+
+    pub fn get_global_plane_energies(&self, plane: usize) -> (f64, f64) {
+        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let tnums = t * (x + y + z);
+        let xnums = x * (y + z);
+        let (plane_dims, mu, nu) = match plane {
+            p if p < t * x => (
+                [Dimension::Y, Dimension::Z], // Remaining [Dimension::T, Dimension::X],
+                p / x,
+                p % x,
+            ),
+            p if p < t * (x + y) => {
+                let p = p - t * x;
+                (
+                    [Dimension::X, Dimension::Z], // Remaining [Dimension::T, Dimension::Y],
+                    p / y,
+                    p % y,
+                )
+            }
+            p if p < tnums => {
+                let p = p - t * (x + y);
+                (
+                    [Dimension::X, Dimension::Y], // Remaining [Dimension::T, Dimension::Z],
+                    p / z,
+                    p % z,
+                )
+            }
+            p if p < tnums + x * y => {
+                let p = p - tnums;
+                (
+                    [Dimension::T, Dimension::Z], // Remaining [Dimension::X, Dimension::Y],
+                    p / y,
+                    p % y,
+                )
+            }
+            p if p < tnums + xnums => {
+                let p = p - (tnums + x * y);
+                (
+                    [Dimension::T, Dimension::Y], // Remaining [Dimension::X, Dimension::Z],
+                    p / z,
+                    p % z,
+                )
+            }
+            p => {
+                let p = p - (tnums + xnums);
+                (
+                    [Dimension::T, Dimension::X], // Remaining [Dimension::Y, Dimension::Z],
+                    p / z,
+                    p % z,
+                )
+            }
+        };
+        let p = Self::dim_dim_to_plaquette_subindex(plane_dims[0], plane_dims[1]);
+        // Iterate over plaquettes in plane (mu, nu, [p])
+        // sum up energy costs for +1 and -1, then decide fate.
+        self.np
+            .axis_iter(ndarray::Axis(plane_dims[1].into()))
+            .fold((0.0, 0.0), |acc, np| {
+                np.axis_iter(ndarray::Axis(plane_dims[0].into()))
+                    .fold(acc, |(sub, add), np| {
+                        let int_n = np.get((mu, nu, p)).unwrap();
+                        let d_sub =
+                            self.vn[(int_n - 1).abs() as usize] - self.vn[int_n.abs() as usize];
+                        let d_add =
+                            self.vn[(int_n + 1).abs() as usize] - self.vn[int_n.abs() as usize];
+                        (sub + d_sub, add + d_add)
+                    })
+            })
+    }
+
+    pub fn get_global_choices<R: Rng>(&mut self, rng: Option<&mut R>) -> Vec<i8> {
         // We can update all planes at once, nothing overlaps.
         // There are 6 planar dims, for each the number of planes is the product of remaining two
         // dimensions: # = y*z + x*z + x*y + t*z + t*y + t*x
@@ -617,81 +734,30 @@ impl NDDualGraph {
         let yz = y * z;
         let num_planes = tnums + xnums + yz;
         let mut choices = vec![0_i8; num_planes];
+        let (rands, use_rands) = if let Some(rng) = rng {
+            (
+                (0..num_planes).map(|_| rng.gen()).collect::<Vec<f64>>(),
+                true,
+            )
+        } else {
+            (vec![], false)
+        };
         choices
             .iter_mut()
             .enumerate()
-            .par_bridge()
+            // .par_bridge()
             .for_each(|(plane, choice)| {
-                let rand_num = 1.0;
-                let (plane_dims, mu, nu) = match plane {
-                    p if p < t * x => (
-                        [Dimension::Y, Dimension::Z], // Remaining [Dimension::T, Dimension::X],
-                        p / x,
-                        p % x,
-                    ),
-                    p if p < t * (x + y) => {
-                        let p = p - t * x;
-                        (
-                            [Dimension::X, Dimension::Z], // Remaining [Dimension::T, Dimension::Y],
-                            p / y,
-                            p % y,
-                        )
-                    }
-                    p if p < tnums => {
-                        let p = p - t * (x + y);
-                        (
-                            [Dimension::X, Dimension::Y], // Remaining [Dimension::T, Dimension::Z],
-                            p / z,
-                            p % z,
-                        )
-                    }
-                    p if p < tnums + x * y => {
-                        let p = p - tnums;
-                        (
-                            [Dimension::T, Dimension::Z], // Remaining [Dimension::X, Dimension::Y],
-                            p / y,
-                            p % y,
-                        )
-                    }
-                    p if p < tnums + x * (y + z) => {
-                        let p = p - (tnums + x * y);
-                        (
-                            [Dimension::T, Dimension::Y], // Remaining [Dimension::X, Dimension::Z],
-                            p / z,
-                            p % z,
-                        )
-                    }
-                    p => {
-                        let p = p - (tnums + xnums);
-                        (
-                            [Dimension::T, Dimension::X], // Remaining [Dimension::Y, Dimension::Z],
-                            p / z,
-                            p % z,
-                        )
-                    }
+                let rand_num = if use_rands {
+                    rands[plane]
+                } else {
+                    rand::thread_rng().gen()
                 };
-                let p = Self::dim_dim_to_plaquette_subindex(plane_dims[0], plane_dims[1]);
                 // Iterate over plaquettes in plane (mu, nu, [p])
                 // sum up energy costs for +1 and -1, then decide fate.
-                let (e_sub_one, e_add_one) = self
-                    .np
-                    .axis_iter(ndarray::Axis(plane_dims[1].into()))
-                    .fold((0.0, 0.0), |acc, np| {
-                        np.axis_iter(ndarray::Axis(plane_dims[0].into())).fold(
-                            acc,
-                            |(sub, add), np| {
-                                let int_n = np.get((mu, nu, p)).unwrap();
-                                let d_sub = self.vn[(int_n - 1).abs() as usize]
-                                    - self.vn[int_n.abs() as usize];
-                                let d_add = self.vn[(int_n + 1).abs() as usize]
-                                    - self.vn[int_n.abs() as usize];
-                                (sub + d_sub, add + d_add)
-                            },
-                        )
-                    });
+                let (e_sub_one, e_add_one) = self.get_global_plane_energies(plane);
                 // Find which edit to perform if any.
-                let w_sub_one = e_sub_one.exp();
-                let w_add_one = e_add_one.exp();
+                let w_sub_one = (-e_sub_one).exp();
+                let w_add_one = (-e_add_one).exp();
                 let total_nontrivial_weight = w_sub_one + w_add_one;
                 // The total weight is 1+this stuff.
                 let rand_num = rand_num * (1.0 + total_nontrivial_weight);
@@ -703,12 +769,12 @@ impl NDDualGraph {
                 // Now choose between the remaining.
                 *choice = if rand_num < w_sub_one { -1 } else { 1 };
             });
-        self.np
-            .indexed_iter_mut()
-            .par_bridge()
-            .for_each(|((t, x, y, z, p), n)| {
-                // TODO find the appropriate choice
-            });
+        choices
+    }
+
+    pub fn global_update_sweep<R: Rng>(&mut self, rng: Option<&mut R>) {
+        let choices = self.get_global_choices(rng);
+        self.apply_global_updates(&choices);
     }
 
     pub fn clone_graph(&self) -> Array5<i32> {
