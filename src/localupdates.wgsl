@@ -45,6 +45,131 @@ fn pcg_hash(input: u32) -> u32 {
     return (word >> 22u) ^ word;
 }
 
+fn prng(index: u32) -> f32 {
+    pcgstate.state[index] = pcg_hash(pcgstate.state[index]);
+    // u32 to i32, cast to f32 and divide by 2^31, then shift to 0-1
+    //let random_float: f32 = f32(i32(pcgstate.state[global_id.x])) * 2.32830643653869628906e-010 + 0.5;
+    // Or convert to f32 and divide by total range.
+    return f32(pcgstate.state[index]) / f32(0xffffffffu);
+}
+
+[[stage(compute), workgroup_size(256,1,1)]]
+fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+    var index = global_id.x;
+
+    let t = dim_indices.data[0];
+    let x = dim_indices.data[1];
+    let y = dim_indices.data[2];
+    let z = dim_indices.data[3];
+    let p = 6u;
+
+    let num_plaquettes = t*(x+y+z) + x*(y+z) + y*z;
+
+    if (index >= num_plaquettes) {
+        return;
+    }
+
+    // We will be looking at all entries of the form:
+    // index = tXYZP + xYZP + yZP + zP + p
+    // where two of [t,x,y,z] are variable.
+    // index = v1*k1 + v2*k2 + offset
+    var k1 = 0u;
+    var v1_max = 0u;
+    var k2 = 0u;
+    var v2_max = 0u;
+    var offset = 0u;
+    if (index < t*x) {
+        let plane = index;
+        // Y/Z plane, p=5
+        let t_index = plane / x;
+        let x_index = plane % x;
+        offset = t_index * (x*y*z*p) + x_index * (y*z*p) + 5u;
+        v1_max = y;
+        v2_max = z;
+        k1 = z*p;
+        k2 = p;
+    } else if (index < t*(x+y)) {
+        let plane = index - t*x;
+        // X/Z plane, p=4
+        let t_index = plane / y;
+        let y_index = plane % y;
+        offset = t_index * (x*y*z*p) + y_index * (z*p) + 4u;
+        v1_max = x;
+        v2_max = z;
+        k1 = y*z*p;
+        k2 = p;
+    } else if (index < t*(x+y+z)) {
+        let plane = index - t*(x+y);
+        // X/Y plane, p=3
+        let t_index = plane / z;
+        let z_index = plane % z;
+        offset = t_index * (x*y*z*p) + z_index * p + 3u;
+        v1_max = x;
+        v2_max = y;
+        k1 = y*z*p;
+        k2 = z*p;
+    } else if (index < t*(x+y+z) + x*y) {
+        let plane = index - t*(x+y+z);
+        // T/Z plane p=2
+        let x_index = plane / y;
+        let y_index = plane % y;
+        offset = x_index * (y*z*p) + y_index * (z*p) + 2u;
+        v1_max = t;
+        v2_max = z;
+        k1 = x*y*z*p;
+        k2 = p;
+    } else if (index < t*(x+y+z) + x*(y+z)) {
+        let plane = index - t*(x+y+z) - x*y;
+        // T/Y plane p=1
+        let x_index = plane / z;
+        let z_index = plane % z;
+        offset = x_index * (y*z*p) + z_index * p + 1u;
+        v1_max = t;
+        v2_max = y;
+        k1 = x*y*z*p;
+        k2 = z*p;
+    } else {
+        let plane = index - t*(x+y+z) - x*(y+z);
+        // T/X plane p=0
+        let y_index = plane / z;
+        let z_index = plane % z;
+        offset = y_index * (z*p) + z_index * p + 0u;
+        v1_max = t;
+        v2_max = x;
+        k1 = x*y*z*p;
+        k2 = y*z*p;
+    }
+
+    // TODO - check if loops are bad on GPUs
+    var inc_energy_increase = 0.0;
+    var dec_energy_increase = 0.0;
+    for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
+        for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
+            let plaquette_index = v1*k1 + v2*k2 + offset;
+            let v_at_plaq = state.state[plaquette_index];
+            inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
+            dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
+        }
+    }
+
+    let add_one_p = exp(-inc_energy_increase);
+    let sub_one_p = exp(-dec_energy_increase);
+
+    let random_float = prng(index);
+    let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
+
+    if (random_float < 0.0) {
+        return;
+    }
+    let choice = select(-1, 1, random_float < add_one_p);
+    for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
+        for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
+            let plaquette_index = v1*k1 + v2*k2 + offset;
+            state.state[plaquette_index] = state.state[plaquette_index] + choice;
+        }
+    }
+}
+
 [[stage(compute), workgroup_size(256,1,1)]]
 fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     var index = global_id.x;
@@ -193,9 +318,7 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let add_one_p = exp(-add_one_dv);
     let sub_one_p = exp(-sub_one_dv);
 
-    pcgstate.state[global_id.x] = pcg_hash(pcgstate.state[global_id.x]);
-    // u32 to i32, cast to f32 and divide by 2^31, then shift to 0-1
-    let random_float: f32 = f32(i32(pcgstate.state[global_id.x])) * 2.32830643653869628906e-010 + 0.5;
+    let random_float = prng(global_id.x);
     let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
 
     if (random_float < 0.0) {

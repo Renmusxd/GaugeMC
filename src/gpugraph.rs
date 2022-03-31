@@ -14,11 +14,16 @@ pub struct GPUBackend {
     vn_buffer: wgpu::Buffer,
     pcgstate_buffer: wgpu::Buffer,
     localupdate: LocalUpdatePipeline,
+    globalupdate: GlobalUpdatePipeline,
 }
 
 struct LocalUpdatePipeline {
     index_buffer: wgpu::Buffer,
-    localupdate_pipeline: wgpu::ComputePipeline,
+    update_pipeline: wgpu::ComputePipeline,
+    bindgroup: wgpu::BindGroup,
+}
+struct GlobalUpdatePipeline {
+    update_pipeline: wgpu::ComputePipeline,
     bindgroup: wgpu::BindGroup,
 }
 
@@ -128,6 +133,13 @@ impl GPUBackend {
                 module: &compute_shader,
                 entry_point: "main",
             });
+        let globalupdate_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("globalupdate pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &compute_shader,
+                entry_point: "main_global",
+            });
 
         let state_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Plaquette Buffer"),
@@ -156,31 +168,32 @@ impl GPUBackend {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        // create two bind groups, one for each buffer as the src
-        // where the alternate buffer is used as the dst
-
-        let bindgroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: state_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: vn_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: index_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: pcgstate_buffer.as_entire_binding(),
-                },
-            ],
-            label: None,
+        let mut bindgroups = (0..2).map(|_| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &compute_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: state_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: vn_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: index_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pcgstate_buffer.as_entire_binding(),
+                    },
+                ],
+                label: None,
+            })
         });
+        let local_b = bindgroups.next().unwrap();
+        let global_b = bindgroups.next().unwrap();
 
         Self {
             shape: bounds,
@@ -191,10 +204,25 @@ impl GPUBackend {
             pcgstate_buffer,
             localupdate: LocalUpdatePipeline {
                 index_buffer,
-                localupdate_pipeline,
-                bindgroup,
+                update_pipeline: localupdate_pipeline,
+                bindgroup: local_b,
+            },
+            globalupdate: GlobalUpdatePipeline {
+                update_pipeline: globalupdate_pipeline,
+                bindgroup: global_b,
             },
         }
+    }
+
+    pub fn get_bounds(&self) -> SiteIndex {
+        self.shape.clone()
+    }
+
+    pub fn num_planes(&self) -> usize {
+        let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
+        let tnums = t * (x + y + z);
+        let xnums = x * (y + z);
+        tnums + xnums + y * z
     }
 
     pub fn run_local_sweep(&mut self, dims: &[Dimension; 3], leftover: Dimension, offset: bool) {
@@ -228,10 +256,51 @@ impl GPUBackend {
         {
             let mut cpass =
                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-            cpass.set_pipeline(&self.localupdate.localupdate_pipeline);
+            cpass.set_pipeline(&self.localupdate.update_pipeline);
             cpass.set_bind_group(0, &self.localupdate.bindgroup, &[]);
 
             let nneeded = rho * mu * nu * (sigma / 2);
+            let ndispatch = if nneeded % 256 == 0 {
+                nneeded / 256
+            } else {
+                nneeded / 256 + 1
+            };
+            cpass.dispatch(ndispatch, 1, 1);
+        }
+        command_encoder.pop_debug_group();
+
+        self.queue.submit(Some(command_encoder.finish()));
+    }
+
+    pub fn run_global_sweep(&mut self) {
+        // Write bounds in case they aren't there.
+        self.queue.write_buffer(
+            &self.localupdate.index_buffer,
+            0 as _,
+            bytemuck::cast_slice(&[
+                self.shape.t as u32,
+                self.shape.x as u32,
+                self.shape.y as u32,
+                self.shape.z as u32,
+            ]),
+        );
+
+        // get command encoder
+        let mut command_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // compute pass
+        command_encoder.push_debug_group(&format!("Global Sweep"));
+
+        {
+            let mut cpass =
+                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            cpass.set_pipeline(&self.globalupdate.update_pipeline);
+            cpass.set_bind_group(0, &self.globalupdate.bindgroup, &[]);
+
+            let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
+            let nneeded = (t * (x + y + z) + x * (y + z) + y * z) as u32;
             let ndispatch = if nneeded % 256 == 0 {
                 nneeded / 256
             } else {
