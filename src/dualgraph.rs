@@ -554,6 +554,8 @@ impl NDDualGraph {
                         self.get_cube_choice([rho, mu, nu, sigma], dims, leftover, off, rand_num);
                     if let Some(delta) = cube_choice {
                         *c = delta;
+                    } else {
+                        *c = 0;
                     }
                 });
         } else {
@@ -566,6 +568,8 @@ impl NDDualGraph {
                         self.get_cube_choice([rho, mu, nu, sigma], dims, leftover, off, rand_num);
                     if let Some(delta) = cube_choice {
                         *c = delta;
+                    } else {
+                        *c = 0;
                     }
                 });
         }
@@ -778,11 +782,12 @@ impl NDDualGraph {
                 let rand_num = rand_num * (1.0 + total_nontrivial_weight);
                 if rand_num <= 1.0 {
                     // Do nothing!
-                    return;
+                    *choice = 0;
+                } else {
+                    let rand_num = rand_num - 1.0;
+                    // Now choose between the remaining.
+                    *choice = if rand_num < w_sub_one { -1 } else { 1 };
                 }
-                let rand_num = rand_num - 1.0;
-                // Now choose between the remaining.
-                *choice = if rand_num < w_sub_one { -1 } else { 1 };
             });
     }
 
