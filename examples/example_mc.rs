@@ -1,9 +1,8 @@
 use gaugemc::NDDualGraph;
 use ndarray_rand::rand::rngs::SmallRng;
-use ndarray_rand::rand::SeedableRng;
 
-fn main() {
-    let mut graph = NDDualGraph::new(4, 4, 4, 4, (1..100).map(|i| 0.5 * (i as f64).powi(2)));
+fn main() -> Result<(), String> {
+    let mut graph = NDDualGraph::new(4, 4, 4, 4, (1..100).map(|i| 0.5 * (i as f64).powi(2)))?;
 
     let mut rng: Option<SmallRng> = None;
 
@@ -13,4 +12,5 @@ fn main() {
         }
         graph.global_update_sweep(rng.as_mut());
     }
+    Ok(())
 }

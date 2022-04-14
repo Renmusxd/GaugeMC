@@ -35,7 +35,15 @@ impl GPUBackend {
         z: usize,
         vn: Vec<f32>,
         seed: Option<u64>,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        for d in [t, x, y, z] {
+            if d % 2 == 1 {
+                return Err(format!(
+                    "Expected all dims to be even, found: {:?}",
+                    [t, x, y, z]
+                ));
+            }
+        }
         let bounds = SiteIndex { t, x, y, z };
         let n_faces = t * x * y * z * 6;
 
@@ -195,7 +203,7 @@ impl GPUBackend {
         let local_b = bindgroups.next().unwrap();
         let global_b = bindgroups.next().unwrap();
 
-        Self {
+        Ok(Self {
             shape: bounds,
             device,
             queue,
@@ -211,7 +219,7 @@ impl GPUBackend {
                 update_pipeline: globalupdate_pipeline,
                 bindgroup: global_b,
             },
-        }
+        })
     }
 
     pub fn get_bounds(&self) -> SiteIndex {

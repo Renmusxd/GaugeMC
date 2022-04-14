@@ -145,22 +145,30 @@ pub struct NDDualGraph {
     vn: Vec<f64>,
     currents: HashMap<(SiteIndex, Dimension), i32>,
     cube_choices: Option<Array4<i32>>,
-    plane_choices: Option<Array1<i8>>
+    plane_choices: Option<Array1<i8>>,
 }
 
 impl NDDualGraph {
-    pub fn new<V>(t: usize, x: usize, y: usize, z: usize, vnp: V) -> Self
+    pub fn new<V>(t: usize, x: usize, y: usize, z: usize, vnp: V) -> Result<Self, String>
     where
         V: IntoIterator<Item = f64>,
     {
-        Self {
+        for d in [t, x, y, z] {
+            if d % 2 == 1 {
+                return Err(format!(
+                    "Expected all dims to be even, found: {:?}",
+                    [t, x, y, z]
+                ));
+            }
+        }
+        Ok(Self {
             bounds: SiteIndex { t, x, y, z },
             np: Array5::zeros((t, x, y, z, 6)),
             vn: vnp.into_iter().collect(),
             currents: Default::default(),
             cube_choices: None,
-            plane_choices: None
-        }
+            plane_choices: None,
+        })
     }
 
     /// Add flux to a plaquette and place current along boundaries.
@@ -886,9 +894,9 @@ mod tests {
     }
 
     #[test]
-    fn test_flux_additions() {
+    fn test_flux_additions() -> Result<(), String> {
         let bounds = simple_bounds();
-        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, []);
+        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, [])?;
         assert_eq!(
             graph.np.iter().map(|n| n.abs()).sum::<i32>(),
             0,
@@ -944,12 +952,13 @@ mod tests {
         );
         assert_eq!(graph.get_edges_with_violations(), vec![]);
         assert_eq!(graph.currents.iter().map(|(_, c)| c.abs()).sum::<i32>(), 6);
+        Ok(())
     }
 
     #[test]
-    fn test_cube_update_violations() {
+    fn test_cube_update_violations() -> Result<(), String> {
         let bounds = simple_bounds();
-        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, []);
+        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, [])?;
 
         for (dims, offset) in NDDualGraph::get_cube_dim_and_offset_iterator() {
             let leftover = NDDualGraph::get_leftover_dim(&dims);
@@ -1017,13 +1026,12 @@ mod tests {
                 cube_choices[cube_site] = 0;
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_cube_side_counts() {
+    fn test_cube_side_counts() -> Result<(), String> {
         let bounds = simple_bounds();
-        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, []);
-
         for (dims, offset) in NDDualGraph::get_cube_dim_and_offset_iterator() {
             let leftover = NDDualGraph::get_leftover_dim(&dims);
             let off = if offset { 1 } else { 0 };
@@ -1042,6 +1050,7 @@ mod tests {
                 assert_eq!(ncubes, 3);
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -1091,9 +1100,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cube_choice() {
+    fn test_cube_choice() -> Result<(), String> {
         let bounds = simple_bounds();
-        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, [0.0, 0.1, 0.4]);
+        let graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, [0.0, 0.1, 0.4])?;
         let choice = graph.get_cube_choice(
             [0, 0, 0, 0],
             &[Dimension::T, Dimension::X, Dimension::Y],
@@ -1101,14 +1110,22 @@ mod tests {
             0,
             0.5,
         );
-        assert_eq!(choice, Some(1))
+        assert_eq!(choice, Some(1));
+        Ok(())
     }
 
     #[test]
-    fn test_local_update() {
+    fn test_local_update() -> Result<(), String> {
         let bounds = simple_bounds();
-        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, [0.0, 0.1, 0.4, 10.0]);
+        let mut graph = NDDualGraph::new(
+            bounds.t,
+            bounds.x,
+            bounds.y,
+            bounds.z,
+            (0..10).map(|i| (i as f64).powi(2) / 2.0),
+        )?;
         let mut rng = SmallRng::from_entropy();
         graph.local_update_sweep(Some(&mut rng));
+        Ok(())
     }
 }

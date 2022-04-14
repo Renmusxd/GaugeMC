@@ -1,10 +1,9 @@
+use env_logger;
 use gaugemc;
-use gaugemc::{Dimension, NDDualGraph};
 use num_traits::Zero;
 use pollster;
-use env_logger;
 
-fn main() {
+fn main() -> Result<(), String> {
     env_logger::init();
     let (t, x, y, z) = (4, 4, 4, 4);
     let mut state = pollster::block_on(gaugemc::GPUBackend::new_async(
@@ -16,7 +15,7 @@ fn main() {
             .map(|i| f32::from(u16::try_from(i.pow(2)).unwrap()) / 4.0)
             .collect(),
         None,
-    ));
+    ))?;
     // for _ in 0..100 {
     //     NDDualGraph::get_cube_dim_and_offset_iterator().for_each(|(dims, offset)| {
     //         let leftover = NDDualGraph::get_leftover_dim(&dims);
@@ -55,4 +54,5 @@ fn main() {
         read_state.iter().cloned().filter(|c| !c.is_zero()).count(),
         read_state.len()
     );
+    Ok(())
 }
