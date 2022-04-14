@@ -1,6 +1,8 @@
 use gaugemc;
 use gaugemc::{Dimension, NDDualGraph};
 use num_traits::Zero;
+use pollster;
+use env_logger;
 
 fn main() {
     env_logger::init();

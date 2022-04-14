@@ -1,4 +1,4 @@
-use ndarray::{Array4, Array5};
+use ndarray::{Array1, Array4, Array5};
 use ndarray_rand::rand::Rng;
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::{rand, RandomExt};
@@ -144,6 +144,8 @@ pub struct NDDualGraph {
     np: Array5<i32>,
     vn: Vec<f64>,
     currents: HashMap<(SiteIndex, Dimension), i32>,
+    cube_choices: Option<Array4<i32>>,
+    plane_choices: Option<Array1<i8>>
 }
 
 impl NDDualGraph {
@@ -156,6 +158,8 @@ impl NDDualGraph {
             np: Array5::zeros((t, x, y, z, 6)),
             vn: vnp.into_iter().collect(),
             currents: Default::default(),
+            cube_choices: None,
+            plane_choices: None
         }
     }
 
@@ -525,8 +529,11 @@ impl NDDualGraph {
 
         let leftover = Self::get_leftover_dim(dims);
         let shape = Self::get_cube_update_shape(&self.bounds, dims, leftover);
-        let mut cube_choices = Array4::<i32>::zeros(shape);
-
+        let mut cube_choices = if let Some(cube_choices) = self.cube_choices.take() {
+            cube_choices.into_shape(shape).unwrap()
+        } else {
+            Array4::<i32>::zeros(shape)
+        };
         // Pick all cube deltas, either using a single rng or a thread specific one
         if let Some(rng) = rng {
             let rands = Array4::random_using(shape, Uniform::new(0.0, 1.0), rng);
@@ -564,6 +571,9 @@ impl NDDualGraph {
             &mut self.np,
             &self.bounds,
         );
+
+        // Hand back the choice array.
+        self.cube_choices = Some(cube_choices);
 
         // Debug check that no edges have violations.
         debug_assert_eq!(self.get_edges_with_violations(), vec![]);
@@ -723,17 +733,14 @@ impl NDDualGraph {
             })
     }
 
-    pub fn get_global_choices<R: Rng>(&mut self, rng: Option<&mut R>) -> Vec<i8> {
+    pub fn get_global_choices<R: Rng>(&mut self, choices: &mut [i8], rng: Option<&mut R>) {
         // We can update all planes at once, nothing overlaps.
         // There are 6 planar dims, for each the number of planes is the product of remaining two
         // dimensions: # = y*z + x*z + x*y + t*z + t*y + t*x
         //               = t*(x+y+z) + x*(y+z) + y*z
-        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
-        let tnums = t * (x + y + z);
-        let xnums = x * (y + z);
-        let yz = y * z;
-        let num_planes = tnums + xnums + yz;
-        let mut choices = vec![0_i8; num_planes];
+        let num_planes = self.num_planes();
+        debug_assert_eq!(choices.len(), num_planes);
+
         let (rands, use_rands) = if let Some(rng) = rng {
             (
                 (0..num_planes).map(|_| rng.gen()).collect::<Vec<f64>>(),
@@ -769,12 +776,17 @@ impl NDDualGraph {
                 // Now choose between the remaining.
                 *choice = if rand_num < w_sub_one { -1 } else { 1 };
             });
-        choices
     }
 
     pub fn global_update_sweep<R: Rng>(&mut self, rng: Option<&mut R>) {
-        let choices = self.get_global_choices(rng);
-        self.apply_global_updates(&choices);
+        let mut choices = if let Some(choices) = self.plane_choices.take() {
+            choices
+        } else {
+            Array1::zeros((self.num_planes(),))
+        };
+        self.get_global_choices(choices.as_slice_mut().unwrap(), rng);
+        self.apply_global_updates(choices.as_slice().unwrap());
+        self.plane_choices = Some(choices);
     }
 
     pub fn clone_graph(&self) -> Array5<i32> {
@@ -1095,8 +1107,8 @@ mod tests {
     #[test]
     fn test_local_update() {
         let bounds = simple_bounds();
-        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, [0.0, 0.1, 0.4]);
+        let mut graph = NDDualGraph::new(bounds.t, bounds.x, bounds.y, bounds.z, [0.0, 0.1, 0.4, 10.0]);
         let mut rng = SmallRng::from_entropy();
-        graph.local_update_sweep(&mut rng);
+        graph.local_update_sweep(Some(&mut rng));
     }
 }
