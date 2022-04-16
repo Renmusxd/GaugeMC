@@ -15,6 +15,7 @@ fn main() -> Result<(), String> {
             .map(|i| f32::from(u16::try_from(i.pow(2)).unwrap()) / 4.0)
             .collect(),
         None,
+        None,
     ))?;
     // for _ in 0..100 {
     //     NDDualGraph::get_cube_dim_and_offset_iterator().for_each(|(dims, offset)| {

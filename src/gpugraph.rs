@@ -1,5 +1,6 @@
 use crate::{Dimension, SiteIndex};
 use bytemuck;
+use ndarray::Array5;
 use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
 use std::borrow::Cow;
@@ -34,6 +35,7 @@ impl GPUBackend {
         y: usize,
         z: usize,
         vn: Vec<f32>,
+        initial_state: Option<Array5<i32>>,
         seed: Option<u64>,
     ) -> Result<Self, String> {
         for d in [t, x, y, z] {
@@ -46,6 +48,16 @@ impl GPUBackend {
         }
         let bounds = SiteIndex { t, x, y, z };
         let n_faces = t * x * y * z * 6;
+
+        if let Some(initial_state) = &initial_state {
+            if &[t, x, y, z, 6] != initial_state.shape() {
+                return Err(format!(
+                    "Expected initial state with shape: {:?} found {:?}",
+                    [t, x, y, z, 6],
+                    initial_state.shape()
+                ));
+            }
+        }
 
         // Instantiates instance of WebGPU
         let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
@@ -149,9 +161,18 @@ impl GPUBackend {
                 entry_point: "main_global",
             });
 
+        let zero_state = vec![0; n_faces];
+        let initial_state = initial_state
+            .as_ref()
+            .map(|x| {
+                x.as_slice()
+                    .expect("Initial state not contiguous in memory!")
+            })
+            .unwrap_or(&zero_state);
+
         let state_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Plaquette Buffer"),
-            contents: bytemuck::cast_slice(&vec![0; n_faces]),
+            contents: bytemuck::cast_slice(initial_state),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let vn_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
