@@ -14,15 +14,10 @@ fn main() -> Result<(), String> {
         (0..20u32)
             .map(|i| f32::from(u16::try_from(i.pow(2)).unwrap()) / 4.0)
             .collect(),
+        Some(2),
         None,
         None,
     ))?;
-    // for _ in 0..100 {
-    //     NDDualGraph::get_cube_dim_and_offset_iterator().for_each(|(dims, offset)| {
-    //         let leftover = NDDualGraph::get_leftover_dim(&dims);
-    //         state.run_local_sweep(&dims, leftover, offset);
-    //     })
-    // }
 
     state.run_global_sweep();
 
@@ -34,6 +29,8 @@ fn main() -> Result<(), String> {
         .filter(|(_, c)| !c.is_zero())
     {
         let original_index = i;
+        let r_index = i / (t * x * y * z * 6);
+        let i = i % (t * x * y * z * 6);
         let t_index = i / (x * y * z * 6);
         let i = i % (x * y * z * 6);
         let x_index = i / (y * z * 6);
@@ -46,10 +43,15 @@ fn main() -> Result<(), String> {
         println!(
             "{} -> {:?}:\t{}",
             original_index,
-            (t_index, x_index, y_index, z_index, p_index),
+            (r_index, t_index, x_index, y_index, z_index, p_index),
             s
         );
     }
+    // let arr = state.get_state_array();
+    // arr.indexed_iter()
+    //     .filter(|(_, s)| **s > 0)
+    //     .for_each(|(indx, s)| println!("{:?}", indx));
+
     println!(
         "{}/{}",
         read_state.iter().cloned().filter(|c| !c.is_zero()).count(),

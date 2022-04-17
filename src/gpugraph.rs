@@ -1,6 +1,6 @@
 use crate::{Dimension, SiteIndex};
 use bytemuck;
-use ndarray::Array5;
+use ndarray::Array6;
 use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
 use std::borrow::Cow;
@@ -9,6 +9,7 @@ use wgpu::util::DeviceExt;
 
 pub struct GPUBackend {
     shape: SiteIndex,
+    num_replicas: usize,
     device: wgpu::Device,
     queue: wgpu::Queue,
     state_buffer: wgpu::Buffer,
@@ -35,7 +36,8 @@ impl GPUBackend {
         y: usize,
         z: usize,
         vn: Vec<f32>,
-        initial_state: Option<Array5<i32>>,
+        num_replicas: Option<usize>,
+        initial_state: Option<Array6<i32>>,
         seed: Option<u64>,
     ) -> Result<Self, String> {
         for d in [t, x, y, z] {
@@ -46,14 +48,18 @@ impl GPUBackend {
                 ));
             }
         }
-        let bounds = SiteIndex { t, x, y, z };
-        let n_faces = t * x * y * z * 6;
+        let num_replicas = num_replicas.unwrap_or(1);
+        if num_replicas == 0 {
+            return Err("num_replicas must be larger than 0".to_string());
+        }
 
+        let bounds = SiteIndex { t, x, y, z };
+        let n_faces = num_replicas * t * x * y * z * 6;
         if let Some(initial_state) = &initial_state {
-            if &[t, x, y, z, 6] != initial_state.shape() {
+            if &[num_replicas, t, x, y, z, 6] != initial_state.shape() {
                 return Err(format!(
                     "Expected initial state with shape: {:?} found {:?}",
-                    [t, x, y, z, 6],
+                    [num_replicas, t, x, y, z, 6],
                     initial_state.shape()
                 ));
             }
@@ -84,7 +90,7 @@ impl GPUBackend {
 
         let compute_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("localupdates.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
         });
 
         let int_size = std::mem::size_of::<i32>();
@@ -120,7 +126,7 @@ impl GPUBackend {
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new((4 * index_size) as _),
+                            min_binding_size: wgpu::BufferSize::new((10 * index_size) as _),
                         },
                         count: None,
                     },
@@ -182,7 +188,7 @@ impl GPUBackend {
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&vec![0_u32; 9]),
+            contents: bytemuck::cast_slice(&vec![0_u32; 10]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let mut rng = if let Some(seed) = seed {
@@ -226,6 +232,7 @@ impl GPUBackend {
 
         Ok(Self {
             shape: bounds,
+            num_replicas,
             device,
             queue,
             state_buffer,
@@ -255,13 +262,19 @@ impl GPUBackend {
     }
 
     pub fn run_local_sweep(&mut self, dims: &[Dimension; 3], leftover: Dimension, offset: bool) {
-        let ndims = [self.shape.t, self.shape.x, self.shape.y, self.shape.z]
-            .into_iter()
-            .map(|d| d as u32)
-            .chain(dims.iter().map(|d| usize::from(*d).try_into().unwrap()))
-            .chain(Some(usize::from(leftover).try_into().unwrap()))
-            .chain(Some(if offset { 1 } else { 0 }))
-            .collect::<Vec<u32>>();
+        let ndims = [
+            self.shape.t,
+            self.shape.x,
+            self.shape.y,
+            self.shape.z,
+            self.num_replicas,
+        ]
+        .into_iter()
+        .map(|d| d as u32)
+        .chain(dims.iter().map(|d| usize::from(*d).try_into().unwrap()))
+        .chain(Some(usize::from(leftover).try_into().unwrap()))
+        .chain(Some(if offset { 1 } else { 0 }))
+        .collect::<Vec<u32>>();
 
         self.queue.write_buffer(
             &self.localupdate.index_buffer,
@@ -288,12 +301,9 @@ impl GPUBackend {
             cpass.set_pipeline(&self.localupdate.update_pipeline);
             cpass.set_bind_group(0, &self.localupdate.bindgroup, &[]);
 
-            let nneeded = rho * mu * nu * (sigma / 2);
-            let ndispatch = if nneeded % 256 == 0 {
-                nneeded / 256
-            } else {
-                nneeded / 256 + 1
-            };
+            let nneeded =
+                self.num_replicas * rho as usize * mu as usize * nu as usize * (sigma as usize / 2);
+            let ndispatch = ((nneeded + 255) / 256) as u32;
             cpass.dispatch(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
@@ -311,6 +321,7 @@ impl GPUBackend {
                 self.shape.x as u32,
                 self.shape.y as u32,
                 self.shape.z as u32,
+                self.num_replicas as u32,
             ]),
         );
 
@@ -329,12 +340,8 @@ impl GPUBackend {
             cpass.set_bind_group(0, &self.globalupdate.bindgroup, &[]);
 
             let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
-            let nneeded = (t * (x + y + z) + x * (y + z) + y * z) as u32;
-            let ndispatch = if nneeded % 256 == 0 {
-                nneeded / 256
-            } else {
-                nneeded / 256 + 1
-            };
+            let nneeded = self.num_replicas * (t * (x + y + z) + x * (y + z) + y * z);
+            let ndispatch = ((nneeded + 255) / 256) as u32;
             cpass.dispatch(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
@@ -342,8 +349,29 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
     }
 
+    pub fn get_state_array(&mut self) -> Array6<i32> {
+        let state = self.get_state();
+        Array6::from_shape_vec(
+            (
+                self.num_replicas,
+                self.shape.t,
+                self.shape.x,
+                self.shape.y,
+                self.shape.z,
+                6,
+            ),
+            state,
+        )
+        .unwrap()
+    }
+
+    pub fn get_num_replicas(&self) -> usize {
+        self.num_replicas
+    }
+
     pub fn get_state(&mut self) -> Vec<i32> {
-        let n_faces = self.shape.t * self.shape.x * self.shape.y * self.shape.z * 6;
+        let n_faces =
+            self.num_replicas * self.shape.t * self.shape.x * self.shape.y * self.shape.z * 6;
         let int_size = std::mem::size_of::<i32>();
 
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {

@@ -9,7 +9,7 @@ struct Vn {
 
 struct DimInformation {
     // First the dimensions of the graph
-    // t, x, y, z
+    // t, x, y, z, num_replicas,
     // Then the cube selections (first 3 are 3D cube, last is remaining)
     // mu, nu, sigma, rho, offset
     data : array<u32>;
@@ -62,12 +62,18 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let y = dim_indices.data[2];
     let z = dim_indices.data[3];
     let p = 6u;
+    let num_replicas = dim_indices.data[4];
 
-    let num_plaquettes = t*(x+y+z) + x*(y+z) + y*z;
+    let planes_per_replica = t*(x+y+z) + x*(y+z) + y*z;
+    let num_plaquettes = num_replicas*planes_per_replica;
 
     if (index >= num_plaquettes) {
         return;
     }
+
+    let replica_index = index / planes_per_replica;
+    let replica_offset = replica_index * planes_per_replica;
+    index = index % planes_per_replica;
 
     // We will be looking at all entries of the form:
     // index = tXYZP + xYZP + yZP + zP + p
@@ -140,32 +146,32 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
         k2 = y*z*p;
     }
 
-    // TODO - check if loops are bad on GPUs
-    var inc_energy_increase = 0.0;
-    var dec_energy_increase = 0.0;
+    //var inc_energy_increase = 0.0;
+    //var dec_energy_increase = 0.0;
+    //for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
+    //    for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
+    //        let plaquette_index = v1*k1 + v2*k2 + offset;
+    //        let v_at_plaq = state.state[replica_offset + plaquette_index];
+    //        inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
+    //        dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
+    //    }
+    //}
+
+    //let add_one_p = exp(-inc_energy_increase);
+    //let sub_one_p = exp(-dec_energy_increase);
+
+    //let random_float = prng(global_id.x);
+    //let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
+
+    //if (random_float < 0.0) {
+    //    return;
+    //}
+    //let choice = select(-1, 1, random_float < add_one_p);
     for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
         for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
             let plaquette_index = v1*k1 + v2*k2 + offset;
-            let v_at_plaq = state.state[plaquette_index];
-            inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
-            dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
-        }
-    }
-
-    let add_one_p = exp(-inc_energy_increase);
-    let sub_one_p = exp(-dec_energy_increase);
-
-    let random_float = prng(index);
-    let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
-
-    if (random_float < 0.0) {
-        return;
-    }
-    let choice = select(-1, 1, random_float < add_one_p);
-    for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
-        for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
-            let plaquette_index = v1*k1 + v2*k2 + offset;
-            state.state[plaquette_index] = state.state[plaquette_index] + choice;
+            //state.state[replica_offset + plaquette_index] = state.state[replica_offset + plaquette_index] + choice;
+            state.state[replica_offset + plaquette_index] = i32(global_id.x);
         }
     }
 }
@@ -174,20 +180,25 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
 fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     var index = global_id.x;
 
+    // Get the bounds.
     let t = dim_indices.data[0];
     let x = dim_indices.data[1];
     let y = dim_indices.data[2];
     let z = dim_indices.data[3];
     let p = 6u;
+    let num_replicas = dim_indices.data[4];
 
-    if (global_id.x >= (t*x*y*z)/2u) {
+    if (global_id.x >= (num_replicas*t*x*y*z)/2u) {
         return;
     }
 
-    let mu = dim_indices.data[4 + 0];
-    let nu = dim_indices.data[4 + 1];
-    let sigma = dim_indices.data[4 + 2];
-    let rho = dim_indices.data[4 + 3];
+    let mu = dim_indices.data[5 + 0];
+    let nu = dim_indices.data[5 + 1];
+    let sigma = dim_indices.data[5 + 2];
+    let rho = dim_indices.data[5 + 3];
+
+    let replica_index = index / ((t*x*y*z)/2u);
+    index = index % ((t*x*y*z)/2u);
 
     let rho_index = index / (dim_indices.data[mu] * dim_indices.data[nu] * dim_indices.data[sigma] /2u);
     index = index % (dim_indices.data[mu] * dim_indices.data[nu] * dim_indices.data[sigma]/2u);
@@ -197,9 +208,11 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     index = index % (dim_indices.data[sigma]/2u);
     let sigma_index_half = index;
 
-    let offset = dim_indices.data[8];
+    let offset = dim_indices.data[5 + 4];
     let parity = (mu_index + nu_index + offset) % 2u;
     let sigma_index = 2u*sigma_index_half + parity;
+
+    let replica_base_offset = replica_index * ((t*x*y*z)/2u);
 
     var cube_index : vec4<u32> = vec4<u32>(0u, 0u, 0u, 0u);
     cube_index[mu] = mu_index;
@@ -308,8 +321,8 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     for(var i: i32 = 0; i < 3; i = i + 1) {
         let pos_index = pos_indices[i];
         let neg_index = neg_indices[i];
-        let pos_np = state.state[pos_index];
-        let neg_np = state.state[neg_index];
+        let pos_np = state.state[replica_base_offset + pos_index];
+        let neg_np = state.state[replica_base_offset + neg_index];
         // add one to pos_index, subtract one from neg_index
         add_one_dv = add_one_dv + vn.vn[abs(pos_np + 1)] + vn.vn[abs(neg_np - 1)] - vn.vn[abs(pos_np)] - vn.vn[abs(neg_np)];
         // subtract one to pos_index, add one from neg_index
@@ -333,12 +346,9 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     for(var i: i32 = 0; i < 3; i = i + 1) {
         let pos_index = pos_indices[i];
         let neg_index = neg_indices[i];
-        let pos_np = state.state[pos_index];
-        let neg_np = state.state[neg_index];
-        state.state[pos_index] = pos_np + choice;
-        state.state[neg_index] = neg_np - choice;
-        // For debugging.
-        //state.state[pos_index] = i32(global_id.x);
-        //state.state[neg_index] = -i32(global_id.x);
+        let pos_np = state.state[replica_base_offset + pos_index];
+        let neg_np = state.state[replica_base_offset + neg_index];
+        state.state[replica_base_offset + pos_index] = pos_np + choice;
+        state.state[replica_base_offset + neg_index] = neg_np - choice;
     }
 }
