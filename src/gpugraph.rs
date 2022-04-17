@@ -8,6 +8,7 @@ use wgpu;
 use wgpu::util::DeviceExt;
 
 pub struct GPUBackend {
+    state: Option<Array5<i32>>,
     shape: SiteIndex,
     vn: Vec<f32>,
     device: wgpu::Device,
@@ -162,18 +163,19 @@ impl GPUBackend {
                 entry_point: "main_global",
             });
 
-        let zero_state = vec![0; n_faces];
-        let initial_state = initial_state
-            .as_ref()
-            .map(|x| {
-                x.as_slice()
-                    .expect("Initial state not contiguous in memory!")
-            })
-            .unwrap_or(&zero_state);
+        let initial_state = if let Some(initial_state) = initial_state {
+            initial_state
+        } else {
+            Array5::zeros((t, x, y, z, 6))
+        };
 
         let state_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Plaquette Buffer"),
-            contents: bytemuck::cast_slice(initial_state),
+            contents: bytemuck::cast_slice(
+                initial_state
+                    .as_slice()
+                    .expect("Initial state not contiguous in memory!"),
+            ),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let vn_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -226,6 +228,7 @@ impl GPUBackend {
         let global_b = bindgroups.next().unwrap();
 
         Ok(Self {
+            state: None,
             shape: bounds,
             vn,
             device,
@@ -261,6 +264,7 @@ impl GPUBackend {
     }
 
     pub fn run_local_sweep(&mut self, dims: &[Dimension; 3], leftover: Dimension, offset: bool) {
+        self.state = None;
         let ndims = [self.shape.t, self.shape.x, self.shape.y, self.shape.z]
             .into_iter()
             .map(|d| d as u32)
@@ -308,6 +312,7 @@ impl GPUBackend {
     }
 
     pub fn run_global_sweep(&mut self) {
+        self.state = None;
         // Write bounds in case they aren't there.
         self.queue.write_buffer(
             &self.localupdate.index_buffer,
@@ -348,59 +353,64 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
     }
 
-    pub fn get_state(&mut self) -> Vec<i32> {
-        let n_faces = self.shape.t * self.shape.x * self.shape.y * self.shape.z * 6;
-        let int_size = std::mem::size_of::<i32>();
+    pub fn get_state(&mut self) -> &Array5<i32> {
+        if self.state.is_none() {
+            let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
+            let n_faces = t * x * y * z * 6;
+            let int_size = std::mem::size_of::<i32>();
 
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (n_faces * int_size) as _,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+            let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n_faces * int_size) as _,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
 
-        // get command encoder
-        let mut command_encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            command_encoder.push_debug_group("Copy state");
-            command_encoder.copy_buffer_to_buffer(
-                &self.state_buffer,
-                0,
-                &staging_buffer,
-                0,
-                (n_faces * int_size) as _,
-            );
-            command_encoder.pop_debug_group();
+            // get command encoder
+            let mut command_encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                command_encoder.push_debug_group("Copy state");
+                command_encoder.copy_buffer_to_buffer(
+                    &self.state_buffer,
+                    0,
+                    &staging_buffer,
+                    0,
+                    (n_faces * int_size) as _,
+                );
+                command_encoder.pop_debug_group();
+            }
+            self.queue.submit(Some(command_encoder.finish()));
+
+            // Note that we're not calling `.await` here.
+            let buffer_slice = staging_buffer.slice(..);
+            // Gets the future representing when `staging_buffer` can be read from
+            let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+
+            // Poll the device in a blocking manner so that our future resolves.
+            // In an actual application, `device.poll(...)` should
+            // be called in an event loop or on another thread.
+            self.device.poll(wgpu::Maintain::Wait);
+
+            // Awaits until `buffer_future` can be read from
+            if let Ok(()) = pollster::block_on(buffer_future) {
+                // Gets contents of buffer
+                let data = buffer_slice.get_mapped_range();
+                let result: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
+                let result =
+                    Array5::from_shape_vec((t, x, y, z, 6), result).expect("Incorrect shape");
+                self.state = Some(result);
+
+                // // // With the current interface, we have to make sure all mapped views are
+                // // // dropped before we unmap the buffer.
+                // drop(data);
+                // buf.unmap(); // Unmaps buffer from memory
+            } else {
+                panic!("failed to run compute on gpu!")
+            }
         }
-        self.queue.submit(Some(command_encoder.finish()));
-
-        // Note that we're not calling `.await` here.
-        let buffer_slice = staging_buffer.slice(..);
-        // Gets the future representing when `staging_buffer` can be read from
-        let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
-
-        // Poll the device in a blocking manner so that our future resolves.
-        // In an actual application, `device.poll(...)` should
-        // be called in an event loop or on another thread.
-        self.device.poll(wgpu::Maintain::Wait);
-
-        // Awaits until `buffer_future` can be read from
-        if let Ok(()) = pollster::block_on(buffer_future) {
-            // Gets contents of buffer
-            let data = buffer_slice.get_mapped_range();
-            let result: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
-
-            // // // With the current interface, we have to make sure all mapped views are
-            // // // dropped before we unmap the buffer.
-            // drop(data);
-            // buf.unmap(); // Unmaps buffer from memory
-
-            // Returns data from buffer
-            result
-        } else {
-            panic!("failed to run compute on gpu!")
-        }
+        // Returns data from buffer
+        self.state.as_ref().unwrap()
     }
 }
