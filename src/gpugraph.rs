@@ -9,6 +9,7 @@ use wgpu::util::DeviceExt;
 
 pub struct GPUBackend {
     shape: SiteIndex,
+    vn: Vec<f32>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     state_buffer: wgpu::Buffer,
@@ -226,6 +227,7 @@ impl GPUBackend {
 
         Ok(Self {
             shape: bounds,
+            vn,
             device,
             queue,
             state_buffer,
@@ -245,6 +247,10 @@ impl GPUBackend {
 
     pub fn get_bounds(&self) -> SiteIndex {
         self.shape.clone()
+    }
+
+    pub fn get_potential(&self) -> &[f32] {
+        &self.vn
     }
 
     pub fn num_planes(&self) -> usize {
