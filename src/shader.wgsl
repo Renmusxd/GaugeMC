@@ -39,8 +39,8 @@ fn p_from_dims(first: u32, second: u32) -> u32 {
 }
 
 // https://www.reedbeta.com/blog/hash-functions-for-gpu-rendering/
-fn pcg_hash(input: u32) -> u32 {
-    let state : u32 = input * 747796405u + 2891336453u;
+fn pcg_hash(inp: u32) -> u32 {
+    let state : u32 = inp * 747796405u + 2891336453u;
     let word : u32 = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
 }
@@ -72,7 +72,7 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     }
 
     let replica_index = index / planes_per_replica;
-    let replica_offset = replica_index * planes_per_replica;
+    let replica_offset = replica_index * (t*x*y*z*p);
     index = index % planes_per_replica;
 
     // We will be looking at all entries of the form:
@@ -146,32 +146,31 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
         k2 = y*z*p;
     }
 
-    //var inc_energy_increase = 0.0;
-    //var dec_energy_increase = 0.0;
-    //for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
-    //    for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
-    //        let plaquette_index = v1*k1 + v2*k2 + offset;
-    //        let v_at_plaq = state.state[replica_offset + plaquette_index];
-    //        inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
-    //        dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
-    //    }
-    //}
-
-    //let add_one_p = exp(-inc_energy_increase);
-    //let sub_one_p = exp(-dec_energy_increase);
-
-    //let random_float = prng(global_id.x);
-    //let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
-
-    //if (random_float < 0.0) {
-    //    return;
-    //}
-    //let choice = select(-1, 1, random_float < add_one_p);
+    var inc_energy_increase = 0.0;
+    var dec_energy_increase = 0.0;
     for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
         for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
             let plaquette_index = v1*k1 + v2*k2 + offset;
-            //state.state[replica_offset + plaquette_index] = state.state[replica_offset + plaquette_index] + choice;
-            state.state[replica_offset + plaquette_index] = i32(global_id.x);
+            let v_at_plaq = state.state[replica_offset + plaquette_index];
+            inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
+            dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
+        }
+    }
+
+    let add_one_p = exp(-inc_energy_increase);
+    let sub_one_p = exp(-dec_energy_increase);
+
+    let random_float = prng(global_id.x);
+    let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
+
+    if (random_float < 0.0) {
+        return;
+    }
+    let choice = select(-1, 1, random_float < add_one_p);
+    for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
+        for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
+            let plaquette_index = v1*k1 + v2*k2 + offset;
+            state.state[replica_offset + plaquette_index] = state.state[replica_offset + plaquette_index] + choice;
         }
     }
 }
@@ -196,8 +195,11 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let nu = dim_indices.data[5 + 1];
     let sigma = dim_indices.data[5 + 2];
     let rho = dim_indices.data[5 + 3];
+    // Assertion: mu < nu < sigma
+    // rho is just the leftover
 
     let replica_index = index / ((t*x*y*z)/2u);
+    let replica_base_offset = replica_index * (t*x*y*z*p);
     index = index % ((t*x*y*z)/2u);
 
     let rho_index = index / (dim_indices.data[mu] * dim_indices.data[nu] * dim_indices.data[sigma] /2u);
@@ -212,7 +214,6 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let parity = (mu_index + nu_index + offset) % 2u;
     let sigma_index = 2u*sigma_index_half + parity;
 
-    let replica_base_offset = replica_index * ((t*x*y*z)/2u);
 
     var cube_index : vec4<u32> = vec4<u32>(0u, 0u, 0u, 0u);
     cube_index[mu] = mu_index;

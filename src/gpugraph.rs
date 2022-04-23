@@ -1,15 +1,18 @@
-use crate::{Dimension, SiteIndex};
+use crate::{Dimension, NDDualGraph, SiteIndex};
 use bytemuck;
-use ndarray::Array6;
+use ndarray::{Array1, Array2, Array6, Axis};
 use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 use std::borrow::Cow;
 use wgpu;
 use wgpu::util::DeviceExt;
 
 pub struct GPUBackend {
+    state: Option<Array6<i32>>,
     shape: SiteIndex,
     num_replicas: usize,
+    vn: Vec<f32>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     state_buffer: wgpu::Buffer,
@@ -56,7 +59,7 @@ impl GPUBackend {
         let bounds = SiteIndex { t, x, y, z };
         let n_faces = num_replicas * t * x * y * z * 6;
         if let Some(initial_state) = &initial_state {
-            if &[num_replicas, t, x, y, z, 6] != initial_state.shape() {
+            if [num_replicas, t, x, y, z, 6] != initial_state.shape() {
                 return Err(format!(
                     "Expected initial state with shape: {:?} found {:?}",
                     [num_replicas, t, x, y, z, 6],
@@ -167,18 +170,19 @@ impl GPUBackend {
                 entry_point: "main_global",
             });
 
-        let zero_state = vec![0; n_faces];
-        let initial_state = initial_state
-            .as_ref()
-            .map(|x| {
-                x.as_slice()
-                    .expect("Initial state not contiguous in memory!")
-            })
-            .unwrap_or(&zero_state);
+        let initial_state = if let Some(initial_state) = initial_state {
+            initial_state
+        } else {
+            Array6::zeros((num_replicas, t, x, y, z, 6))
+        };
 
         let state_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Plaquette Buffer"),
-            contents: bytemuck::cast_slice(initial_state),
+            contents: bytemuck::cast_slice(
+                initial_state
+                    .as_slice()
+                    .expect("Initial state not contiguous in memory!"),
+            ),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let vn_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -188,7 +192,7 @@ impl GPUBackend {
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&vec![0_u32; 10]),
+            contents: bytemuck::cast_slice(&[0_u32; 10]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let mut rng = if let Some(seed) = seed {
@@ -231,8 +235,10 @@ impl GPUBackend {
         let global_b = bindgroups.next().unwrap();
 
         Ok(Self {
+            state: None,
             shape: bounds,
             num_replicas,
+            vn,
             device,
             queue,
             state_buffer,
@@ -254,6 +260,13 @@ impl GPUBackend {
         self.shape.clone()
     }
 
+    pub fn get_num_replicas(&self) -> usize {
+        self.num_replicas
+    }
+    pub fn get_potential(&self) -> &[f32] {
+        &self.vn
+    }
+
     pub fn num_planes(&self) -> usize {
         let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
         let tnums = t * (x + y + z);
@@ -262,6 +275,7 @@ impl GPUBackend {
     }
 
     pub fn run_local_sweep(&mut self, dims: &[Dimension; 3], leftover: Dimension, offset: bool) {
+        self.state = None;
         let ndims = [
             self.shape.t,
             self.shape.x,
@@ -278,7 +292,7 @@ impl GPUBackend {
 
         self.queue.write_buffer(
             &self.localupdate.index_buffer,
-            0 as _,
+            0_u64,
             bytemuck::cast_slice(&ndims),
         );
 
@@ -301,8 +315,8 @@ impl GPUBackend {
             cpass.set_pipeline(&self.localupdate.update_pipeline);
             cpass.set_bind_group(0, &self.localupdate.bindgroup, &[]);
 
-            let nneeded =
-                self.num_replicas * rho as usize * mu as usize * nu as usize * (sigma as usize / 2);
+            let cubes_per_replica = rho * mu * nu * (sigma / 2);
+            let nneeded = self.num_replicas * cubes_per_replica as usize;
             let ndispatch = ((nneeded + 255) / 256) as u32;
             cpass.dispatch(ndispatch, 1, 1);
         }
@@ -312,10 +326,11 @@ impl GPUBackend {
     }
 
     pub fn run_global_sweep(&mut self) {
+        self.state = None;
         // Write bounds in case they aren't there.
         self.queue.write_buffer(
             &self.localupdate.index_buffer,
-            0 as _,
+            0_u64,
             bytemuck::cast_slice(&[
                 self.shape.t as u32,
                 self.shape.x as u32,
@@ -331,7 +346,7 @@ impl GPUBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         // compute pass
-        command_encoder.push_debug_group(&format!("Global Sweep"));
+        command_encoder.push_debug_group("Global Sweep");
 
         {
             let mut cpass =
@@ -340,8 +355,12 @@ impl GPUBackend {
             cpass.set_bind_group(0, &self.globalupdate.bindgroup, &[]);
 
             let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
-            let nneeded = self.num_replicas * (t * (x + y + z) + x * (y + z) + y * z);
+            let planes_per_replica = t * (x + y + z) + x * (y + z) + y * z;
+            let nneeded = self.num_replicas * planes_per_replica;
             let ndispatch = ((nneeded + 255) / 256) as u32;
+
+            println!("{}:{}\t{}", planes_per_replica, nneeded, ndispatch);
+
             cpass.dispatch(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
@@ -349,80 +368,153 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
     }
 
-    pub fn get_state_array(&mut self) -> Array6<i32> {
-        let state = self.get_state();
-        Array6::from_shape_vec(
-            (
-                self.num_replicas,
-                self.shape.t,
-                self.shape.x,
-                self.shape.y,
-                self.shape.z,
-                6,
-            ),
-            state,
-        )
-        .unwrap()
+    pub fn get_energy(&mut self) -> Array1<f32> {
+        // sum t, x, y, z
+        self.calculate_state();
+        let potential = self.get_potential();
+        self.get_precalculated_state()
+            .unwrap()
+            .axis_iter(Axis(0))
+            .map(|s| s.iter().map(|s| potential[s.abs() as usize]).sum())
+            .collect()
     }
 
-    pub fn get_num_replicas(&self) -> usize {
-        self.num_replicas
-    }
-
-    pub fn get_state(&mut self) -> Vec<i32> {
-        let n_faces =
-            self.num_replicas * self.shape.t * self.shape.x * self.shape.y * self.shape.z * 6;
-        let int_size = std::mem::size_of::<i32>();
-
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (n_faces * int_size) as _,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+    pub fn get_winding_nums(&mut self) -> Array2<i32> {
+        let mut sum = self
+            .get_state()
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1));
+        let bounds = &self.shape;
+        let plane_sizes = [
+            bounds.t * bounds.x,
+            bounds.t * bounds.y,
+            bounds.t * bounds.z,
+            bounds.x * bounds.y,
+            bounds.x * bounds.z,
+            bounds.y * bounds.z,
+        ];
+        sum.axis_iter_mut(Axis(0)).for_each(|mut arr| {
+            arr.iter_mut().zip(plane_sizes.iter()).for_each(|(s, n)| {
+                *s /= *n as i32;
+            })
         });
+        sum
+    }
 
-        // get command encoder
-        let mut command_encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            command_encoder.push_debug_group("Copy state");
-            command_encoder.copy_buffer_to_buffer(
-                &self.state_buffer,
-                0,
-                &staging_buffer,
-                0,
-                (n_faces * int_size) as _,
-            );
-            command_encoder.pop_debug_group();
+    pub fn calculate_state(&mut self) {
+        if self.state.is_none() {
+            let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
+            let n_faces = self.num_replicas * t * x * y * z * 6;
+            let int_size = std::mem::size_of::<i32>();
+            let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n_faces * int_size) as _,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            // get command encoder
+            let mut command_encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                command_encoder.push_debug_group("Copy state");
+                command_encoder.copy_buffer_to_buffer(
+                    &self.state_buffer,
+                    0,
+                    &staging_buffer,
+                    0,
+                    (n_faces * int_size) as _,
+                );
+                command_encoder.pop_debug_group();
+            }
+            self.queue.submit(Some(command_encoder.finish()));
+
+            // Note that we're not calling `.await` here.
+            let buffer_slice = staging_buffer.slice(..);
+            // Gets the future representing when `staging_buffer` can be read from
+            let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+
+            // Poll the device in a blocking manner so that our future resolves.
+            // In an actual application, `device.poll(...)` should
+            // be called in an event loop or on another thread.
+            self.device.poll(wgpu::Maintain::Wait);
+
+            // Awaits until `buffer_future` can be read from
+            if let Ok(()) = pollster::block_on(buffer_future) {
+                // Gets contents of buffer
+                let data = buffer_slice.get_mapped_range();
+                let result: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
+                let result = Array6::from_shape_vec((self.num_replicas, t, x, y, z, 6), result)
+                    .expect("Incorrect shape");
+                self.state = Some(result);
+
+                // // // With the current interface, we have to make sure all mapped views are
+                // // // dropped before we unmap the buffer.
+                // drop(data);
+                // buf.unmap(); // Unmaps buffer from memory
+            } else {
+                panic!("failed to run compute on gpu!")
+            }
         }
-        self.queue.submit(Some(command_encoder.finish()));
+    }
 
-        // Note that we're not calling `.await` here.
-        let buffer_slice = staging_buffer.slice(..);
-        // Gets the future representing when `staging_buffer` can be read from
-        let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+    pub fn get_state(&mut self) -> &Array6<i32> {
+        self.calculate_state();
+        // Returns data from buffer
+        self.state.as_ref().unwrap()
+    }
 
-        // Poll the device in a blocking manner so that our future resolves.
-        // In an actual application, `device.poll(...)` should
-        // be called in an event loop or on another thread.
-        self.device.poll(wgpu::Maintain::Wait);
+    pub fn get_precalculated_state(&self) -> Option<&Array6<i32>> {
+        self.state.as_ref()
+    }
 
-        // Awaits until `buffer_future` can be read from
-        if let Ok(()) = pollster::block_on(buffer_future) {
-            // Gets contents of buffer
-            let data = buffer_slice.get_mapped_range();
-            let result: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
-
-            // // // With the current interface, we have to make sure all mapped views are
-            // // // dropped before we unmap the buffer.
-            // drop(data);
-            // buf.unmap(); // Unmaps buffer from memory
-
-            // Returns data from buffer
-            result
-        } else {
-            panic!("failed to run compute on gpu!")
-        }
+    pub fn get_edges_with_violations(
+        &mut self,
+    ) -> Vec<((usize, SiteIndex, Dimension), Vec<(SiteIndex, usize)>)> {
+        let shape = self.shape.clone();
+        let edge_iterator = (0..self.get_num_replicas()).flat_map(|r| {
+            (0..shape.t).flat_map(move |t| {
+                (0..shape.x).flat_map(move |x| {
+                    (0..shape.y).flat_map(move |y| {
+                        (0..shape.z).flat_map(move |z| {
+                            (0..4usize)
+                                .map(Dimension::from)
+                                .map(move |d| (r, SiteIndex { t, x, y, z }, d))
+                        })
+                    })
+                })
+            })
+        });
+        self.calculate_state();
+        let state = self.get_precalculated_state().unwrap();
+        edge_iterator
+            .par_bridge()
+            .filter_map(|(r, s, d)| {
+                let (poss, negs) = NDDualGraph::plaquettes_next_to_edge(&s, d, &self.shape);
+                let sum = poss
+                    .iter()
+                    .cloned()
+                    .map(|p| (p, 1))
+                    .chain(negs.iter().cloned().map(|n| (n, -1)))
+                    .map(|((site, p), mult)| {
+                        state
+                            .get(ndarray::Ix6(r, site.t, site.x, site.y, site.z, p))
+                            .unwrap()
+                            * mult
+                    })
+                    .sum::<i32>();
+                if sum != 0 {
+                    Some((
+                        (r, s.clone(), d),
+                        poss.into_iter().chain(negs.into_iter()).collect::<Vec<_>>(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
