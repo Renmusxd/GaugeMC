@@ -359,8 +359,6 @@ impl GPUBackend {
             let nneeded = self.num_replicas * planes_per_replica;
             let ndispatch = ((nneeded + 255) / 256) as u32;
 
-            println!("{}:{}\t{}", planes_per_replica, nneeded, ndispatch);
-
             cpass.dispatch(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
