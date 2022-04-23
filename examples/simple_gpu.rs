@@ -1,5 +1,6 @@
 use env_logger;
 use gaugemc;
+use gaugemc::Dimension;
 use num_traits::Zero;
 use pollster;
 use std::collections::HashMap;
@@ -20,7 +21,12 @@ fn main() -> Result<(), String> {
         None,
     ))?;
 
-    state.run_global_sweep();
+    // state.run_global_sweep();
+    state.run_local_sweep(
+        &[Dimension::T, Dimension::X, Dimension::Y],
+        Dimension::Z,
+        false,
+    );
     let read_state = state.get_state();
 
     let max_int = read_state.iter().cloned().max().unwrap_or(0) as usize;

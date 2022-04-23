@@ -224,81 +224,44 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
 
     var pos_indices : vec3<u32> = vec3<u32>(0u, 0u, 0u);
     var neg_indices : vec3<u32> = vec3<u32>(0u, 0u, 0u);
-    var pos_count: u32 = 0u;
-    var neg_count: u32 = 0u;
 
     // First do the ones attached to the calculated point
     let first = mu;
     let second = nu;
-    let sign = (second - first + 1u) % 2u;
     let p_index = p_from_dims(first, second);
     let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
-    if (sign == 0u) {
-        pos_indices[pos_count] = index;
-        pos_count = pos_count + 1u;
-    } else {
-        neg_indices[neg_count] = index;
-        neg_count = neg_count + 1u;
-    }
+    pos_indices[0] = index;
 
     let first = mu;
     let second = sigma;
-    let sign = (second - first + 1u) % 2u;
     let p_index = p_from_dims(first, second);
     let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
-    if (sign == 0u) {
-        pos_indices[pos_count] = index;
-        pos_count = pos_count + 1u;
-    } else {
-        neg_indices[neg_count] = index;
-        neg_count = neg_count + 1u;
-    }
+    neg_indices[0] = index;
 
     let first = nu;
     let second = sigma;
-    let sign = (second - first + 1u) % 2u;
     let p_index = p_from_dims(first, second);
     let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
-    if (sign == 0u) {
-        pos_indices[pos_count] = index;
-        pos_count = pos_count + 1u;
-    } else {
-        neg_indices[neg_count] = index;
-        neg_count = neg_count + 1u;
-    }
+    pos_indices[1] = index;
 
     // Now the opposing faces.
     let first = mu;
     let second = nu;
     let normal = sigma;
     cube_index[normal] = (cube_index[normal] + 1u) % dim_indices.data[normal];
-    let sign = (second - first) % 2u;
     let p_index = p_from_dims(first, second);
     let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     cube_index[normal] = (cube_index[normal] + dim_indices.data[normal] - 1u) % dim_indices.data[normal];
-    if (sign == 0u) {
-        pos_indices[pos_count] = index;
-        pos_count = pos_count + 1u;
-    } else {
-        neg_indices[neg_count] = index;
-        neg_count = neg_count + 1u;
-    }
+    neg_indices[1] = index;
 
     let first = mu;
     let second = sigma;
     let normal = nu;
     cube_index[normal] = (cube_index[normal] + 1u) % dim_indices.data[normal];
-    let sign = (second - first) % 2u;
     let p_index = p_from_dims(first, second);
     let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     cube_index[normal] = (cube_index[normal] + dim_indices.data[normal] - 1u) % dim_indices.data[normal];
-    if (sign == 0u) {
-        pos_indices[pos_count] = index;
-        pos_count = pos_count + 1u;
-    } else {
-        neg_indices[neg_count] = index;
-        neg_count = neg_count + 1u;
-    }
+    pos_indices[2] = index;
 
     let first = nu;
     let second = sigma;
@@ -308,13 +271,7 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let p_index = p_from_dims(first, second);
     let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     cube_index[normal] = (cube_index[normal] + dim_indices.data[normal] - 1u) % dim_indices.data[normal];
-    if (sign == 0u) {
-        pos_indices[pos_count] = index;
-        pos_count = pos_count + 1u;
-    } else {
-        neg_indices[neg_count] = index;
-        neg_count = neg_count + 1u;
-    }
+    neg_indices[2] = index;
 
     // Now we have the positive and negative indices.
     var add_one_dv = f32(0.0);
