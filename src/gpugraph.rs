@@ -5,6 +5,7 @@ use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::cmp::max;
 use wgpu;
 use wgpu::util::DeviceExt;
 
@@ -12,6 +13,7 @@ pub struct GPUBackend {
     state: Option<Array6<i32>>,
     shape: SiteIndex,
     num_replicas: usize,
+    num_pcgs: usize,
     vn: Vec<f32>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -20,6 +22,7 @@ pub struct GPUBackend {
     pcgstate_buffer: wgpu::Buffer,
     localupdate: LocalUpdatePipeline,
     globalupdate: GlobalUpdatePipeline,
+    pcgupdate: PCGRotatePipeline,
 }
 
 struct LocalUpdatePipeline {
@@ -28,6 +31,10 @@ struct LocalUpdatePipeline {
     bindgroup: wgpu::BindGroup,
 }
 struct GlobalUpdatePipeline {
+    update_pipeline: wgpu::ComputePipeline,
+    bindgroup: wgpu::BindGroup,
+}
+struct PCGRotatePipeline {
     update_pipeline: wgpu::ComputePipeline,
     bindgroup: wgpu::BindGroup,
 }
@@ -67,6 +74,9 @@ impl GPUBackend {
                 ));
             }
         }
+
+        let n_planes = num_replicas * (t * (x + y + z) + x * (y + z) + y * z);
+        let num_pcgs = max(n_faces / 2, n_planes);
 
         // Instantiates instance of WebGPU
         let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
@@ -169,6 +179,13 @@ impl GPUBackend {
                 module: &compute_shader,
                 entry_point: "main_global",
             });
+        let rotate_pcg_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rotate pcg pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &compute_shader,
+                entry_point: "rotate_pcg",
+            });
 
         let initial_state = if let Some(initial_state) = initial_state {
             initial_state
@@ -200,14 +217,15 @@ impl GPUBackend {
         } else {
             SmallRng::from_entropy()
         };
-        let contents = (0..n_faces / 2).map(|_| rng.gen()).collect::<Vec<u32>>();
+
+        let contents = (0..num_pcgs).map(|_| rng.gen()).collect::<Vec<u32>>();
         let pcgstate_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("PCG Buffer"),
             contents: bytemuck::cast_slice(&contents),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let mut bindgroups = (0..2).map(|_| {
+        let mut bindgroups = (0..3).map(|_| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &compute_bind_group_layout,
                 entries: &[
@@ -233,11 +251,13 @@ impl GPUBackend {
         });
         let local_b = bindgroups.next().unwrap();
         let global_b = bindgroups.next().unwrap();
+        let pcg_b = bindgroups.next().unwrap();
 
         Ok(Self {
             state: None,
             shape: bounds,
             num_replicas,
+            num_pcgs,
             vn,
             device,
             queue,
@@ -252,6 +272,10 @@ impl GPUBackend {
             globalupdate: GlobalUpdatePipeline {
                 update_pipeline: globalupdate_pipeline,
                 bindgroup: global_b,
+            },
+            pcgupdate: PCGRotatePipeline {
+                update_pipeline: rotate_pcg_pipeline,
+                bindgroup: pcg_b,
             },
         })
     }
@@ -272,6 +296,54 @@ impl GPUBackend {
         let tnums = t * (x + y + z);
         let xnums = x * (y + z);
         tnums + xnums + y * z
+    }
+
+    pub fn run_pcg_rotate(&mut self) {
+        self.run_pcg_rotate_offset(false);
+        self.run_pcg_rotate_offset(true);
+    }
+
+    pub fn run_pcg_rotate_offset(&mut self, offset: bool) {
+        let ndims = [
+            self.shape.t,
+            self.shape.x,
+            self.shape.y,
+            self.shape.z,
+            self.num_replicas,
+            self.num_pcgs,
+            if offset { 1 } else { 0 },
+        ]
+        .into_iter()
+        .map(|x| x as u32)
+        .collect::<Vec<_>>();
+
+        self.queue.write_buffer(
+            &self.localupdate.index_buffer,
+            0_u64,
+            bytemuck::cast_slice(&ndims),
+        );
+
+        // get command encoder
+        let mut command_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // compute pass
+        command_encoder.push_debug_group(&format!("PCG Rotate Sweep: {}", offset));
+
+        {
+            let mut cpass =
+                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            cpass.set_pipeline(&self.pcgupdate.update_pipeline);
+            cpass.set_bind_group(0, &self.pcgupdate.bindgroup, &[]);
+
+            let nneeded = self.num_pcgs / 2;
+            let ndispatch = ((nneeded + 255) / 256) as u32;
+            cpass.dispatch(ndispatch, 1, 1);
+        }
+        command_encoder.pop_debug_group();
+
+        self.queue.submit(Some(command_encoder.finish()));
     }
 
     pub fn run_local_sweep(&mut self, dims: &[Dimension; 3], leftover: Dimension, offset: bool) {
@@ -366,20 +438,22 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
     }
 
-    pub fn get_energy(&mut self) -> Array1<f32> {
+    pub fn get_energy(&mut self) -> Result<Array1<f32>, String> {
         // sum t, x, y, z
-        self.calculate_state();
+        self.calculate_state()?;
         let potential = self.get_potential();
-        self.get_precalculated_state()
+        let res = self
+            .get_precalculated_state()
             .unwrap()
             .axis_iter(Axis(0))
             .map(|s| s.iter().map(|s| potential[s.abs() as usize]).sum())
-            .collect()
+            .collect();
+        Ok(res)
     }
 
-    pub fn get_winding_nums(&mut self) -> Array2<i32> {
+    pub fn get_winding_nums(&mut self) -> Result<Array2<i32>, String> {
         let mut sum = self
-            .get_state()
+            .get_state()?
             .sum_axis(Axis(1))
             .sum_axis(Axis(1))
             .sum_axis(Axis(1))
@@ -398,10 +472,10 @@ impl GPUBackend {
                 *s /= *n as i32;
             })
         });
-        sum
+        Ok(sum)
     }
 
-    pub fn calculate_state(&mut self) {
+    pub fn calculate_state(&mut self) -> Result<(), String> {
         if self.state.is_none() {
             let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
             let n_faces = self.num_replicas * t * x * y * z * 6;
@@ -453,16 +527,22 @@ impl GPUBackend {
                 // // // dropped before we unmap the buffer.
                 // drop(data);
                 // buf.unmap(); // Unmaps buffer from memory
+
+                Ok(())
             } else {
-                panic!("failed to run compute on gpu!")
+                Err("failed to run compute on gpu!".to_string())
             }
+        } else {
+            Ok(())
         }
     }
 
-    pub fn get_state(&mut self) -> &Array6<i32> {
-        self.calculate_state();
+    pub fn get_state(&mut self) -> Result<&Array6<i32>, String> {
+        self.calculate_state()?;
         // Returns data from buffer
-        self.state.as_ref().unwrap()
+        self.state
+            .as_ref()
+            .ok_or_else(|| "State not stored".to_string())
     }
 
     pub fn get_precalculated_state(&self) -> Option<&Array6<i32>> {
@@ -471,7 +551,7 @@ impl GPUBackend {
 
     pub fn get_edges_with_violations(
         &mut self,
-    ) -> Vec<((usize, SiteIndex, Dimension), Vec<(SiteIndex, usize)>)> {
+    ) -> Result<Vec<((usize, SiteIndex, Dimension), Vec<(SiteIndex, usize)>)>, String> {
         let shape = self.shape.clone();
         let edge_iterator = (0..self.get_num_replicas()).flat_map(|r| {
             (0..shape.t).flat_map(move |t| {
@@ -486,9 +566,9 @@ impl GPUBackend {
                 })
             })
         });
-        self.calculate_state();
+        self.calculate_state()?;
         let state = self.get_precalculated_state().unwrap();
-        edge_iterator
+        let res = edge_iterator
             .par_bridge()
             .filter_map(|(r, s, d)| {
                 let (poss, negs) = NDDualGraph::plaquettes_next_to_edge(&s, d, &self.shape);
@@ -506,13 +586,14 @@ impl GPUBackend {
                     .sum::<i32>();
                 if sum != 0 {
                     Some((
-                        (r, s.clone(), d),
+                        (r, s, d),
                         poss.into_iter().chain(negs.into_iter()).collect::<Vec<_>>(),
                     ))
                 } else {
                     None
                 }
             })
-            .collect()
+            .collect();
+        Ok(res)
     }
 }

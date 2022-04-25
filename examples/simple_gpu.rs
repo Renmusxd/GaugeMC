@@ -1,6 +1,7 @@
 use env_logger;
 use gaugemc;
 use gaugemc::{Dimension, NDDualGraph};
+use ndarray::{Array2, Array3, Axis};
 use num_traits::Zero;
 use pollster;
 use std::collections::HashMap;
@@ -8,29 +9,37 @@ use std::collections::HashMap;
 fn main() -> Result<(), String> {
     env_logger::init();
 
-    let (t, x, y, z) = (20, 20, 20, 20);
+    let num_replicas = 1;
+    let steps_per_sample = 10000;
+    let num_updates = 10;
+
+    let (t, x, y, z) = (32, 32, 32, 32);
     let mut state = pollster::block_on(gaugemc::GPUBackend::new_async(
         t,
         x,
         y,
         z,
         VNS.to_vec(),
-        Some(1),
+        Some(num_replicas),
         None,
         None,
     ))?;
 
-    for _ in 0..1000 {
-        for _ in 0..10 {
+    for _ in 0..steps_per_sample {
+        for _ in 0..num_updates {
             NDDualGraph::get_cube_dim_and_offset_iterator().for_each(|(dims, offset)| {
                 let leftover = NDDualGraph::get_leftover_dim(&dims);
                 state.run_local_sweep(&dims, leftover, offset);
             })
         }
         state.run_global_sweep();
+        state.run_pcg_rotate();
     }
 
-    assert_eq!(state.get_edges_with_violations().len(), 0);
+    let winding_nums = state.get_winding_nums()?;
+    println!("{:?}", winding_nums.as_slice());
+
+    // assert_eq!(state.get_edges_with_violations()?.len(), 0);
 
     // // state.run_global_sweep();
     // state.run_local_sweep(

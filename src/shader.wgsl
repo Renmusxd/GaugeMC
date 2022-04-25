@@ -16,7 +16,7 @@ struct DimInformation {
 };
 
 struct PCGState {
-  state : array<u32>;
+    state : array<u32>;
 };
 
 [[group(0), binding(0)]]
@@ -54,6 +54,20 @@ fn prng(index: u32) -> f32 {
 }
 
 [[stage(compute), workgroup_size(256,1,1)]]
+fn rotate_pcg([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+    var index = global_id.x;
+
+    let num_pcgs = dim_indices.data[5];
+    let use_offset = dim_indices.data[6];
+
+    let pcg_index = 2u*index + use_offset;
+    if (pcg_index >= num_pcgs) {
+        return;
+    }
+    pcgstate.state[pcg_index] = pcgstate.state[pcg_index] ^ pcgstate.state[(pcg_index + 1u) % num_pcgs];
+}
+
+[[stage(compute), workgroup_size(256,1,1)]]
 fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     var index = global_id.x;
 
@@ -65,9 +79,9 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let num_replicas = dim_indices.data[4];
 
     let planes_per_replica = t*(x+y+z) + x*(y+z) + y*z;
-    let num_plaquettes = num_replicas*planes_per_replica;
+    let num_planes = num_replicas*planes_per_replica;
 
-    if (index >= num_plaquettes) {
+    if (index >= num_planes) {
         return;
     }
 
@@ -157,11 +171,18 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
         }
     }
 
+    // Shift all choices to the most preferable thing is "0" energy.
+    let lowest_e = min(inc_energy_increase, min(dec_energy_increase, 0.0));
+    let zero_energy = 0.0 - lowest_e;
+    inc_energy_increase = inc_energy_increase - lowest_e;
+    dec_energy_increase = dec_energy_increase - lowest_e;
+
+    let add_zer_p = exp(-zero_energy);
     let add_one_p = exp(-inc_energy_increase);
     let sub_one_p = exp(-dec_energy_increase);
 
     let random_float = prng(global_id.x);
-    let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
+    let random_float = random_float * (add_zer_p + add_one_p + sub_one_p) - add_zer_p;
 
     if (random_float < 0.0) {
         return;
