@@ -92,7 +92,7 @@ fn rotate_pcg([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
 }
 
 [[stage(compute), workgroup_size(256,1,1)]]
-fn initial_sum_planes_inc_dec([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+fn initial_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     var index = global_id.x;
 
     let t = dim_indices.data[0];
@@ -102,84 +102,61 @@ fn initial_sum_planes_inc_dec([[builtin(global_invocation_id)]] global_id: vec3<
     let p = 6u;
     let num_replicas = dim_indices.data[4];
 
+    // Since each dimension starts as an even number, and there are 6 faces, we knows at least
+    // 2^4 * 6 entries in each replica.
+    // We will just do 16 of those since parallelization is good too.
+    // We wont, however, do the reduction in any particular order.
+    let intitial_reduction = 16u;
+
     // We group 4 at a time to start.
-    let entries_per_plane_type = (t*x*y*z)/4u;
-    let entries_per_replica = entries_per_plane_type*p;
+    let entries_per_replica = (t*x*y*z*p)/intitial_reduction;
     let num_threads = entries_per_replica*num_replicas;
     if (index >= num_threads) {
         return;
     }
 
-    let replica_index = index / entries_per_replica;
-    index = index % entries_per_replica;
-
-    let pi = index / entries_per_plane_type;
-    var subindex = index % entries_per_plane_type;
-
-    var bounds = vec4<u32>(t, x, y, z);
-    // Depending on pi, rescale values.
-    let dims = dims_from_p(pi);
-    let mu = dims[0];
-    let nu = dims[1];
-    bounds[mu] = bounds[mu]/2u;
-    bounds[nu] = bounds[nu]/2u;
-
-    let ti = subindex / (bounds[1] * bounds[2] * bounds[3]);
-    subindex = subindex % (bounds[1] * bounds[2] * bounds[3]);
-    let xi = subindex / (bounds[2] * bounds[3]);
-    subindex = subindex % (bounds[2] * bounds[3]);
-    let yi = subindex / bounds[3];
-    let zi = subindex % bounds[3];
-
-    var coords = vec4<u32>(ti, xi, yi, zi);
-    let mu = dims[0];
-    let nu = dims[1];
-    coords[mu] = coords[mu]*2u;
-    coords[nu] = coords[nu]*2u;
-
-    // Now calculate the change in energy
-    var indices = vec4<u32>(0u,0u,0u,0u);
+    let replica_index = index % num_replicas;
+    index = index / num_replicas;
 
     let replica_offset = replica_index * (t*x*y*z*p);
-    // 0,0
-    let plaq_index = coords[0]*(x*y*z*p) + coords[1]*(y*z*p) + coords[2]*(z*p) + coords[3]*p + pi;
-    indices[0] = replica_offset + plaq_index;
 
-    // 1,0
-    coords[mu] = coords[mu] + 1u;
-    let plaq_index = coords[0]*(x*y*z*p) + coords[1]*(y*z*p) + coords[2]*(z*p) + coords[3]*p + pi;
-    indices[1] = replica_offset + plaq_index;
+    var energy = 0.0;
+    for (var i = 0u; i < initial_reduction; i++) {
+        let n = state.state[replica_offset + index + i];
+        energy = energy + vn.vn[abs(n)];
+    }
 
-    // 1,1
-    coords[nu] = coords[nu] + 1u;
-    let plaq_index = coords[0]*(x*y*z*p) + coords[1]*(y*z*p) + coords[2]*(z*p) + coords[3]*p + pi;
-    indices[3] = replica_offset + plaq_index;
-
-    // 1,0
-    coords[mu] = coords[mu] - 1u;
-    let plaq_index = coords[0]*(x*y*z*p) + coords[1]*(y*z*p) + coords[2]*(z*p) + coords[3]*p + pi;
-    indices[2] = replica_offset + plaq_index;
-
-    var inc_energy_increase = 0.0;
-    var dec_energy_increase = 0.0;
-    let v_at_plaq = state.state[ indices[0] ];
-    inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
-    dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
-    let v_at_plaq = state.state[ indices[1] ];
-    inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
-    dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
-    let v_at_plaq = state.state[ indices[2] ];
-    inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
-    dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
-    let v_at_plaq = state.state[ indices[3] ];
-    inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
-    dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
-
-    sumbuffer.buff[2u*global_id.x] = inc_energy_increase;
-    sumbuffer.buff[2u*global_id.x + 1u] = dec_energy_increase;
+    sumbuffer.buff[global_id.x] = energy;
 }
 
-// TODO reduce the results from the above function...
+
+[[stage(compute), workgroup_size(256,1,1)]]
+fn incremental_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+    var index = global_id.x;
+
+    let num_replicas = dim_indices.data[4];
+    let size_in_replica = dim_indices.data[5];
+
+    let num_threads = size_in_replica*num_replicas;
+    if (index >= num_threads) {
+        return;
+    }
+
+    let replica_index = index % num_replicas;
+    index = index / num_replicas;
+
+    // Want to fold ith with (N-i)th - reduces by 2 each time and keeps arrangement of replicas.
+    let fold_index = (size_in_replica - 1u - index)*num_replicas + replica_index;
+    let index = (index * num_replicas) + replica_index;
+
+    if (fold_index == index) {
+        return;
+    }
+
+    let energy = sumbuffer.buff[index] + sumbuffer.buff[fold_index];
+    sumbuffer.buff[index] = energy;
+    sumbuffer.buff[fold_index] = 0.0;
+}
 
 [[stage(compute), workgroup_size(256,1,1)]]
 fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {

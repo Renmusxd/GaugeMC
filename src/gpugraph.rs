@@ -41,9 +41,11 @@ struct PCGRotatePipeline {
     bindgroup: wgpu::BindGroup,
 }
 
-struct SumPlanesPipeline {
-    sum_pipeline: wgpu::ComputePipeline,
-    bindgroup: wgpu::BindGroup,
+struct SumEnergyPipeline {
+    init_sum_pipeline: wgpu::ComputePipeline,
+    inc_sum_pipeline: wgpu::ComputePipeline,
+    init_bindgroup: wgpu::BindGroup,
+    inc_bindgroup: wgpu::BindGroup,
 }
 
 impl GPUBackend {
@@ -117,6 +119,7 @@ impl GPUBackend {
         let float_size = std::mem::size_of::<f32>();
         let index_size = std::mem::size_of::<u32>();
 
+        const INIT_REDUX: usize = 16;
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
@@ -169,7 +172,7 @@ impl GPUBackend {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: wgpu::BufferSize::new(
-                                (2 * (n_faces / 4) * float_size) as _,
+                                ((n_faces / INIT_REDUX) * float_size) as _,
                             ),
                         },
                         count: None,
@@ -179,7 +182,7 @@ impl GPUBackend {
             });
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("localupdate"),
+                label: Some("DualGaugeLayout"),
                 bind_group_layouts: &[&compute_bind_group_layout],
                 push_constant_ranges: &[],
             });
@@ -205,11 +208,17 @@ impl GPUBackend {
                 module: &compute_shader,
                 entry_point: "rotate_pcg",
             });
-        let sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("planewise summation pipeline"),
+        let init_sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("intitial energy summation pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &compute_shader,
-            entry_point: "initial_sum_planes_inc_dec",
+            entry_point: "initial_sum_energy",
+        });
+        let inc_sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("incremental energy summation pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: "incremental_sum_energy",
         });
 
         let initial_state = if let Some(initial_state) = initial_state {
@@ -252,11 +261,11 @@ impl GPUBackend {
 
         let sum_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sum Buffer"),
-            contents: bytemuck::cast_slice(&vec![0_u32; n_faces / 2]),
+            contents: bytemuck::cast_slice(&vec![0_u32; n_faces / INIT_REDUX]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let mut bindgroups = (0..4).map(|_| {
+        let mut bindgroups = (0..5).map(|_| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &compute_bind_group_layout,
                 entries: &[
@@ -283,7 +292,8 @@ impl GPUBackend {
         let local_b = bindgroups.next().unwrap();
         let global_b = bindgroups.next().unwrap();
         let pcg_b = bindgroups.next().unwrap();
-        let sum_b = bindgroups.next().unwrap();
+        let init_sum_b = bindgroups.next().unwrap();
+        let inc_sum_b = bindgroups.next().unwrap();
 
         Ok(Self {
             state: None,
@@ -310,9 +320,11 @@ impl GPUBackend {
                 update_pipeline: rotate_pcg_pipeline,
                 bindgroup: pcg_b,
             },
-            sum_planes: SumPlanesPipeline {
-                sum_pipeline,
-                bindgroup: sum_b,
+            sum_planes: SumEnergyPipeline {
+                init_sum_pipeline,
+                inc_sum_pipeline,
+                init_bindgroup: init_sum_b,
+                inc_bindgroup: inc_sum_b,
             },
         })
     }
