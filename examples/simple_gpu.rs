@@ -10,7 +10,7 @@ fn main() -> Result<(), String> {
     env_logger::init();
 
     let num_replicas = 1;
-    let steps_per_sample = 10000;
+    let steps_per_sample = 10;
     let num_updates = 10;
 
     let (t, x, y, z) = (32, 32, 32, 32);
