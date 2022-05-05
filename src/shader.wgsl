@@ -19,6 +19,10 @@ struct PCGState {
     state : array<u32>;
 };
 
+struct SumBuffer {
+    buff : array<f32>;
+};
+
 [[group(0), binding(0)]]
 var<storage, read_write> state : State;
 [[group(0), binding(1)]]
@@ -27,6 +31,8 @@ var<storage, read> vn : Vn;
 var<storage, read> dim_indices : DimInformation;
 [[group(0), binding(3)]]
 var<storage, read_write> pcgstate : PCGState;
+[[group(0), binding(4)]]
+var<storage, read_write> sumbuffer : SumBuffer;
 
 fn p_from_dims(first: u32, second: u32) -> u32 {
     // first and second are between 0x00 and 0x11
@@ -36,6 +42,24 @@ fn p_from_dims(first: u32, second: u32) -> u32 {
     let b = ((first == 0u) & (second == 3u)) | ((first == 1u) & (second == 2u));
     let c = (first == 2u) | (second == 2u);
     return (u32(a) << 2u) | (u32(b) << 1u) | u32(c);
+}
+
+fn dims_from_p(p: u32) -> vec2<u32> {
+    // t t t x x y
+    // x y z y z z
+    var v = vec2<u32>(0u, 1u);
+    // v[0] = select(0,0,p<3);
+    v[0] = select(0u,1u,p<5u);
+    v[0] = select(v[0],2u,p==5u);
+
+    // v[1] = select(v[1],1,p==0);
+    v[1] = select(v[1],2u,p==1u);
+    v[1] = select(v[1],3u,p==2u);
+    v[1] = select(v[1],2u,p==3u);
+    v[1] = select(v[1],3u,p==4u);
+    v[1] = select(v[1],3u,p==5u);
+
+    return v;
 }
 
 // https://www.reedbeta.com/blog/hash-functions-for-gpu-rendering/
@@ -66,6 +90,96 @@ fn rotate_pcg([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     }
     pcgstate.state[pcg_index] = pcgstate.state[pcg_index] ^ pcgstate.state[(pcg_index + 1u) % num_pcgs];
 }
+
+[[stage(compute), workgroup_size(256,1,1)]]
+fn initial_sum_planes_inc_dec([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+    var index = global_id.x;
+
+    let t = dim_indices.data[0];
+    let x = dim_indices.data[1];
+    let y = dim_indices.data[2];
+    let z = dim_indices.data[3];
+    let p = 6u;
+    let num_replicas = dim_indices.data[4];
+
+    // We group 4 at a time to start.
+    let entries_per_plane_type = (t*x*y*z)/4u;
+    let entries_per_replica = entries_per_plane_type*p;
+    let num_threads = entries_per_replica*num_replicas;
+    if (index >= num_threads) {
+        return;
+    }
+
+    let replica_index = index / entries_per_replica;
+    index = index % entries_per_replica;
+
+    let pi = index / entries_per_plane_type;
+    var subindex = index % entries_per_plane_type;
+
+    var bounds = vec4<u32>(t, x, y, z);
+    // Depending on pi, rescale values.
+    let dims = dims_from_p(pi);
+    let mu = dims[0];
+    let nu = dims[1];
+    bounds[mu] = bounds[mu]/2u;
+    bounds[nu] = bounds[nu]/2u;
+
+    let ti = subindex / (bounds[1] * bounds[2] * bounds[3]);
+    subindex = subindex % (bounds[1] * bounds[2] * bounds[3]);
+    let xi = subindex / (bounds[2] * bounds[3]);
+    subindex = subindex % (bounds[2] * bounds[3]);
+    let yi = subindex / bounds[3];
+    let zi = subindex % bounds[3];
+
+    var coords = vec4<u32>(ti, xi, yi, zi);
+    let mu = dims[0];
+    let nu = dims[1];
+    coords[mu] = coords[mu]*2u;
+    coords[nu] = coords[nu]*2u;
+
+    // Now calculate the change in energy
+    var indices = vec4<u32>(0u,0u,0u,0u);
+
+    let replica_offset = replica_index * (t*x*y*z*p);
+    // 0,0
+    let plaq_index = coords[0]*(x*y*z*p) + coords[1]*(y*z*p) + coords[2]*(z*p) + coords[3]*p + pi;
+    indices[0] = replica_offset + plaq_index;
+
+    // 1,0
+    coords[mu] = coords[mu] + 1u;
+    let plaq_index = coords[0]*(x*y*z*p) + coords[1]*(y*z*p) + coords[2]*(z*p) + coords[3]*p + pi;
+    indices[1] = replica_offset + plaq_index;
+
+    // 1,1
+    coords[nu] = coords[nu] + 1u;
+    let plaq_index = coords[0]*(x*y*z*p) + coords[1]*(y*z*p) + coords[2]*(z*p) + coords[3]*p + pi;
+    indices[3] = replica_offset + plaq_index;
+
+    // 1,0
+    coords[mu] = coords[mu] - 1u;
+    let plaq_index = coords[0]*(x*y*z*p) + coords[1]*(y*z*p) + coords[2]*(z*p) + coords[3]*p + pi;
+    indices[2] = replica_offset + plaq_index;
+
+    var inc_energy_increase = 0.0;
+    var dec_energy_increase = 0.0;
+    let v_at_plaq = state.state[ indices[0] ];
+    inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
+    dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
+    let v_at_plaq = state.state[ indices[1] ];
+    inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
+    dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
+    let v_at_plaq = state.state[ indices[2] ];
+    inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
+    dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
+    let v_at_plaq = state.state[ indices[3] ];
+    inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
+    dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
+
+    sumbuffer.buff[2u*global_id.x] = inc_energy_increase;
+    sumbuffer.buff[2u*global_id.x + 1u] = dec_energy_increase;
+}
+
+// TODO reduce the results from the above function...
 
 [[stage(compute), workgroup_size(256,1,1)]]
 fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {

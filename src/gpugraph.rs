@@ -20,9 +20,11 @@ pub struct GPUBackend {
     state_buffer: wgpu::Buffer,
     vn_buffer: wgpu::Buffer,
     pcgstate_buffer: wgpu::Buffer,
+    sum_buffer: wgpu::Buffer,
     localupdate: LocalUpdatePipeline,
     globalupdate: GlobalUpdatePipeline,
     pcgupdate: PCGRotatePipeline,
+    sum_planes: SumPlanesPipeline,
 }
 
 struct LocalUpdatePipeline {
@@ -36,6 +38,11 @@ struct GlobalUpdatePipeline {
 }
 struct PCGRotatePipeline {
     update_pipeline: wgpu::ComputePipeline,
+    bindgroup: wgpu::BindGroup,
+}
+
+struct SumPlanesPipeline {
+    sum_pipeline: wgpu::ComputePipeline,
     bindgroup: wgpu::BindGroup,
 }
 
@@ -155,6 +162,18 @@ impl GPUBackend {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                (2 * (n_faces / 4) * float_size) as _,
+                            ),
+                        },
+                        count: None,
+                    },
                 ],
                 label: None,
             });
@@ -186,6 +205,12 @@ impl GPUBackend {
                 module: &compute_shader,
                 entry_point: "rotate_pcg",
             });
+        let sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("planewise summation pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: "initial_sum_planes_inc_dec",
+        });
 
         let initial_state = if let Some(initial_state) = initial_state {
             initial_state
@@ -225,7 +250,13 @@ impl GPUBackend {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let mut bindgroups = (0..3).map(|_| {
+        let sum_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sum Buffer"),
+            contents: bytemuck::cast_slice(&vec![0_u32; n_faces / 2]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let mut bindgroups = (0..4).map(|_| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &compute_bind_group_layout,
                 entries: &[
@@ -252,6 +283,7 @@ impl GPUBackend {
         let local_b = bindgroups.next().unwrap();
         let global_b = bindgroups.next().unwrap();
         let pcg_b = bindgroups.next().unwrap();
+        let sum_b = bindgroups.next().unwrap();
 
         Ok(Self {
             state: None,
@@ -264,6 +296,7 @@ impl GPUBackend {
             state_buffer,
             vn_buffer,
             pcgstate_buffer,
+            sum_buffer,
             localupdate: LocalUpdatePipeline {
                 index_buffer,
                 update_pipeline: localupdate_pipeline,
@@ -276,6 +309,10 @@ impl GPUBackend {
             pcgupdate: PCGRotatePipeline {
                 update_pipeline: rotate_pcg_pipeline,
                 bindgroup: pcg_b,
+            },
+            sum_planes: SumPlanesPipeline {
+                sum_pipeline,
+                bindgroup: sum_b,
             },
         })
     }
