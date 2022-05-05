@@ -24,7 +24,7 @@ pub struct GPUBackend {
     localupdate: LocalUpdatePipeline,
     globalupdate: GlobalUpdatePipeline,
     pcgupdate: PCGRotatePipeline,
-    sum_planes: SumPlanesPipeline,
+    sum_planes: SumEnergyPipeline,
 }
 
 struct LocalUpdatePipeline {
