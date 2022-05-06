@@ -25,27 +25,23 @@ pub struct GPUBackend {
     globalupdate: GlobalUpdatePipeline,
     pcgupdate: PCGRotatePipeline,
     sum_planes: SumEnergyPipeline,
+    bindgroup: wgpu::BindGroup,
 }
 
 struct LocalUpdatePipeline {
     index_buffer: wgpu::Buffer,
     update_pipeline: wgpu::ComputePipeline,
-    bindgroup: wgpu::BindGroup,
 }
 struct GlobalUpdatePipeline {
     update_pipeline: wgpu::ComputePipeline,
-    bindgroup: wgpu::BindGroup,
 }
 struct PCGRotatePipeline {
     update_pipeline: wgpu::ComputePipeline,
-    bindgroup: wgpu::BindGroup,
 }
 
 struct SumEnergyPipeline {
     init_sum_pipeline: wgpu::ComputePipeline,
     inc_sum_pipeline: wgpu::ComputePipeline,
-    init_bindgroup: wgpu::BindGroup,
-    inc_bindgroup: wgpu::BindGroup,
 }
 
 const WORKGROUP: usize = 256;
@@ -197,7 +193,7 @@ impl GPUBackend {
                 label: Some("localupdate pipeline"),
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
-                entry_point: "main",
+                entry_point: "main_local",
             });
         let globalupdate_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -270,39 +266,32 @@ impl GPUBackend {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
-        let make_bg = || {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &compute_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: state_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: vn_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: index_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: pcgstate_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: sum_buffer.as_entire_binding(),
-                    },
-                ],
-                label: None,
-            })
-        };
-        let local_b = make_bg();
-        let global_b = make_bg();
-        let pcg_b = make_bg();
-        let init_sum_b = make_bg();
-        let inc_sum_b = make_bg();
+        let bindgroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: state_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: vn_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: index_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pcgstate_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: sum_buffer.as_entire_binding(),
+                },
+            ],
+            label: None,
+        });
 
         Ok(Self {
             state: None,
@@ -316,24 +305,20 @@ impl GPUBackend {
             vn_buffer,
             pcgstate_buffer,
             sum_buffer,
+            bindgroup,
             localupdate: LocalUpdatePipeline {
                 index_buffer,
                 update_pipeline: localupdate_pipeline,
-                bindgroup: local_b,
             },
             globalupdate: GlobalUpdatePipeline {
                 update_pipeline: globalupdate_pipeline,
-                bindgroup: global_b,
             },
             pcgupdate: PCGRotatePipeline {
                 update_pipeline: rotate_pcg_pipeline,
-                bindgroup: pcg_b,
             },
             sum_planes: SumEnergyPipeline {
                 init_sum_pipeline,
                 inc_sum_pipeline,
-                init_bindgroup: init_sum_b,
-                inc_bindgroup: inc_sum_b,
             },
         })
     }
@@ -362,19 +347,7 @@ impl GPUBackend {
     }
 
     pub fn run_pcg_rotate_offset(&mut self, offset: bool) {
-        let ndims = [
-            self.shape.t,
-            self.shape.x,
-            self.shape.y,
-            self.shape.z,
-            self.num_replicas,
-            self.num_pcgs,
-            if offset { 1 } else { 0 },
-        ]
-        .into_iter()
-        .map(|x| x as u32)
-        .collect::<Vec<_>>();
-
+        let ndims = [self.num_pcgs as u32, if offset { 1 } else { 0 }];
         self.queue.write_buffer(
             &self.localupdate.index_buffer,
             0_u64,
@@ -393,8 +366,7 @@ impl GPUBackend {
             let mut cpass =
                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             cpass.set_pipeline(&self.pcgupdate.update_pipeline);
-            cpass.set_bind_group(0, &self.pcgupdate.bindgroup, &[]);
-            // cpass.set_bind_group(0, &self.bindgroup, &[]);
+            cpass.set_bind_group(0, &self.bindgroup, &[]);
 
             let nneeded = self.num_pcgs / 2;
             let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
@@ -444,8 +416,7 @@ impl GPUBackend {
             let mut cpass =
                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             cpass.set_pipeline(&self.localupdate.update_pipeline);
-            cpass.set_bind_group(0, &self.localupdate.bindgroup, &[]);
-            // cpass.set_bind_group(0, &self.bindgroup, &[]);
+            cpass.set_bind_group(0, &self.bindgroup, &[]);
 
             let cubes_per_replica = rho * mu * nu * (sigma / 2);
             let nneeded = self.num_replicas * cubes_per_replica as usize;
@@ -484,8 +455,7 @@ impl GPUBackend {
             let mut cpass =
                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             cpass.set_pipeline(&self.globalupdate.update_pipeline);
-            cpass.set_bind_group(0, &self.globalupdate.bindgroup, &[]);
-            // cpass.set_bind_group(0, &self.bindgroup, &[]);
+            cpass.set_bind_group(0, &self.bindgroup, &[]);
 
             let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
             let planes_per_replica = t * (x + y + z) + x * (y + z) + y * z;
@@ -506,7 +476,7 @@ impl GPUBackend {
 
     /// Get the energy of each replica, allow forcing from stored state, or not.
     pub fn get_energy(&mut self, from_stored_state: Option<bool>) -> Result<Array1<f32>, String> {
-        let from_stored_state = from_stored_state.unwrap_or(self.state.is_some());
+        let from_stored_state = from_stored_state.unwrap_or_else(|| self.state.is_some());
 
         // If we already have the state stored, just use that.
         if from_stored_state {
@@ -553,8 +523,7 @@ impl GPUBackend {
                 let mut cpass = command_encoder
                     .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
                 cpass.set_pipeline(&self.sum_planes.init_sum_pipeline);
-                cpass.set_bind_group(0, &self.sum_planes.init_bindgroup, &[]);
-                // cpass.set_bind_group(0, &self.bindgroup, &[]);
+                cpass.set_bind_group(0, &self.bindgroup, &[]);
 
                 let nneeded = self.num_replicas * threads_per_replica;
                 let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
@@ -590,8 +559,7 @@ impl GPUBackend {
                     let mut cpass = command_encoder
                         .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
                     cpass.set_pipeline(&self.sum_planes.inc_sum_pipeline);
-                    cpass.set_bind_group(0, &self.sum_planes.inc_bindgroup, &[]);
-                    // cpass.set_bind_group(0, &self.bindgroup, &[]);
+                    cpass.set_bind_group(0, &self.bindgroup, &[]);
 
                     threads_per_replica = threads_per_replica / 2 + threads_per_replica % 2;
                     let nneeded = self.num_replicas * threads_per_replica;

@@ -81,8 +81,8 @@ fn prng(index: u32) -> f32 {
 fn rotate_pcg([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     var index = global_id.x;
 
-    let num_pcgs = dim_indices.data[5];
-    let use_offset = dim_indices.data[6];
+    let num_pcgs = dim_indices.data[0];
+    let use_offset = dim_indices.data[1];
 
     let pcg_index = 2u*index + use_offset;
     if (pcg_index >= num_pcgs) {
@@ -289,7 +289,7 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
 }
 
 [[stage(compute), workgroup_size(256,1,1)]]
-fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+fn main_local([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     var index = global_id.x;
 
     // Get the bounds.

@@ -924,7 +924,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            graph.np.iter().map(|n| *n).sum::<i32>(),
+            graph.np.iter().copied().sum::<i32>(),
             1,
             "Unexpected sum from entries {:?}",
             graph
@@ -946,7 +946,7 @@ mod tests {
             1,
         );
         assert_eq!(
-            graph.np.iter().map(|n| *n).sum::<i32>(),
+            graph.np.iter().copied().sum::<i32>(),
             2,
             "Unexpected sum from entries {:?}",
             graph
@@ -998,7 +998,7 @@ mod tests {
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(
-                    graph.np.iter().map(|n| *n).sum::<i32>(),
+                    graph.np.iter().copied().sum::<i32>(),
                     0,
                     "Unexpected sum from entries {:?}",
                     graph
