@@ -48,6 +48,9 @@ struct SumEnergyPipeline {
     inc_bindgroup: wgpu::BindGroup,
 }
 
+const WORKGROUP: usize = 256;
+const INIT_REDUX: usize = 16;
+
 impl GPUBackend {
     pub async fn new_async(
         t: usize,
@@ -98,12 +101,15 @@ impl GPUBackend {
 
         // `request_device` instantiates the feature specific connection to the GPU, defining some parameters,
         //  `features` being the available features.
+        let mut limits = wgpu::Limits::downlevel_defaults();
+        limits.max_bind_groups = 5;
+        limits.max_storage_buffers_per_shader_stage = 5;
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
                     features: wgpu::Features::empty(),
-                    limits: wgpu::Limits::downlevel_defaults(),
+                    limits,
                 },
                 None,
             )
@@ -119,7 +125,6 @@ impl GPUBackend {
         let float_size = std::mem::size_of::<f32>();
         let index_size = std::mem::size_of::<u32>();
 
-        const INIT_REDUX: usize = 16;
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
@@ -262,10 +267,10 @@ impl GPUBackend {
         let sum_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sum Buffer"),
             contents: bytemuck::cast_slice(&vec![0_u32; n_faces / INIT_REDUX]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
-        let mut bindgroups = (0..5).map(|_| {
+        let make_bg = || {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &compute_bind_group_layout,
                 entries: &[
@@ -285,15 +290,19 @@ impl GPUBackend {
                         binding: 3,
                         resource: pcgstate_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: sum_buffer.as_entire_binding(),
+                    },
                 ],
                 label: None,
             })
-        });
-        let local_b = bindgroups.next().unwrap();
-        let global_b = bindgroups.next().unwrap();
-        let pcg_b = bindgroups.next().unwrap();
-        let init_sum_b = bindgroups.next().unwrap();
-        let inc_sum_b = bindgroups.next().unwrap();
+        };
+        let local_b = make_bg();
+        let global_b = make_bg();
+        let pcg_b = make_bg();
+        let init_sum_b = make_bg();
+        let inc_sum_b = make_bg();
 
         Ok(Self {
             state: None,
@@ -385,9 +394,10 @@ impl GPUBackend {
                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             cpass.set_pipeline(&self.pcgupdate.update_pipeline);
             cpass.set_bind_group(0, &self.pcgupdate.bindgroup, &[]);
+            // cpass.set_bind_group(0, &self.bindgroup, &[]);
 
             let nneeded = self.num_pcgs / 2;
-            let ndispatch = ((nneeded + 255) / 256) as u32;
+            let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
             cpass.dispatch(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
@@ -435,10 +445,11 @@ impl GPUBackend {
                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             cpass.set_pipeline(&self.localupdate.update_pipeline);
             cpass.set_bind_group(0, &self.localupdate.bindgroup, &[]);
+            // cpass.set_bind_group(0, &self.bindgroup, &[]);
 
             let cubes_per_replica = rho * mu * nu * (sigma / 2);
             let nneeded = self.num_replicas * cubes_per_replica as usize;
-            let ndispatch = ((nneeded + 255) / 256) as u32;
+            let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
             cpass.dispatch(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
@@ -474,11 +485,12 @@ impl GPUBackend {
                 command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
             cpass.set_pipeline(&self.globalupdate.update_pipeline);
             cpass.set_bind_group(0, &self.globalupdate.bindgroup, &[]);
+            // cpass.set_bind_group(0, &self.bindgroup, &[]);
 
             let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
             let planes_per_replica = t * (x + y + z) + x * (y + z) + y * z;
             let nneeded = self.num_replicas * planes_per_replica;
-            let ndispatch = ((nneeded + 255) / 256) as u32;
+            let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
 
             cpass.dispatch(ndispatch, 1, 1);
         }
@@ -487,17 +499,111 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
     }
 
-    pub fn get_energy(&mut self) -> Result<Array1<f32>, String> {
-        // sum t, x, y, z
-        self.calculate_state()?;
-        let potential = self.get_potential();
-        let res = self
-            .get_precalculated_state()
-            .unwrap()
-            .axis_iter(Axis(0))
-            .map(|s| s.iter().map(|s| potential[s.abs() as usize]).sum())
-            .collect();
-        Ok(res)
+    /// Force clear the stored state.
+    pub fn clear_stored_state(&mut self) {
+        self.state = None;
+    }
+
+    /// Get the energy of each replica, allow forcing from stored state, or not.
+    pub fn get_energy(&mut self, from_stored_state: Option<bool>) -> Result<Array1<f32>, String> {
+        let from_stored_state = from_stored_state.unwrap_or(self.state.is_some());
+
+        // If we already have the state stored, just use that.
+        if from_stored_state {
+            // If forced and not calculated.
+            self.calculate_state()?;
+            // sum t, x, y, z
+            let potential = self.get_potential();
+            let res = self
+                .get_precalculated_state()
+                .unwrap()
+                .axis_iter(Axis(0))
+                .into_par_iter()
+                // .zip(res.axis_iter_mut(Axis(0)).into_par_iter())
+                .map(|s| s.into_par_iter().map(|s| potential[s.abs() as usize]).sum())
+                .collect::<Vec<_>>();
+            let res = Array1::from_vec(res);
+            Ok(res)
+        } else {
+            let (t, x, y, z, p) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z, 6);
+            let buff_size = t * x * y * z * p / INIT_REDUX;
+            let mut threads_per_replica = buff_size;
+
+            self.queue.write_buffer(
+                &self.localupdate.index_buffer,
+                0_u64,
+                bytemuck::cast_slice(&[
+                    self.shape.t as u32,
+                    self.shape.x as u32,
+                    self.shape.y as u32,
+                    self.shape.z as u32,
+                    self.num_replicas as u32,
+                ]),
+            );
+
+            // get command encoder
+            let mut command_encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+            // compute pass
+            command_encoder.push_debug_group("Initial Energy Summation");
+
+            {
+                let mut cpass = command_encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+                cpass.set_pipeline(&self.sum_planes.init_sum_pipeline);
+                cpass.set_bind_group(0, &self.sum_planes.init_bindgroup, &[]);
+                // cpass.set_bind_group(0, &self.bindgroup, &[]);
+
+                let nneeded = self.num_replicas * threads_per_replica;
+                let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
+
+                cpass.dispatch(ndispatch, 1, 1);
+            }
+
+            command_encoder.pop_debug_group();
+
+            self.queue.submit(Some(command_encoder.finish()));
+
+            while threads_per_replica > 1 {
+                self.queue.write_buffer(
+                    &self.localupdate.index_buffer,
+                    0_u64,
+                    bytemuck::cast_slice(&[
+                        self.shape.t as u32,
+                        self.shape.x as u32,
+                        self.shape.y as u32,
+                        self.shape.z as u32,
+                        self.num_replicas as u32,
+                        threads_per_replica as u32,
+                    ]),
+                );
+                // get command encoder
+                let mut command_encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+                // compute pass
+                command_encoder.push_debug_group("Incremental Energy Summation");
+                {
+                    let mut cpass = command_encoder
+                        .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+                    cpass.set_pipeline(&self.sum_planes.inc_sum_pipeline);
+                    cpass.set_bind_group(0, &self.sum_planes.inc_bindgroup, &[]);
+                    // cpass.set_bind_group(0, &self.bindgroup, &[]);
+
+                    threads_per_replica = threads_per_replica / 2 + threads_per_replica % 2;
+                    let nneeded = self.num_replicas * threads_per_replica;
+                    let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
+                    cpass.dispatch(ndispatch, 1, 1);
+                }
+                command_encoder.pop_debug_group();
+
+                self.queue.submit(Some(command_encoder.finish()));
+            }
+            self.read_energy_from_gpu(None)
+        }
     }
 
     pub fn get_winding_nums(&mut self) -> Result<Array2<i32>, String> {
@@ -522,6 +628,64 @@ impl GPUBackend {
             })
         });
         Ok(sum)
+    }
+
+    pub fn read_energy_from_gpu(
+        &mut self,
+        read_num_values: Option<usize>,
+    ) -> Result<Array1<f32>, String> {
+        let read_num_values = read_num_values.unwrap_or(self.num_replicas);
+        let to_read = read_num_values * std::mem::size_of::<f32>();
+
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: to_read as _,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // get command encoder
+        let mut command_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            command_encoder.push_debug_group("Copy energies");
+            command_encoder.copy_buffer_to_buffer(
+                &self.sum_buffer,
+                0,
+                &staging_buffer,
+                0,
+                to_read as _,
+            );
+            command_encoder.pop_debug_group();
+        }
+        self.queue.submit(Some(command_encoder.finish()));
+
+        // Note that we're not calling `.await` here.
+        let buffer_slice = staging_buffer.slice(..);
+        // Gets the future representing when `staging_buffer` can be read from
+        let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+
+        // Poll the device in a blocking manner so that our future resolves.
+        // In an actual application, `device.poll(...)` should
+        // be called in an event loop or on another thread.
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Awaits until `buffer_future` can be read from
+        if let Ok(()) = pollster::block_on(buffer_future) {
+            // Gets contents of buffer
+            let data = buffer_slice.get_mapped_range();
+            let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+            let result = Array1::from_vec(result);
+
+            // // // With the current interface, we have to make sure all mapped views are
+            // // // dropped before we unmap the buffer.
+            // drop(data);
+            // buf.unmap(); // Unmaps buffer from memory
+            Ok(result)
+        } else {
+            Err("failed to run compute on gpu!".to_string())
+        }
     }
 
     pub fn calculate_state(&mut self) -> Result<(), String> {

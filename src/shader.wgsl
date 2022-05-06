@@ -106,10 +106,10 @@ fn initial_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     // 2^4 * 6 entries in each replica.
     // We will just do 16 of those since parallelization is good too.
     // We wont, however, do the reduction in any particular order.
-    let intitial_reduction = 16u;
+    let initial_reduction = 16u;
 
     // We group 4 at a time to start.
-    let entries_per_replica = (t*x*y*z*p)/intitial_reduction;
+    let entries_per_replica = (t*x*y*z*p)/initial_reduction;
     let num_threads = entries_per_replica*num_replicas;
     if (index >= num_threads) {
         return;
@@ -121,8 +121,8 @@ fn initial_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let replica_offset = replica_index * (t*x*y*z*p);
 
     var energy = 0.0;
-    for (var i = 0u; i < initial_reduction; i++) {
-        let n = state.state[replica_offset + index + i];
+    for (var i = 0u; i < initial_reduction; i = i+1u) {
+        let n = state.state[replica_offset + initial_reduction*index + i];
         energy = energy + vn.vn[abs(n)];
     }
 
@@ -137,7 +137,8 @@ fn incremental_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>
     let num_replicas = dim_indices.data[4];
     let size_in_replica = dim_indices.data[5];
 
-    let num_threads = size_in_replica*num_replicas;
+    let threads_per_replica = size_in_replica / 2u + size_in_replica % 2u;
+    let num_threads = threads_per_replica*num_replicas;
     if (index >= num_threads) {
         return;
     }

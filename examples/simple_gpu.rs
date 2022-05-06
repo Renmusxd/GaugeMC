@@ -1,7 +1,7 @@
 use env_logger;
 use gaugemc;
 use gaugemc::{Dimension, NDDualGraph};
-use ndarray::{Array2, Array3, Axis};
+use ndarray::{Array2, Array3, Array6, Axis};
 use num_traits::Zero;
 use pollster;
 use std::collections::HashMap;
@@ -13,32 +13,58 @@ fn main() -> Result<(), String> {
     let steps_per_sample = 10;
     let num_updates = 10;
 
-    let (t, x, y, z) = (32, 32, 32, 32);
+    let (t, x, y, z) = (8, 8, 8, 8);
+
+    let mut init_state = Array6::zeros((num_replicas, t, x, y, z, 6));
+    *init_state.get_mut([0, 0, 0, 0, 0, 1]).unwrap() = 1;
+
+    // let vns = VNS.to_vec();
+    let vns = (0..50).map(|n| n as f32).collect();
     let mut state = pollster::block_on(gaugemc::GPUBackend::new_async(
         t,
         x,
         y,
         z,
-        VNS.to_vec(),
+        vns,
         Some(num_replicas),
-        None,
+        Some(init_state),
         None,
     ))?;
 
-    for _ in 0..steps_per_sample {
-        for _ in 0..num_updates {
-            NDDualGraph::get_cube_dim_and_offset_iterator().for_each(|(dims, offset)| {
-                let leftover = NDDualGraph::get_leftover_dim(&dims);
-                state.run_local_sweep(&dims, leftover, offset);
-            })
-        }
-        state.run_global_sweep();
-        state.run_pcg_rotate();
-    }
+    NDDualGraph::get_cube_dim_and_offset_iterator()
+        .take(1)
+        .for_each(|(dims, offset)| {
+            let leftover = NDDualGraph::get_leftover_dim(&dims);
+            state.run_local_sweep(&dims, leftover, offset);
+        });
 
-    let winding_nums = state.get_winding_nums()?;
-    println!("{:?}", winding_nums.as_slice());
+    let energies_gpu = state.get_energy(Some(false))?;
 
+    let energies_state = state.get_energy(Some(true))?;
+
+    assert_eq!(energies_gpu, energies_state);
+
+    //
+    // let winding_nums = state.get_winding_nums()?;
+    // println!("{:?}", winding_nums);
+    //
+    // for _ in 0..steps_per_sample {
+    //     for _ in 0..num_updates {
+    //         NDDualGraph::get_cube_dim_and_offset_iterator().for_each(|(dims, offset)| {
+    //             let leftover = NDDualGraph::get_leftover_dim(&dims);
+    //             state.run_local_sweep(&dims, leftover, offset);
+    //         })
+    //     }
+    //     state.run_global_sweep();
+    //     state.run_pcg_rotate();
+    // }
+    //
+    // let energies = state.get_energy()?;
+    // println!("{:?}", energies);
+    //
+    // let winding_nums = state.get_winding_nums()?;
+    // println!("{:?}", winding_nums);
+    //
     // assert_eq!(state.get_edges_with_violations()?.len(), 0);
 
     // // state.run_global_sweep();
