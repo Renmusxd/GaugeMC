@@ -118,12 +118,14 @@ fn initial_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let replica_index = index % num_replicas;
     index = index / num_replicas;
 
+    let vn_offset = i32(dim_indices.data[5u + replica_index]);
+
     let replica_offset = replica_index * (t*x*y*z*p);
 
     var energy = 0.0;
     for (var i = 0u; i < initial_reduction; i = i+1u) {
         let n = state.state[replica_offset + initial_reduction*index + i];
-        energy = energy + vn.vn[abs(n)];
+        energy = energy + vn.vn[vn_offset + abs(n)];
     }
 
     sumbuffer.buff[global_id.x] = energy;
@@ -135,7 +137,8 @@ fn incremental_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>
     var index = global_id.x;
 
     let num_replicas = dim_indices.data[4];
-    let size_in_replica = dim_indices.data[5];
+    // data[5] is for replica 0, ...
+    let size_in_replica = dim_indices.data[5u + num_replicas];
 
     let threads_per_replica = size_in_replica / 2u + size_in_replica % 2u;
     let num_threads = threads_per_replica*num_replicas;
@@ -180,6 +183,8 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let replica_index = index / planes_per_replica;
     let replica_offset = replica_index * (t*x*y*z*p);
     index = index % planes_per_replica;
+
+    let vn_offset = i32(dim_indices.data[5u + replica_index]);
 
     // We will be looking at all entries of the form:
     // index = tXYZP + xYZP + yZP + zP + p
@@ -258,8 +263,8 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
         for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
             let plaquette_index = v1*k1 + v2*k2 + offset;
             let v_at_plaq = state.state[replica_offset + plaquette_index];
-            inc_energy_increase = inc_energy_increase + vn.vn[abs(v_at_plaq + 1)] - vn.vn[abs(v_at_plaq)];
-            dec_energy_increase = dec_energy_increase + vn.vn[abs(v_at_plaq - 1)] - vn.vn[abs(v_at_plaq)];
+            inc_energy_increase = inc_energy_increase + vn.vn[vn_offset + abs(v_at_plaq + 1)] - vn.vn[vn_offset + abs(v_at_plaq)];
+            dec_energy_increase = dec_energy_increase + vn.vn[vn_offset + abs(v_at_plaq - 1)] - vn.vn[vn_offset + abs(v_at_plaq)];
         }
     }
 
@@ -304,16 +309,19 @@ fn main_local([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
         return;
     }
 
-    let mu = dim_indices.data[5 + 0];
-    let nu = dim_indices.data[5 + 1];
-    let sigma = dim_indices.data[5 + 2];
-    let rho = dim_indices.data[5 + 3];
-    // Assertion: mu < nu < sigma
-    // rho is just the leftover
-
     let replica_index = index / ((t*x*y*z)/2u);
     let replica_base_offset = replica_index * (t*x*y*z*p);
     index = index % ((t*x*y*z)/2u);
+
+    let vn_offset = i32(dim_indices.data[5u + replica_index]);
+
+    let mu = dim_indices.data[5u + num_replicas + 0u];
+    let nu = dim_indices.data[5u + num_replicas + 1u];
+    let sigma = dim_indices.data[5u + num_replicas + 2u];
+    let rho = dim_indices.data[5u + num_replicas + 3u];
+    // Assertion: mu < nu < sigma
+    // rho is just the leftover
+    let offset = dim_indices.data[5u + num_replicas + 4u];
 
     let rho_index = index / (dim_indices.data[mu] * dim_indices.data[nu] * dim_indices.data[sigma] /2u);
     index = index % (dim_indices.data[mu] * dim_indices.data[nu] * dim_indices.data[sigma]/2u);
@@ -323,7 +331,6 @@ fn main_local([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     index = index % (dim_indices.data[sigma]/2u);
     let sigma_index_half = index;
 
-    let offset = dim_indices.data[5 + 4];
     let parity = (mu_index + nu_index + offset) % 2u;
     let sigma_index = 2u*sigma_index_half + parity;
 
@@ -395,9 +402,9 @@ fn main_local([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
         let pos_np = state.state[replica_base_offset + pos_index];
         let neg_np = state.state[replica_base_offset + neg_index];
         // add one to pos_index, subtract one from neg_index
-        add_one_dv = add_one_dv + vn.vn[abs(pos_np + 1)] + vn.vn[abs(neg_np - 1)] - vn.vn[abs(pos_np)] - vn.vn[abs(neg_np)];
+        add_one_dv = add_one_dv + vn.vn[vn_offset + abs(pos_np + 1)] + vn.vn[vn_offset + abs(neg_np - 1)] - vn.vn[vn_offset + abs(pos_np)] - vn.vn[vn_offset + abs(neg_np)];
         // subtract one to pos_index, add one from neg_index
-        sub_one_dv = sub_one_dv + vn.vn[abs(pos_np - 1)] + vn.vn[abs(neg_np + 1)] - vn.vn[abs(pos_np)] - vn.vn[abs(neg_np)];
+        sub_one_dv = sub_one_dv + vn.vn[vn_offset + abs(pos_np - 1)] + vn.vn[vn_offset + abs(neg_np + 1)] - vn.vn[vn_offset + abs(pos_np)] - vn.vn[vn_offset + abs(neg_np)];
     }
     let add_one_p = exp(-add_one_dv);
     let sub_one_p = exp(-sub_one_dv);

@@ -1,3 +1,5 @@
+extern crate core;
+
 pub mod dualgraph;
 #[cfg(feature = "gpu-wgpu")]
 pub mod gpugraph;
