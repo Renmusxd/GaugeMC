@@ -1,27 +1,32 @@
 use gaugemc::NDDualGraph;
-use ndarray::Array6;
+use ndarray::{Array2, Array6, Axis};
+use std::iter::repeat;
 
 fn main() -> Result<(), String> {
     env_logger::init();
 
-    let num_replicas = 1;
+    let num_replicas = 3;
     let steps_per_sample = 10;
     let num_updates = 10;
 
-    let (t, x, y, z) = (8, 8, 8, 8);
+    let (t, x, y, z) = (4, 4, 4, 4);
 
-    let mut init_state = Array6::zeros((num_replicas, t, x, y, z, 6));
-    *init_state.get_mut([0, 0, 0, 0, 0, 1]).unwrap() = 1;
+    let init_state = Array6::zeros((num_replicas, t, x, y, z, 6));
+    let mut vns = Array2::zeros((num_replicas, 50));
+    vns.axis_iter_mut(Axis(0))
+        .enumerate()
+        .for_each(|(i, mut v)| {
+            v.iter_mut().enumerate().for_each(|(j, v)| {
+                *v = ((i + 1) * (j.pow(2))) as f32 / 8.0;
+            })
+        });
 
-    // let vns = VNS.to_vec();
-    let vns = (0..50).map(|n| n as f32).collect();
     let mut state = pollster::block_on(gaugemc::GPUBackend::new_async(
         t,
         x,
         y,
         z,
         vns,
-        Some(num_replicas),
         Some(init_state),
         None,
     ))?;
@@ -37,16 +42,19 @@ fn main() -> Result<(), String> {
         state.run_pcg_rotate();
     }
 
-    let energies_gpu = state.get_energy(Some(false))?;
+    for _ in 0..4 {
+        let energies_gpu = state.get_energy(Some(false))?;
+        let energies_state = state.get_energy(Some(true))?;
 
-    let energies_state = state.get_energy(Some(true))?;
+        println!(
+            "{:?}\t{:?}",
+            energies_state.as_slice(),
+            energies_gpu.as_slice()
+        );
+        assert_eq!(energies_gpu, energies_state);
 
-    println!(
-        "{:?}\t{:?}",
-        energies_state.as_slice(),
-        energies_gpu.as_slice()
-    );
-    assert_eq!(energies_gpu, energies_state);
+        state.swap_replica_potentials(false, repeat(true));
+    }
 
     //
     // let winding_nums = state.get_winding_nums()?;
