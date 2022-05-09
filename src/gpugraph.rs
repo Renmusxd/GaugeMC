@@ -31,6 +31,44 @@ pub struct GPUBackend {
     pcgupdate: PCGRotatePipeline,
     sum_planes: SumEnergyPipeline,
     bindgroup: wgpu::BindGroup,
+    // Debugging information
+    tempering_debug: Option<ParallelTemperingDebug>,
+}
+
+struct ParallelTemperingDebug {
+    swap_attempts: Vec<u64>,
+    swap_successes: Vec<u64>,
+}
+
+impl ParallelTemperingDebug {
+    fn new(num_replicas: usize) -> Self {
+        Self {
+            swap_attempts: vec![0; num_replicas - 1],
+            swap_successes: vec![0; num_replicas - 1],
+        }
+    }
+
+    fn get_swap_probs(&self) -> Vec<f64> {
+        self.swap_successes
+            .iter()
+            .zip(self.swap_attempts.iter())
+            .map(|(s, a)| {
+                if *a > 0 {
+                    (*s as f64) / (*a as f64)
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    /// A swap attempt between lower_replica and lower_replica + 1
+    fn add_attempt(&mut self, lower_replica: usize, success: bool) {
+        self.swap_attempts[lower_replica] += 1;
+        if success {
+            self.swap_successes[lower_replica] += 1;
+        }
+    }
 }
 
 struct LocalUpdatePipeline {
@@ -339,6 +377,7 @@ impl GPUBackend {
                 init_sum_pipeline,
                 inc_sum_pipeline,
             },
+            tempering_debug: Some(ParallelTemperingDebug::new(num_replicas)),
         })
     }
 
@@ -547,6 +586,7 @@ impl GPUBackend {
         debug_assert_eq!(base_energies, self.get_energy(energies_from_stored_state)?);
 
         let mut rng = self.rng.take().unwrap();
+        let mut tempering_debug = self.tempering_debug.take().unwrap();
         let i_offset = if offset { 1 } else { 0 };
         let bases = &base_energies.as_slice().unwrap()[i_offset..];
         let modifieds = &modified_energies.as_slice().unwrap()[i_offset..];
@@ -559,11 +599,23 @@ impl GPUBackend {
             })
             .map(|action| if action < 0.0 { 0.0 } else { -action })
             .map(|minus_action| minus_action.exp())
-            .map(|prob| rng.gen_bool(prob as f64));
+            .map(|prob| rng.gen_bool(prob as f64))
+            .enumerate()
+            .map(|(i, b)| {
+                // Log the bools
+                let r = 2 * i + i_offset;
+                tempering_debug.add_attempt(r, b);
+                b
+            });
 
         self.swap_replica_potentials(offset, swap_choices);
         self.rng = Some(rng);
+        self.tempering_debug = Some(tempering_debug);
         Ok(())
+    }
+
+    pub fn get_parallel_tempering_success_rate(&self) -> Vec<f64> {
+        self.tempering_debug.as_ref().unwrap().get_swap_probs()
     }
 
     /// Force clear the stored state.
@@ -905,7 +957,55 @@ impl GPUBackend {
 mod gpu_tests {
     use super::*;
 
-    fn make_state(r: usize, t: usize, x: usize, y: usize, z: usize) -> Result<GPUBackend, String> {
+    #[test]
+    fn test_global_respect_replica_potential() -> Result<(), String> {
+        let (r, t, x, y, z) = (4, 4, 4, 4, 4);
+        let mut vn = Array2::zeros((r, 3));
+        vn.axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(r, mut ax)| {
+                ax.iter_mut().enumerate().for_each(|(i, v)| {
+                    *v = 6.0 * ((r + 1) as f32) * (i.pow(2)) as f32;
+                    if r % 2 == 1 {
+                        *v = -*v;
+                    }
+                })
+            });
+        let mut graph = pollster::block_on(GPUBackend::new_async(t, x, y, z, vn, None, None))?;
+
+        graph.run_global_sweep();
+
+        let state = graph.get_state()?;
+
+        state.indexed_iter().for_each(|((r, _, _, _, _, _), v)| {
+            if r % 2 == 0 {
+                assert_eq!(*v, 0);
+            } else {
+                assert_eq!(v.abs(), 1);
+            }
+        });
+
+        graph.run_global_sweep();
+
+        let state = graph.get_state()?;
+
+        state.indexed_iter().for_each(|((r, _, _, _, _, _), v)| {
+            if r % 2 == 0 {
+                assert_eq!(*v, 0);
+            } else {
+                assert_eq!(v.abs(), 2);
+            }
+        });
+        Ok(())
+    }
+
+    fn make_replica_value_state(
+        r: usize,
+        t: usize,
+        x: usize,
+        y: usize,
+        z: usize,
+    ) -> Result<GPUBackend, String> {
         let mut vn = Array2::zeros((r, 10));
         vn.axis_iter_mut(Axis(0))
             .enumerate()
@@ -925,12 +1025,12 @@ mod gpu_tests {
 
     #[test]
     fn test_energy_calc() -> Result<(), String> {
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let energies = s.get_energy(Some(true))?;
         s.swap_replica_potentials(false, repeat(true));
         let swapped_state = s.get_energy(Some(true))?;
 
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.swap_replica_potentials(false, repeat(true));
         let calced_swapped_state = s.get_energy(Some(false))?;
 
@@ -969,13 +1069,13 @@ mod gpu_tests {
 
     #[test]
     fn test_swap_states() -> Result<(), String> {
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let basic_state = s.get_state()?.clone();
         s.clear_stored_state();
         s.swap_replica_potentials(false, repeat(true));
         let cleared_swapped_state = s.get_state()?.clone();
 
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.calculate_state()?;
         s.swap_replica_potentials(false, repeat(true));
         let calced_swapped_state = s.get_state()?.clone();
@@ -1002,13 +1102,13 @@ mod gpu_tests {
 
     #[test]
     fn test_offset_swap_states() -> Result<(), String> {
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let basic_state = s.get_state()?.clone();
         s.clear_stored_state();
         s.swap_replica_potentials(true, repeat(true));
         let cleared_swapped_state = s.get_state()?.clone();
 
-        let mut s = make_state(3, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(3, 4, 4, 4, 4)?;
         s.calculate_state()?;
         s.swap_replica_potentials(true, repeat(true));
         let calced_swapped_state = s.get_state()?.clone();
@@ -1035,13 +1135,13 @@ mod gpu_tests {
 
     #[test]
     fn test_swap_states_some() -> Result<(), String> {
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let basic_state = s.get_state()?.clone();
         s.clear_stored_state();
         s.swap_replica_potentials(false, [true, false]);
         let cleared_swapped_state = s.get_state()?.clone();
 
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.calculate_state()?;
         s.swap_replica_potentials(false, [true, false]);
         let calced_swapped_state = s.get_state()?.clone();
@@ -1064,13 +1164,13 @@ mod gpu_tests {
                 assert_eq!(*v, rubrick[r]);
             });
 
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let basic_state = s.get_state()?.clone();
         s.clear_stored_state();
         s.swap_replica_potentials(false, [false, true]);
         let cleared_swapped_state = s.get_state()?.clone();
 
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.calculate_state()?;
         s.swap_replica_potentials(false, [false, true]);
         let calced_swapped_state = s.get_state()?.clone();
@@ -1097,13 +1197,13 @@ mod gpu_tests {
 
     #[test]
     fn test_offset_swap_states_some() -> Result<(), String> {
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let basic_state = s.get_state()?.clone();
         s.clear_stored_state();
         s.swap_replica_potentials(true, [true]);
         let cleared_swapped_state = s.get_state()?.clone();
 
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.calculate_state()?;
         s.swap_replica_potentials(true, [true]);
         let calced_swapped_state = s.get_state()?.clone();
@@ -1126,13 +1226,13 @@ mod gpu_tests {
                 assert_eq!(*v, rubrick[r]);
             });
 
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let basic_state = s.get_state()?.clone();
         s.clear_stored_state();
         s.swap_replica_potentials(false, [false]);
         let cleared_swapped_state = s.get_state()?.clone();
 
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.calculate_state()?;
         s.swap_replica_potentials(false, [false]);
         let calced_swapped_state = s.get_state()?.clone();
@@ -1160,14 +1260,14 @@ mod gpu_tests {
     fn test_parallel_swap_back() -> Result<(), String> {
         // Make a state where np is higher for larger potentials,
         // energetically preferable to swap back.
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let energies = s.get_energy(Some(true))?;
         s.swap_replica_potentials(false, repeat(true));
         let swapped_energy = s.get_energy(Some(true))?;
         let swap_state = s.get_state()?;
 
         // Reinit, and check if it swaps.
-        let mut s = make_state(4, 4, 4, 4, 4)?;
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.run_parallel_tempering_sweep(false, Some(true))?;
 
         assert_eq!(swapped_energy, s.get_energy(Some(true))?);
