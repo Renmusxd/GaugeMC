@@ -762,9 +762,8 @@ impl NDDualGraph {
             (vec![], false)
         };
         choices
-            .iter_mut()
+            .par_iter_mut()
             .enumerate()
-            // .par_bridge()
             .for_each(|(plane, choice)| {
                 let rand_num = if use_rands {
                     rands[plane]
