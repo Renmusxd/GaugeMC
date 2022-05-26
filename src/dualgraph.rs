@@ -502,8 +502,8 @@ impl NDDualGraph {
         np: &mut Array5<i32>,
         bounds: &SiteIndex,
     ) {
-        np.indexed_iter_mut()
-            .par_bridge()
+        ndarray::Zip::indexed(np)
+            .into_par_iter()
             .for_each(|((t, x, y, z, p), np)| {
                 let cube_index = Self::get_cube_index([t, x, y, z], p, dims, leftover, off, bounds);
                 if let Some((cube_index, sign)) = cube_index {
@@ -545,9 +545,8 @@ impl NDDualGraph {
         // Pick all cube deltas, either using a single rng or a thread specific one
         if let Some(rng) = rng {
             let rands = Array4::random_using(shape, Uniform::new(0.0, 1.0), rng);
-            cube_choices
-                .indexed_iter_mut()
-                .par_bridge()
+            ndarray::Zip::indexed(&mut cube_choices)
+                .into_par_iter()
                 .for_each(|((rho, mu, nu, sigma), c)| {
                     let rand_num = rands[(rho, mu, nu, sigma)];
                     let cube_choice =
@@ -559,9 +558,8 @@ impl NDDualGraph {
                     }
                 });
         } else {
-            cube_choices
-                .indexed_iter_mut()
-                .par_bridge()
+            ndarray::Zip::indexed(&mut cube_choices)
+                .into_par_iter()
                 .for_each(|((rho, mu, nu, sigma), c)| {
                     let rand_num = rand::thread_rng().gen();
                     let cube_choice =
@@ -643,36 +641,38 @@ impl NDDualGraph {
         let tnums = bt * (bx + by + bz);
         let xnums = bx * (by + bz);
         debug_assert_eq!(choices.len(), self.num_planes());
-        self.np
-            .indexed_iter_mut()
-            .par_bridge()
+
+        ndarray::Zip::indexed(&mut self.np)
+            .into_par_iter()
             .for_each(|((t, x, y, z, p), n)| {
-                let indx = match p {
-                    0 => {
-                        // base index is: t(x+y+z) + x(y+z)
-                        let base = tnums + xnums;
-                        base + y * bz + z
-                    }
-                    1 => {
-                        let base = tnums + bx * by;
-                        base + x * bz + z
-                    }
-                    2 => {
-                        let base = tnums;
-                        base + x * by + y
-                    }
-                    3 => {
-                        let base = bt * (bx + by);
-                        base + t * bz + z
-                    }
-                    4 => {
-                        let base = bt * bx;
-                        base + t * by + y
-                    }
-                    5 => t * bx + x,
-                    _ => unreachable!(),
-                };
-                *n += choices[indx].clone().into();
+                {
+                    let indx = match p {
+                        0 => {
+                            // base index is: t(x+y+z) + x(y+z)
+                            let base = tnums + xnums;
+                            base + y * bz + z
+                        }
+                        1 => {
+                            let base = tnums + bx * by;
+                            base + x * bz + z
+                        }
+                        2 => {
+                            let base = tnums;
+                            base + x * by + y
+                        }
+                        3 => {
+                            let base = bt * (bx + by);
+                            base + t * bz + z
+                        }
+                        4 => {
+                            let base = bt * bx;
+                            base + t * by + y
+                        }
+                        5 => t * bx + x,
+                        _ => unreachable!(),
+                    };
+                    *n += choices[indx].clone().into();
+                }
             });
     }
 

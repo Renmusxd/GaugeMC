@@ -865,10 +865,8 @@ impl GPUBackend {
                 let data = buffer_slice.get_mapped_range();
                 let data_vec: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
                 let mut result = Array6::zeros((self.num_replicas, t, x, y, z, 6));
-                result
-                    .indexed_iter_mut()
-                    .par_bridge()
-                    .for_each(|((ir, it, ix, iy, iz, ip), v)| {
+                ndarray::Zip::indexed(&mut result).into_par_iter().for_each(
+                    |((ir, it, ix, iy, iz, ip), v)| {
                         let ir = self.vn_index_to_replica_index[ir];
                         let replica_offset = ir * (t * x * y * z * p);
                         let t_offset = it * x * y * z * p;
@@ -879,7 +877,8 @@ impl GPUBackend {
                         let indx =
                             replica_offset + t_offset + x_offset + y_offset + z_offset + p_offset;
                         *v = data_vec[indx];
-                    });
+                    },
+                );
                 self.state = Some(result);
 
                 // // // With the current interface, we have to make sure all mapped views are
