@@ -144,7 +144,7 @@ impl GPUBackend {
                 compatible_surface: None,
             })
             .await
-            .unwrap();
+            .ok_or_else(|| "GPU: Instance was not able to request an adapter".to_string())?;
 
         // `request_device` instantiates the feature specific connection to the GPU, defining some parameters,
         //  `features` being the available features.
@@ -166,7 +166,7 @@ impl GPUBackend {
                 None,
             )
             .await
-            .unwrap();
+            .map_err(|f| format!("GPU Error: {:?}", f))?;
 
         let compute_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
             label: None,
