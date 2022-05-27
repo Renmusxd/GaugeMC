@@ -11,7 +11,7 @@ gpu-wgpu = ["wgpu", "bytemuck", "pollster", "log", "env_logger"]
 rayon = ">=1.5"
 num-traits = ">=0.2"
 ndarray-rand = ">=0.14"
-wgpu = {version=">=0.12", optional=true}
+wgpu = {version=">=0.12", git="https://github.com/gfx-rs/wgpu/", optional=true}
 bytemuck = { version = ">=1.9", features = [ "derive" ],optional=true }
 pollster = {version=">=0.2",optional=true }
 log = {version=">=0.4",optional=true }

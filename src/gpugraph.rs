@@ -432,7 +432,7 @@ impl GPUBackend {
 
             let nneeded = self.num_pcgs / 2;
             let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
-            cpass.dispatch(ndispatch, 1, 1);
+            cpass.dispatch_workgroups(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
 
@@ -471,7 +471,7 @@ impl GPUBackend {
             let cubes_per_replica = rho * mu * nu * (sigma / 2);
             let nneeded = self.num_replicas * cubes_per_replica as usize;
             let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
-            cpass.dispatch(ndispatch, 1, 1);
+            cpass.dispatch_workgroups(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
 
@@ -501,7 +501,7 @@ impl GPUBackend {
             let nneeded = self.num_replicas * planes_per_replica;
             let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
 
-            cpass.dispatch(ndispatch, 1, 1);
+            cpass.dispatch_workgroups(ndispatch, 1, 1);
         }
         command_encoder.pop_debug_group();
 
@@ -670,7 +670,7 @@ impl GPUBackend {
                 let nneeded = self.num_replicas * threads_per_replica;
                 let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
 
-                cpass.dispatch(ndispatch, 1, 1);
+                cpass.dispatch_workgroups(ndispatch, 1, 1);
             }
 
             command_encoder.pop_debug_group();
@@ -696,7 +696,7 @@ impl GPUBackend {
                     threads_per_replica = threads_per_replica / 2 + threads_per_replica % 2;
                     let nneeded = self.num_replicas * threads_per_replica;
                     let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
-                    cpass.dispatch(ndispatch, 1, 1);
+                    cpass.dispatch_workgroups(ndispatch, 1, 1);
                 }
                 command_encoder.pop_debug_group();
 

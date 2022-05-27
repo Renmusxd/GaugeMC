@@ -1,10 +1,10 @@
 
 struct State {
-  state : array<i32>;
+  state : array<i32>,
 };
 
 struct Vn {
-    vn : array<f32>;
+    vn : array<f32>,
 };
 
 struct DimInformation {
@@ -12,26 +12,35 @@ struct DimInformation {
     // t, x, y, z, num_replicas,
     // Then the cube selections (first 3 are 3D cube, last is remaining)
     // mu, nu, sigma, rho, offset
-    data : array<u32>;
+    data : array<u32>,
 };
 
 struct PCGState {
-    state : array<u32>;
+    state : array<u32>,
 };
 
 struct SumBuffer {
-    buff : array<f32>;
+    buff : array<f32>,
 };
 
-[[group(0), binding(0)]]
+@group(0)
+@binding(0)
 var<storage, read_write> state : State;
-[[group(0), binding(1)]]
+
+@group(0)
+@binding(1)
 var<storage, read> vn : Vn;
-[[group(0), binding(2)]]
+
+@group(0)
+@binding(2)
 var<storage, read> dim_indices : DimInformation;
-[[group(0), binding(3)]]
+
+@group(0)
+@binding(3)
 var<storage, read_write> pcgstate : PCGState;
-[[group(0), binding(4)]]
+
+@group(0)
+@binding(4)
 var<storage, read_write> sumbuffer : SumBuffer;
 
 fn p_from_dims(first: u32, second: u32) -> u32 {
@@ -77,8 +86,9 @@ fn prng(index: u32) -> f32 {
     return f32(pcgstate.state[index]) / f32(0xffffffffu);
 }
 
-[[stage(compute), workgroup_size(256,1,1)]]
-fn rotate_pcg([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+@compute
+@workgroup_size(256,1,1)
+fn rotate_pcg(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var index = global_id.x;
 
     let num_pcgs = dim_indices.data[0];
@@ -91,8 +101,9 @@ fn rotate_pcg([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     pcgstate.state[pcg_index] = pcgstate.state[pcg_index] ^ pcgstate.state[(pcg_index + 1u) % num_pcgs];
 }
 
-[[stage(compute), workgroup_size(256,1,1)]]
-fn initial_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+@compute
+@workgroup_size(256,1,1)
+fn initial_sum_energy(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var index = global_id.x;
 
     let t = dim_indices.data[0];
@@ -132,8 +143,9 @@ fn initial_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
 }
 
 
-[[stage(compute), workgroup_size(256,1,1)]]
-fn incremental_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+@compute
+@workgroup_size(256,1,1)
+fn incremental_sum_energy(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var index = global_id.x;
 
     let num_replicas = dim_indices.data[4];
@@ -162,8 +174,9 @@ fn incremental_sum_energy([[builtin(global_invocation_id)]] global_id: vec3<u32>
     sumbuffer.buff[fold_index] = 0.0;
 }
 
-[[stage(compute), workgroup_size(256,1,1)]]
-fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+@compute
+@workgroup_size(256,1,1)
+fn main_global(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var index = global_id.x;
 
     let t = dim_indices.data[0];
@@ -293,8 +306,9 @@ fn main_global([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     }
 }
 
-[[stage(compute), workgroup_size(256,1,1)]]
-fn main_local([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+@compute
+@workgroup_size(256,1,1)
+fn main_local(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var index = global_id.x;
 
     // Get the bounds.
