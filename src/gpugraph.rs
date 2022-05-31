@@ -791,33 +791,28 @@ impl GPUBackend {
         // Note that we're not calling `.await` here.
         let buffer_slice = staging_buffer.slice(..);
         // Gets the future representing when `staging_buffer` can be read from
-        let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+        buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
 
         // Poll the device in a blocking manner so that our future resolves.
         // In an actual application, `device.poll(...)` should
         // be called in an event loop or on another thread.
         self.device.poll(wgpu::Maintain::Wait);
 
-        // Awaits until `buffer_future` can be read from
-        if let Ok(()) = pollster::block_on(buffer_future) {
-            // Gets contents of buffer
-            // location R uses potential Vi = rotation[R]
-            let data = buffer_slice.get_mapped_range();
-            let data_vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-            let mut result = Array1::zeros((self.num_replicas,));
-            result.iter_mut().enumerate().for_each(|(r, v)| {
-                let r_rot = self.vn_index_to_replica_index[r];
-                *v = data_vec[r_rot];
-            });
+        // Gets contents of buffer
+        // location R uses potential Vi = rotation[R]
+        let data = buffer_slice.get_mapped_range();
+        let data_vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        let mut result = Array1::zeros((self.num_replicas,));
+        result.iter_mut().enumerate().for_each(|(r, v)| {
+            let r_rot = self.vn_index_to_replica_index[r];
+            *v = data_vec[r_rot];
+        });
 
-            // // // With the current interface, we have to make sure all mapped views are
-            // // // dropped before we unmap the buffer.
-            // drop(data);
-            // buf.unmap(); // Unmaps buffer from memory
-            Ok(result)
-        } else {
-            Err("failed to run compute on gpu!".to_string())
-        }
+        // // // With the current interface, we have to make sure all mapped views are
+        // // // dropped before we unmap the buffer.
+        // drop(data);
+        // buf.unmap(); // Unmaps buffer from memory
+        Ok(result)
     }
 
     pub fn calculate_state(&mut self) -> Result<(), String> {
@@ -852,44 +847,39 @@ impl GPUBackend {
             // Note that we're not calling `.await` here.
             let buffer_slice = staging_buffer.slice(..);
             // Gets the future representing when `staging_buffer` can be read from
-            let buffer_future = buffer_slice.map_async(wgpu::MapMode::Read);
+            buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
 
             // Poll the device in a blocking manner so that our future resolves.
             // In an actual application, `device.poll(...)` should
             // be called in an event loop or on another thread.
             self.device.poll(wgpu::Maintain::Wait);
 
-            // Awaits until `buffer_future` can be read from
-            if let Ok(()) = pollster::block_on(buffer_future) {
-                // Gets contents of buffer
-                let data = buffer_slice.get_mapped_range();
-                let data_vec: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
-                let mut result = Array6::zeros((self.num_replicas, t, x, y, z, 6));
-                ndarray::Zip::indexed(&mut result).into_par_iter().for_each(
-                    |((ir, it, ix, iy, iz, ip), v)| {
-                        let ir = self.vn_index_to_replica_index[ir];
-                        let replica_offset = ir * (t * x * y * z * p);
-                        let t_offset = it * x * y * z * p;
-                        let x_offset = ix * y * z * p;
-                        let y_offset = iy * z * p;
-                        let z_offset = iz * p;
-                        let p_offset = ip;
-                        let indx =
-                            replica_offset + t_offset + x_offset + y_offset + z_offset + p_offset;
-                        *v = data_vec[indx];
-                    },
-                );
-                self.state = Some(result);
+            // Gets contents of buffer
+            let data = buffer_slice.get_mapped_range();
+            let data_vec: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
+            let mut result = Array6::zeros((self.num_replicas, t, x, y, z, 6));
+            ndarray::Zip::indexed(&mut result).into_par_iter().for_each(
+                |((ir, it, ix, iy, iz, ip), v)| {
+                    let ir = self.vn_index_to_replica_index[ir];
+                    let replica_offset = ir * (t * x * y * z * p);
+                    let t_offset = it * x * y * z * p;
+                    let x_offset = ix * y * z * p;
+                    let y_offset = iy * z * p;
+                    let z_offset = iz * p;
+                    let p_offset = ip;
+                    let indx =
+                        replica_offset + t_offset + x_offset + y_offset + z_offset + p_offset;
+                    *v = data_vec[indx];
+                },
+            );
+            self.state = Some(result);
 
-                // // // With the current interface, we have to make sure all mapped views are
-                // // // dropped before we unmap the buffer.
-                // drop(data);
-                // buf.unmap(); // Unmaps buffer from memory
+            // // // With the current interface, we have to make sure all mapped views are
+            // // // dropped before we unmap the buffer.
+            // drop(data);
+            // buf.unmap(); // Unmaps buffer from memory
 
-                Ok(())
-            } else {
-                Err("failed to run compute on gpu!".to_string())
-            }
+            Ok(())
         } else {
             Ok(())
         }
