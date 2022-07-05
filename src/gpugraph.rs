@@ -168,7 +168,7 @@ impl GPUBackend {
             .await
             .map_err(|f| format!("GPU Error: {:?}", f))?;
 
-        let compute_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
         });
