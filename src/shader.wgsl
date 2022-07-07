@@ -287,16 +287,21 @@ fn main_global(@builtin(global_invocation_id) global_id: vec3<u32>) {
     inc_energy_increase = inc_energy_increase - lowest_e;
     dec_energy_increase = dec_energy_increase - lowest_e;
 
-    let add_zer_p = exp(-zero_energy);
-    let add_one_p = exp(-inc_energy_increase);
-    let sub_one_p = exp(-dec_energy_increase);
+    // Protect against overflow/underflow.
+    let add_zer_p = select(exp(-zero_energy), 0.0, zero_energy >= 32.0);
+    let add_one_p = select(exp(-inc_energy_increase), 0.0, inc_energy_increase >= 32.0);
+    let sub_one_p = select(exp(-dec_energy_increase), 0.0, dec_energy_increase >= 32.0);
 
     let random_float = prng(global_id.x);
     let random_float = random_float * (add_zer_p + add_one_p + sub_one_p) - add_zer_p;
 
-    if (random_float < 0.0) {
+    if (random_float <= 0.0) {
         return;
     }
+
+    // select(f,t,condition)
+    // random_float is between 0.0 and add_one_p + sub_one_p
+    // If between 0.0 and add_one_p then random_float < add_one_p == true so choose 1.
     let choice = select(-1, 1, random_float < add_one_p);
     for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
         for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
@@ -420,17 +425,28 @@ fn main_local(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // subtract one to pos_index, add one from neg_index
         sub_one_dv = sub_one_dv + vn.vn[vn_offset + abs(pos_np - 1)] + vn.vn[vn_offset + abs(neg_np + 1)] - vn.vn[vn_offset + abs(pos_np)] - vn.vn[vn_offset + abs(neg_np)];
     }
-    let add_one_p = exp(-add_one_dv);
-    let sub_one_p = exp(-sub_one_dv);
+
+    // Shift all choices to the most preferable thing is "0" energy.
+    let lowest_e = min(add_one_dv, min(sub_one_dv, 0.0));
+    let zero_energy = 0.0 - lowest_e;
+    add_one_dv = add_one_dv - lowest_e;
+    sub_one_dv = sub_one_dv - lowest_e;
+
+    // Protect against overflow/underflow.
+    let zero_p = select(exp(-zero_energy), 0.0, zero_energy >= 32.0);
+    let add_one_p = select(exp(-add_one_dv), 0.0, add_one_dv >= 32.0);
+    let sub_one_p = select(exp(-sub_one_dv), 0.0, sub_one_dv >= 32.0);
 
     let random_float = prng(global_id.x);
-    let random_float = random_float * (1.0 + add_one_p + sub_one_p) - 1.0;
+    let random_float = random_float * (zero_p + add_one_p + sub_one_p) - zero_p;
 
-    if (random_float < 0.0) {
+    if (random_float <= 0.0) {
         return;
     }
 
-    // select(t,f,condition)
+    // select(f,t,condition)
+    // random_float is between 0.0 and add_one_p + sub_one_p
+    // If between 0.0 and add_one_p then random_float < add_one_p == true so choose 1.
     let choice = select(-1, 1, random_float < add_one_p);
     let index = pos_indices[0];
 
