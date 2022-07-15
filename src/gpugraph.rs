@@ -1,6 +1,6 @@
 use crate::{Dimension, NDDualGraph, SiteIndex};
 use bytemuck;
-use ndarray::{s, Array1, Array2, Array6, Axis};
+use ndarray::{s, Array1, Array2, Array6, Axis, Ix};
 use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -9,6 +9,16 @@ use std::cmp::max;
 use std::iter::repeat;
 use wgpu;
 use wgpu::util::DeviceExt;
+
+pub enum WindingNumsOption {
+    Gpu,
+    Cpu,
+}
+pub enum EnergyOption {
+    Gpu,
+    Cpu,
+    CpuIfPresent,
+}
 
 pub struct GPUBackend {
     rng: Option<SmallRng>,
@@ -29,10 +39,13 @@ pub struct GPUBackend {
     localupdate: LocalUpdatePipeline,
     globalupdate: GlobalUpdatePipeline,
     pcgupdate: PCGRotatePipeline,
-    sum_planes: SumEnergyPipeline,
+    sum_energy_planes: SumEnergyPipeline,
+    sum_winding_planes: WindingPipeline,
     bindgroup: wgpu::BindGroup,
     // Debugging information
     tempering_debug: Option<ParallelTemperingDebug>,
+    winding_nums_option: WindingNumsOption,
+    energy_option: EnergyOption,
 }
 
 struct ParallelTemperingDebug {
@@ -85,6 +98,9 @@ struct PCGRotatePipeline {
 struct SumEnergyPipeline {
     init_sum_pipeline: wgpu::ComputePipeline,
     inc_sum_pipeline: wgpu::ComputePipeline,
+}
+struct WindingPipeline {
+    winding_sum_pipeline: wgpu::ComputePipeline,
 }
 
 const WORKGROUP: usize = 256;
@@ -243,7 +259,6 @@ impl GPUBackend {
                 bind_group_layouts: &[&compute_bind_group_layout],
                 push_constant_ranges: &[],
             });
-
         let localupdate_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("localupdate pipeline"),
@@ -266,7 +281,7 @@ impl GPUBackend {
                 entry_point: "rotate_pcg",
             });
         let init_sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("intitial energy summation pipeline"),
+            label: Some("initial energy summation pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &compute_shader,
             entry_point: "initial_sum_energy",
@@ -277,6 +292,13 @@ impl GPUBackend {
             module: &compute_shader,
             entry_point: "incremental_sum_energy",
         });
+        let winding_sum_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("winding summation pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &compute_shader,
+                entry_point: "calculate_winding_numbers",
+            });
 
         let initial_state = if let Some(initial_state) = initial_state {
             initial_state
@@ -377,11 +399,16 @@ impl GPUBackend {
             pcgupdate: PCGRotatePipeline {
                 update_pipeline: rotate_pcg_pipeline,
             },
-            sum_planes: SumEnergyPipeline {
+            sum_energy_planes: SumEnergyPipeline {
                 init_sum_pipeline,
                 inc_sum_pipeline,
             },
+            sum_winding_planes: WindingPipeline {
+                winding_sum_pipeline,
+            },
             tempering_debug: Some(ParallelTemperingDebug::new(num_replicas)),
+            winding_nums_option: WindingNumsOption::Gpu,
+            energy_option: EnergyOption::CpuIfPresent,
         })
     }
 
@@ -577,17 +604,13 @@ impl GPUBackend {
         }
     }
 
-    pub fn run_parallel_tempering_sweep(
-        &mut self,
-        offset: bool,
-        energies_from_stored_state: Option<bool>,
-    ) -> Result<(), String> {
-        let base_energies = self.get_energy(energies_from_stored_state)?;
+    pub fn run_parallel_tempering_sweep(&mut self, offset: bool) -> Result<(), String> {
+        let base_energies = self.get_energy()?;
         self.swap_replica_potentials(offset, repeat(true));
-        let modified_energies = self.get_energy(energies_from_stored_state)?;
+        let modified_energies = self.get_energy()?;
         self.swap_replica_potentials(offset, repeat(true));
         // Should now be back to where we were before.
-        debug_assert_eq!(base_energies, self.get_energy(energies_from_stored_state)?);
+        debug_assert_eq!(base_energies, self.get_energy()?);
 
         let mut rng = self.rng.take().unwrap();
         let mut tempering_debug = self.tempering_debug.take().unwrap();
@@ -627,31 +650,55 @@ impl GPUBackend {
         self.state = None;
     }
 
-    /// Get the energy of each replica, allow forcing from stored state, or not.
-    pub fn get_energy(&mut self, from_stored_state: Option<bool>) -> Result<Array1<f32>, String> {
-        let from_stored_state = from_stored_state.unwrap_or_else(|| self.state.is_some());
+    pub fn get_energy_from_cpu(&mut self) -> Result<Array1<f32>, String> {
+        // If forced and not calculated.
+        self.calculate_state()?;
+        // sum t, x, y, z
+        let potentials = self.get_potentials();
+        let state = self.get_precalculated_state().unwrap();
+        let res = state
+            .axis_iter(Axis(0))
+            .into_par_iter()
+            .zip(potentials.axis_iter(Axis(0)).into_par_iter())
+            .map(|(s, potential)| s.into_par_iter().map(|s| potential[s.abs() as usize]).sum())
+            .collect::<Vec<_>>();
+        let res = Array1::from_vec(res);
+        Ok(res)
+    }
 
-        // If we already have the state stored, just use that.
-        if from_stored_state {
-            // If forced and not calculated.
-            self.calculate_state()?;
-            // sum t, x, y, z
-            let potentials = self.get_potentials();
-            let state = self.get_precalculated_state().unwrap();
-            let res = state
-                .axis_iter(Axis(0))
-                .into_par_iter()
-                .zip(potentials.axis_iter(Axis(0)).into_par_iter())
-                .map(|(s, potential)| s.into_par_iter().map(|s| potential[s.abs() as usize]).sum())
-                .collect::<Vec<_>>();
-            let res = Array1::from_vec(res);
-            Ok(res)
-        } else {
-            let (t, x, y, z, p) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z, 6);
-            let buff_size = t * x * y * z * p / INIT_REDUX;
-            let mut threads_per_replica = buff_size;
+    pub fn get_energy_from_gpu(&mut self) -> Result<Array1<f32>, String> {
+        let (t, x, y, z, p) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z, 6);
+        let buff_size = t * x * y * z * p / INIT_REDUX;
+        let mut threads_per_replica = buff_size;
 
-            self.write_arguments(None);
+        self.write_arguments(None);
+
+        // get command encoder
+        let mut command_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // compute pass
+        command_encoder.push_debug_group("Initial Energy Summation");
+
+        {
+            let mut cpass =
+                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            cpass.set_pipeline(&self.sum_energy_planes.init_sum_pipeline);
+            cpass.set_bind_group(0, &self.bindgroup, &[]);
+
+            let nneeded = self.num_replicas * threads_per_replica;
+            let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
+
+            cpass.dispatch_workgroups(ndispatch, 1, 1);
+        }
+
+        command_encoder.pop_debug_group();
+
+        self.queue.submit(Some(command_encoder.finish()));
+
+        while threads_per_replica > 1 {
+            self.write_arguments(Some(threads_per_replica as u32));
 
             // get command encoder
             let mut command_encoder = self
@@ -659,75 +706,106 @@ impl GPUBackend {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
             // compute pass
-            command_encoder.push_debug_group("Initial Energy Summation");
-
+            command_encoder.push_debug_group("Incremental Energy Summation");
             {
                 let mut cpass = command_encoder
                     .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-                cpass.set_pipeline(&self.sum_planes.init_sum_pipeline);
+                cpass.set_pipeline(&self.sum_energy_planes.inc_sum_pipeline);
                 cpass.set_bind_group(0, &self.bindgroup, &[]);
 
+                threads_per_replica = threads_per_replica / 2 + threads_per_replica % 2;
                 let nneeded = self.num_replicas * threads_per_replica;
                 let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
-
                 cpass.dispatch_workgroups(ndispatch, 1, 1);
             }
-
             command_encoder.pop_debug_group();
 
             self.queue.submit(Some(command_encoder.finish()));
+        }
+        self.read_energy_from_gpu(None)
+    }
 
-            while threads_per_replica > 1 {
-                self.write_arguments(Some(threads_per_replica as u32));
-
-                // get command encoder
-                let mut command_encoder = self
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-                // compute pass
-                command_encoder.push_debug_group("Incremental Energy Summation");
-                {
-                    let mut cpass = command_encoder
-                        .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-                    cpass.set_pipeline(&self.sum_planes.inc_sum_pipeline);
-                    cpass.set_bind_group(0, &self.bindgroup, &[]);
-
-                    threads_per_replica = threads_per_replica / 2 + threads_per_replica % 2;
-                    let nneeded = self.num_replicas * threads_per_replica;
-                    let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
-                    cpass.dispatch_workgroups(ndispatch, 1, 1);
-                }
-                command_encoder.pop_debug_group();
-
-                self.queue.submit(Some(command_encoder.finish()));
-            }
-            self.read_energy_from_gpu(None)
+    /// Get the energy of each replica, allow forcing from stored state, or not.
+    pub fn get_energy(&mut self) -> Result<Array1<f32>, String> {
+        match self.energy_option {
+            EnergyOption::Gpu => self.get_energy_from_gpu(),
+            EnergyOption::CpuIfPresent if self.state.is_none() => self.get_energy_from_gpu(),
+            _ => self.get_energy_from_cpu(),
         }
     }
 
+    pub fn set_winding_num_method(&mut self, method: WindingNumsOption) {
+        self.winding_nums_option = method;
+    }
+    pub fn set_energy_method(&mut self, method: EnergyOption) {
+        self.energy_option = method;
+    }
+
     pub fn get_winding_nums(&mut self) -> Result<Array2<i32>, String> {
-        let mut sum = self
-            .get_state()?
-            .sum_axis(Axis(1))
-            .sum_axis(Axis(1))
-            .sum_axis(Axis(1))
-            .sum_axis(Axis(1));
-        let bounds = &self.shape;
-        let plane_sizes = [
-            bounds.t * bounds.x,
-            bounds.t * bounds.y,
-            bounds.t * bounds.z,
-            bounds.x * bounds.y,
-            bounds.x * bounds.z,
-            bounds.y * bounds.z,
-        ];
-        sum.axis_iter_mut(Axis(0)).for_each(|mut arr| {
-            arr.iter_mut().zip(plane_sizes.iter()).for_each(|(s, n)| {
-                *s /= *n as i32;
-            })
-        });
-        Ok(sum)
+        match self.winding_nums_option {
+            WindingNumsOption::Gpu => self.get_winding_nums_gpu(),
+            WindingNumsOption::Cpu => self.get_winding_nums_cpu(),
+        }
+    }
+
+    pub fn get_winding_nums_cpu(&mut self) -> Result<Array2<i32>, String> {
+        let mut res = Array2::zeros((self.num_replicas, 6));
+        let state = self.get_state()?;
+        ndarray::Zip::indexed(&mut res)
+            .into_par_iter()
+            .for_each(|((rep, p), res)| {
+                let subslice = match p {
+                    0 => state.slice(s![rep, 0, 0, .., .., p]),
+                    1 => state.slice(s![rep, 0, .., 0, .., p]),
+                    2 => state.slice(s![rep, 0, .., .., 0, p]),
+                    3 => state.slice(s![rep, .., 0, 0, .., p]),
+                    4 => state.slice(s![rep, .., 0, .., 0, p]),
+                    5 => state.slice(s![rep, .., .., 0, 0, p]),
+                    _ => unreachable!(),
+                };
+                *res = subslice.iter().copied().sum();
+            });
+
+        Ok(res)
+    }
+
+    pub fn get_winding_nums_gpu(&mut self) -> Result<Array2<i32>, String> {
+        let p = 6;
+        let buff_size = p;
+        let mut threads_per_replica = buff_size;
+
+        self.write_arguments(None);
+
+        // get command encoder
+        let mut command_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // compute pass
+        command_encoder.push_debug_group("Initial Energy Summation");
+
+        {
+            let mut cpass =
+                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            cpass.set_pipeline(&self.sum_winding_planes.winding_sum_pipeline);
+            cpass.set_bind_group(0, &self.bindgroup, &[]);
+
+            let nneeded = self.num_replicas * threads_per_replica;
+            let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
+
+            cpass.dispatch_workgroups(ndispatch, 1, 1);
+        }
+
+        command_encoder.pop_debug_group();
+
+        self.queue.submit(Some(command_encoder.finish()));
+
+        self.read_sumbuffer_from_gpu(p * self.num_replicas)
+            .into_iter()
+            .map(|f| f as i32)
+            .collect::<Array1<i32>>()
+            .into_shape((self.num_replicas, p))
+            .map_err(|se| se.to_string())
     }
 
     pub fn write_arguments<It>(&mut self, it: It)
@@ -757,11 +835,7 @@ impl GPUBackend {
         );
     }
 
-    pub fn read_energy_from_gpu(
-        &mut self,
-        read_num_values: Option<usize>,
-    ) -> Result<Array1<f32>, String> {
-        let read_num_values = read_num_values.unwrap_or(self.num_replicas);
+    pub fn read_sumbuffer_from_gpu(&mut self, read_num_values: usize) -> Vec<f32> {
         let to_read = read_num_values * std::mem::size_of::<f32>();
 
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -801,7 +875,15 @@ impl GPUBackend {
         // Gets contents of buffer
         // location R uses potential Vi = rotation[R]
         let data = buffer_slice.get_mapped_range();
-        let data_vec: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        bytemuck::cast_slice(&data).to_vec()
+    }
+
+    pub fn read_energy_from_gpu(
+        &mut self,
+        read_num_values: Option<usize>,
+    ) -> Result<Array1<f32>, String> {
+        let read_num_values = read_num_values.unwrap_or(self.num_replicas);
+        let data_vec = self.read_sumbuffer_from_gpu(read_num_values);
         let mut result = Array1::zeros((self.num_replicas,));
         result.iter_mut().enumerate().for_each(|(r, v)| {
             let r_rot = self.vn_index_to_replica_index[r];
@@ -1019,13 +1101,15 @@ mod gpu_tests {
     #[test]
     fn test_energy_calc() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let energies = s.get_energy(Some(true))?;
+        let energies = s.get_energy()?;
         s.swap_replica_potentials(false, repeat(true));
-        let swapped_state = s.get_energy(Some(true))?;
+        s.set_energy_method(EnergyOption::Gpu);
+        let swapped_state = s.get_energy()?;
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.swap_replica_potentials(false, repeat(true));
-        let calced_swapped_state = s.get_energy(Some(false))?;
+        s.set_energy_method(EnergyOption::Cpu);
+        let calced_swapped_state = s.get_energy()?;
 
         let n_faces = 4 * 4 * 4 * 4 * 6;
         let energies_slice = energies
@@ -1254,16 +1338,16 @@ mod gpu_tests {
         // Make a state where np is higher for larger potentials,
         // energetically preferable to swap back.
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let energies = s.get_energy(Some(true))?;
+        let energies = s.get_energy()?;
         s.swap_replica_potentials(false, repeat(true));
-        let swapped_energy = s.get_energy(Some(true))?;
+        let swapped_energy = s.get_energy()?;
         let swap_state = s.get_state()?;
 
         // Reinit, and check if it swaps.
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.run_parallel_tempering_sweep(false, Some(true))?;
+        s.run_parallel_tempering_sweep(false)?;
 
-        assert_eq!(swapped_energy, s.get_energy(Some(true))?);
+        assert_eq!(swapped_energy, s.get_energy()?);
         assert_eq!(swap_state, s.get_state()?);
 
         Ok(())

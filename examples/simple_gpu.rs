@@ -5,9 +5,9 @@ use std::iter::repeat;
 fn main() -> Result<(), String> {
     env_logger::init();
 
-    let num_replicas = 3;
-    let steps_per_sample = 10;
-    let num_updates = 10;
+    let num_replicas = 5;
+    let steps_per_sample = 1;
+    let num_updates = 1;
 
     let (t, x, y, z) = (4, 4, 4, 4);
 
@@ -42,19 +42,26 @@ fn main() -> Result<(), String> {
         state.run_pcg_rotate();
     }
 
-    for _ in 0..4 {
-        let energies_gpu = state.get_energy(Some(false))?;
-        let energies_state = state.get_energy(Some(true))?;
+    // TODO
+    let windings = state.get_winding_nums_gpu()?;
+    println!("{:?}", windings);
+    println!("{:?}", state.get_winding_nums()?);
 
-        println!(
-            "{:?}\t{:?}",
-            energies_state.as_slice(),
-            energies_gpu.as_slice()
-        );
-        assert_eq!(energies_gpu, energies_state);
+    assert_eq!(windings, state.get_winding_nums()?);
 
-        state.swap_replica_potentials(false, repeat(true));
-    }
+    // for _ in 0..4 {
+    //     let energies_gpu = state.get_energy(Some(false))?;
+    //     let energies_state = state.get_energy(Some(true))?;
+    //
+    //     println!(
+    //         "{:?}\t{:?}",
+    //         energies_state.as_slice(),
+    //         energies_gpu.as_slice()
+    //     );
+    //     assert_eq!(energies_gpu, energies_state);
+    //
+    //     state.swap_replica_potentials(false, repeat(true));
+    // }
 
     //
     // let winding_nums = state.get_winding_nums()?;

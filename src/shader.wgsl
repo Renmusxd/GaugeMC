@@ -101,6 +101,85 @@ fn rotate_pcg(@builtin(global_invocation_id) global_id: vec3<u32>) {
     pcgstate.state[pcg_index] = pcgstate.state[pcg_index] ^ pcgstate.state[(pcg_index + 1u) % num_pcgs];
 }
 
+
+@compute
+@workgroup_size(256,1,1)
+fn calculate_winding_numbers(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    var index = global_id.x;
+
+    let t = dim_indices.data[0];
+    let x = dim_indices.data[1];
+    let y = dim_indices.data[2];
+    let z = dim_indices.data[3];
+    let p = 6u;
+    let num_replicas = dim_indices.data[4];
+
+    // p W.N. per replica
+    let num_threads = p*num_replicas;
+    if (index >= num_threads) {
+        return;
+    }
+
+    let p_index = index % p;
+    let replica_index = index / p;
+
+    let replica_offset = replica_index * (t*x*y*z*p);
+
+    var k1 = 0u;
+    var v1_max = 0u;
+    var k2 = 0u;
+    var v2_max = 0u;
+    var offset = p_index;
+    if (p_index == 0u) {
+        // T/X plane
+        v1_max = y;
+        v2_max = z;
+        k1 = z*p;
+        k2 = p;
+    } else if (p_index == 1u) {
+        // T/Y plane
+        v1_max = x;
+        v2_max = z;
+        k1 = y*z*p;
+        k2 = p;
+    } else if (p_index == 2u) {
+        // T/Z plane
+        v1_max = x;
+        v2_max = y;
+        k1 = y*z*p;
+        k2 = z*p;
+    } else if (p_index == 3u) {
+        // X/Y plane
+        v1_max = t;
+        v2_max = z;
+        k1 = x*y*z*p;
+        k2 = p;
+    } else if (p_index == 4u) {
+        // X/Z plane
+        v1_max = t;
+        v2_max = y;
+        k1 = x*y*z*p;
+        k2 = z*p;
+    } else {
+        // Y/Z plane
+        v1_max = t;
+        v2_max = x;
+        k1 = x*y*z*p;
+        k2 = y*z*p;
+    }
+
+    var plaq_sum = 0;
+    for (var v1 = 0u; v1 < v1_max; v1 = v1 + 1u) {
+        for (var v2 = 0u; v2 < v2_max; v2 = v2 + 1u) {
+            let plaquette_index = v1*k1 + v2*k2 + offset;
+            plaq_sum = plaq_sum + state.state[replica_offset + plaquette_index];
+        }
+    }
+
+    sumbuffer.buff[global_id.x] = f32(plaq_sum);
+}
+
+
 @compute
 @workgroup_size(256,1,1)
 fn initial_sum_energy(@builtin(global_invocation_id) global_id: vec3<u32>) {
