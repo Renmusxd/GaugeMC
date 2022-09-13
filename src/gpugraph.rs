@@ -116,6 +116,7 @@ impl GPUBackend {
         vn: Array2<f32>,
         initial_state: Option<Array6<i32>>,
         seed: Option<u64>,
+        device_id: Option<usize>,
     ) -> Result<Self, String> {
         for d in [t, x, y, z] {
             if d % 2 == 1 {
@@ -154,15 +155,21 @@ impl GPUBackend {
         let instance = wgpu::Instance::new(wgpu::Backends::all());
 
         // `request_adapter` instantiates the general connection to the GPU
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
-            .await
-            .ok_or_else(|| "GPU: Instance was not able to request an adapter".to_string())?;
-
+        let adapter = if let Some(device_id) = device_id {
+            instance
+                .enumerate_adapters(wgpu::Backends::all())
+                .filter(|x| x.get_info().device == device_id)
+                .next()
+        } else {
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+        }
+        .ok_or_else(|| "GPU: Instance was not able to request an adapter".to_string())?;
         // `request_device` instantiates the feature specific connection to the GPU, defining some parameters,
         //  `features` being the available features.
         let mut limits = wgpu::Limits::downlevel_defaults();
@@ -1081,7 +1088,8 @@ mod gpu_tests {
                     }
                 })
             });
-        let mut graph = pollster::block_on(GPUBackend::new_async(t, x, y, z, vn, None, None))?;
+        let mut graph =
+            pollster::block_on(GPUBackend::new_async(t, x, y, z, vn, None, None, None))?;
 
         graph.run_global_sweep();
 
@@ -1130,7 +1138,16 @@ mod gpu_tests {
             .for_each(|((r, _, _, _, _, _), v)| {
                 *v = r as i32;
             });
-        pollster::block_on(GPUBackend::new_async(t, x, t, z, vn, Some(state), None))
+        pollster::block_on(GPUBackend::new_async(
+            t,
+            x,
+            t,
+            z,
+            vn,
+            Some(state),
+            None,
+            None,
+        ))
     }
 
     #[test]

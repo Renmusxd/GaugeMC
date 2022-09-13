@@ -29,6 +29,7 @@ fn main() -> Result<(), String> {
         vns,
         Some(init_state),
         None,
+        None,
     ))?;
 
     for _ in 0..steps_per_sample {
