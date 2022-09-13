@@ -373,11 +373,11 @@ impl NDDualGraph {
                     .iter()
                     .cloned()
                     .map(|v| {
-                        let new_val = (v + delta).abs() as usize;
+                        let new_val = (v + delta).unsigned_abs() as usize;
                         if new_val >= self.vn.len() {
                             f64::infinity()
                         } else {
-                            self.vn[new_val] - self.vn[v.abs() as usize]
+                            self.vn[new_val] - self.vn[v.unsigned_abs() as usize]
                         }
                     })
                     .sum::<f64>();
@@ -385,11 +385,11 @@ impl NDDualGraph {
                     .iter()
                     .cloned()
                     .map(|v| {
-                        let new_val = (v - delta).abs() as usize;
+                        let new_val = (v - delta).unsigned_abs() as usize;
                         if new_val >= self.vn.len() {
                             f64::infinity()
                         } else {
-                            self.vn[new_val] - self.vn[v.abs() as usize]
+                            self.vn[new_val] - self.vn[v.unsigned_abs() as usize]
                         }
                     })
                     .sum::<f64>();
@@ -736,10 +736,10 @@ impl NDDualGraph {
                 np.axis_iter(ndarray::Axis(plane_dims[0].into()))
                     .fold(acc, |(sub, add), np| {
                         let int_n = np.get((mu, nu, p)).unwrap();
-                        let d_sub =
-                            self.vn[(int_n - 1).abs() as usize] - self.vn[int_n.abs() as usize];
-                        let d_add =
-                            self.vn[(int_n + 1).abs() as usize] - self.vn[int_n.abs() as usize];
+                        let d_sub = self.vn[(int_n - 1).unsigned_abs() as usize]
+                            - self.vn[int_n.unsigned_abs() as usize];
+                        let d_add = self.vn[(int_n + 1).unsigned_abs() as usize]
+                            - self.vn[int_n.unsigned_abs() as usize];
                         (sub + d_sub, add + d_add)
                     })
             })
