@@ -1,6 +1,6 @@
 use crate::{Dimension, NDDualGraph, SiteIndex};
 use bytemuck;
-use ndarray::{s, Array1, Array2, Array6, Axis, Ix};
+use ndarray::{s, Array1, Array2, Array6, Axis};
 use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -13,6 +13,7 @@ use wgpu::util::DeviceExt;
 pub enum WindingNumsOption {
     Gpu,
     Cpu,
+    OldCpu,
 }
 pub enum EnergyOption {
     Gpu,
@@ -745,7 +746,32 @@ impl GPUBackend {
         match self.winding_nums_option {
             WindingNumsOption::Gpu => self.get_winding_nums_gpu(),
             WindingNumsOption::Cpu => self.get_winding_nums_cpu(),
+            WindingNumsOption::OldCpu => self.get_winding_nums_cpu_old(),
         }
+    }
+
+    pub fn get_winding_nums_cpu_old(&mut self) -> Result<Array2<i32>, String> {
+        let mut sum = self
+            .get_state()?
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1));
+        let bounds = &self.shape;
+        let plane_sizes = [
+            bounds.t * bounds.x,
+            bounds.t * bounds.y,
+            bounds.t * bounds.z,
+            bounds.x * bounds.y,
+            bounds.x * bounds.z,
+            bounds.y * bounds.z,
+        ];
+        sum.axis_iter_mut(Axis(0)).for_each(|mut arr| {
+            arr.iter_mut().zip(plane_sizes.iter()).for_each(|(s, n)| {
+                *s /= *n as i32;
+            })
+        });
+        Ok(sum)
     }
 
     pub fn get_winding_nums_cpu(&mut self) -> Result<Array2<i32>, String> {
@@ -771,8 +797,7 @@ impl GPUBackend {
 
     pub fn get_winding_nums_gpu(&mut self) -> Result<Array2<i32>, String> {
         let p = 6;
-        let buff_size = p;
-        let mut threads_per_replica = buff_size;
+        let threads_per_replica = p;
 
         self.write_arguments(None);
 
@@ -782,7 +807,7 @@ impl GPUBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         // compute pass
-        command_encoder.push_debug_group("Initial Energy Summation");
+        command_encoder.push_debug_group("Winding Num Summation");
 
         {
             let mut cpass =
@@ -800,12 +825,22 @@ impl GPUBackend {
 
         self.queue.submit(Some(command_encoder.finish()));
 
-        self.read_sumbuffer_from_gpu(p * self.num_replicas)
+        let raw_windings = self
+            .read_sumbuffer_from_gpu(p * self.num_replicas)
             .into_iter()
             .map(|f| f as i32)
             .collect::<Array1<i32>>()
             .into_shape((self.num_replicas, p))
-            .map_err(|se| se.to_string())
+            .map_err(|se| se.to_string())?;
+        // Now reorder by parallel temperings.
+        let mut result = Array2::zeros((self.num_replicas, p));
+        ndarray::Zip::indexed(&mut result)
+            .into_par_iter()
+            .for_each(|((ir, ip), v)| {
+                let ir = self.vn_index_to_replica_index[ir];
+                *v = raw_windings[[ir, ip]];
+            });
+        Ok(result)
     }
 
     pub fn write_arguments<It>(&mut self, it: It)
@@ -1099,17 +1134,76 @@ mod gpu_tests {
     }
 
     #[test]
+    fn test_winding_num_calc() -> Result<(), String> {
+        let mut s = make_replica_value_state(3, 4, 4, 4, 4)?;
+        for i in 0..100 {
+            s.run_global_sweep();
+            s.swap_replica_potentials(i % 2 == 0, repeat(true));
+            s.swap_replica_potentials(i % 2 == 1, repeat(true));
+            let cpu_w = s.get_winding_nums_cpu()?;
+            let gpu_w = s.get_winding_nums_gpu()?;
+            let old_w = s.get_winding_nums_cpu_old()?;
+            assert_eq!(cpu_w, gpu_w);
+            assert_eq!(cpu_w, old_w);
+        }
+        println!("{:?}", s.get_parallel_tempering_success_rate());
+        Ok(())
+    }
+
+    #[test]
     fn test_energy_calc() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let energies = s.get_energy()?;
+        let energies = s.get_energy_from_gpu()?;
         s.swap_replica_potentials(false, repeat(true));
-        s.set_energy_method(EnergyOption::Gpu);
-        let swapped_state = s.get_energy()?;
+        let swapped_state = s.get_energy_from_gpu()?;
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.swap_replica_potentials(false, repeat(true));
-        s.set_energy_method(EnergyOption::Cpu);
-        let calced_swapped_state = s.get_energy()?;
+        let calced_swapped_state = s.get_energy_from_gpu()?;
+
+        let n_faces = 4 * 4 * 4 * 4 * 6;
+        let energies_slice = energies
+            .as_slice()
+            .ok_or_else(|| "Not a slice".to_string())?;
+        let swapped_energies_slice = swapped_state
+            .as_slice()
+            .ok_or_else(|| "Not a slice".to_string())?;
+        let calced_swapped_energies_slice = calced_swapped_state
+            .as_slice()
+            .ok_or_else(|| "Not a slice".to_string())?;
+        assert_eq!(
+            energies_slice,
+            &[
+                1.0 * 0.0 * (n_faces as f32),
+                2.0 * 1.0 * (n_faces as f32),
+                3.0 * 4.0 * (n_faces as f32),
+                4.0 * 9.0 * (n_faces as f32),
+            ]
+        );
+        assert_eq!(
+            swapped_energies_slice,
+            &[
+                1.0 * 1.0 * (n_faces as f32),
+                2.0 * 0.0 * (n_faces as f32),
+                3.0 * 9.0 * (n_faces as f32),
+                4.0 * 4.0 * (n_faces as f32),
+            ]
+        );
+        assert_eq!(calced_swapped_energies_slice, swapped_energies_slice);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_energy_calc_cpu() -> Result<(), String> {
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
+        let energies = s.get_energy_from_cpu()?;
+        s.swap_replica_potentials(false, repeat(true));
+        let swapped_state = s.get_energy_from_cpu()?;
+
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
+        s.swap_replica_potentials(false, repeat(true));
+        let calced_swapped_state = s.get_energy_from_cpu()?;
 
         let n_faces = 4 * 4 * 4 * 4 * 6;
         let energies_slice = energies
