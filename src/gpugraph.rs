@@ -1,5 +1,6 @@
 use crate::{Dimension, NDDualGraph, SiteIndex};
 use bytemuck;
+use log::{info, warn};
 use ndarray::{s, Array1, Array2, Array6, Axis};
 use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
@@ -9,6 +10,7 @@ use std::cmp::max;
 use std::iter::repeat;
 use wgpu;
 use wgpu::util::DeviceExt;
+use wgpu::DeviceType;
 
 pub enum WindingNumsOption {
     Gpu,
@@ -156,10 +158,31 @@ impl GPUBackend {
 
         // `request_adapter` instantiates the general connection to the GPU
         let adapter = if let Some(device_id) = device_id {
-            instance
+            let mut adapters = instance
                 .enumerate_adapters(wgpu::Backends::all())
+                .filter(|x| x.get_info().device_type != DeviceType::Cpu)
                 .filter(|x| x.get_info().device == device_id)
-                .next()
+                .collect::<Vec<_>>();
+            info!(
+                "Found {} adapters with device_id={}",
+                adapters.len(),
+                device_id
+            );
+            if let Some(a) = adapters.pop() {
+                Ok(a)
+            } else {
+                let adapters = instance
+                    .enumerate_adapters(wgpu::Backends::all())
+                    .map(|a| a.get_info())
+                    .collect::<Vec<_>>();
+                warn!(
+                    "No adapters found with device_id={} (compared to {} unfiltered)",
+                    device_id,
+                    adapters.len()
+                );
+                info!("List of adapters: {:?}", adapters);
+                Err(format!("No adapter found for device_id={}", device_id))
+            }
         } else {
             instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
@@ -168,8 +191,8 @@ impl GPUBackend {
                     compatible_surface: None,
                 })
                 .await
-        }
-        .ok_or_else(|| "GPU: Instance was not able to request an adapter".to_string())?;
+                .ok_or_else(|| "GPU: Instance was not able to request an adapter".to_string())
+        }?;
         // `request_device` instantiates the feature specific connection to the GPU, defining some parameters,
         //  `features` being the available features.
         let mut limits = wgpu::Limits::downlevel_defaults();
