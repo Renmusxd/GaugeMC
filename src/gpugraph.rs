@@ -406,7 +406,7 @@ impl GPUBackend {
 
         Ok(Self {
             rng: Some(rng),
-            state: None,
+            state: Some(initial_state),
             shape: bounds,
             num_replicas,
             num_pcgs,
@@ -691,7 +691,11 @@ impl GPUBackend {
             .axis_iter(Axis(0))
             .into_par_iter()
             .zip(potentials.axis_iter(Axis(0)).into_par_iter())
-            .map(|(s, potential)| s.into_par_iter().map(|s| potential[s.abs() as usize]).sum())
+            .map(|(s, potential)| {
+                s.into_par_iter()
+                    .map(|s| potential[s.unsigned_abs() as usize])
+                    .sum()
+            })
             .collect::<Vec<_>>();
         let res = Array1::from_vec(res);
         Ok(res)
@@ -871,6 +875,15 @@ impl GPUBackend {
                 *v = raw_windings[[ir, ip]];
             });
         Ok(result)
+    }
+
+    pub fn write_potentials(&mut self, vn: Array2<f32>) {
+        self.queue.write_buffer(
+            &self.vn_buffer,
+            0_u64,
+            bytemuck::cast_slice(vn.as_slice().expect("Memory not contiguous")),
+        );
+        self.vn = vn;
     }
 
     pub fn write_arguments<It>(&mut self, it: It)
