@@ -49,6 +49,8 @@ pub struct GPUBackend {
     tempering_debug: Option<ParallelTemperingDebug>,
     winding_nums_option: WindingNumsOption,
     energy_option: EnergyOption,
+
+    written_arguments: Option<Vec<u32>>,
 }
 
 struct ParallelTemperingDebug {
@@ -437,6 +439,7 @@ impl GPUBackend {
             tempering_debug: Some(ParallelTemperingDebug::new(num_replicas)),
             winding_nums_option: WindingNumsOption::Gpu,
             energy_option: EnergyOption::CpuIfPresent,
+            written_arguments: None,
         })
     }
 
@@ -939,11 +942,15 @@ impl GPUBackend {
         // Add the additional arguments
         .chain(it.into_iter())
         .collect::<Vec<u32>>();
-        self.queue.write_buffer(
-            &self.localupdate.index_buffer,
-            0_u64,
-            bytemuck::cast_slice(vals.as_slice()),
-        );
+
+        if Some(&vals) != self.written_arguments.as_ref() {
+            self.queue.write_buffer(
+                &self.localupdate.index_buffer,
+                0_u64,
+                bytemuck::cast_slice(vals.as_slice()),
+            );
+            self.written_arguments = Some(vals);
+        }
     }
 
     pub fn read_sumbuffer_from_gpu(&mut self, read_num_values: usize) -> Vec<f32> {
