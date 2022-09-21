@@ -16,6 +16,10 @@ pub struct SiteIndex {
 }
 
 impl SiteIndex {
+    pub fn new(t: usize, x: usize, y: usize, z: usize) -> Self {
+        Self { t, x, y, z }
+    }
+
     pub fn get(&self, dim: Dimension) -> usize {
         match dim {
             Dimension::T => self.t,

@@ -1,4 +1,4 @@
-use gaugemc::NDDualGraph;
+use gaugemc::{NDDualGraph, SiteIndex};
 use ndarray::{Array2, Array6, Axis};
 use std::iter::repeat;
 
@@ -22,10 +22,7 @@ fn main() -> Result<(), String> {
         });
 
     let mut state = pollster::block_on(gaugemc::GPUBackend::new_async(
-        t,
-        x,
-        y,
-        z,
+        SiteIndex::new(t, x, y, z),
         vns,
         Some(init_state),
         None,
@@ -39,16 +36,16 @@ fn main() -> Result<(), String> {
                 state.run_local_sweep(&dims, leftover, offset);
             })
         }
-        state.run_global_sweep();
+        state.run_global_sweep(None);
         state.run_pcg_rotate();
     }
 
     // TODO
-    let windings = state.get_winding_nums_gpu()?;
+    let windings = state.get_winding_nums_gpu(None)?;
     println!("{:?}", windings);
-    println!("{:?}", state.get_winding_nums()?);
+    println!("{:?}", state.get_winding_nums(None)?);
 
-    assert_eq!(windings, state.get_winding_nums()?);
+    assert_eq!(windings, state.get_winding_nums(None)?);
 
     // for _ in 0..4 {
     //     let energies_gpu = state.get_energy(Some(false))?;

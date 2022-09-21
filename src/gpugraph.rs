@@ -26,7 +26,7 @@ pub enum EnergyOption {
 pub struct GPUBackend {
     rng: Option<SmallRng>,
     // In order of vn, not matching GPU internal state.
-    state: Option<Array6<i32>>,
+    state: Option<(usize, Array6<i32>)>,
     shape: SiteIndex,
     num_replicas: usize,
     num_pcgs: usize,
@@ -111,15 +111,13 @@ const INIT_REDUX: usize = 16;
 
 impl GPUBackend {
     pub async fn new_async(
-        t: usize,
-        x: usize,
-        y: usize,
-        z: usize,
+        bounds: SiteIndex,
         vn: Array2<f32>,
         initial_state: Option<Array6<i32>>,
         seed: Option<u64>,
         device_id: Option<usize>,
     ) -> Result<Self, String> {
+        let (t, x, y, z) = (bounds.t, bounds.x, bounds.y, bounds.z);
         for d in [t, x, y, z] {
             if d % 2 == 1 {
                 return Err(format!(
@@ -134,7 +132,6 @@ impl GPUBackend {
             return Err("Replica number must be larger than 0".to_string());
         }
 
-        let bounds = SiteIndex { t, x, y, z };
         let n_faces = num_replicas * t * x * y * z * 6;
         if let Some(initial_state) = &initial_state {
             if [num_replicas, t, x, y, z, 6] != initial_state.shape() {
@@ -406,7 +403,7 @@ impl GPUBackend {
 
         Ok(Self {
             rng: Some(rng),
-            state: Some(initial_state),
+            state: Some((num_replicas, initial_state)),
             shape: bounds,
             num_replicas,
             num_pcgs,
@@ -505,6 +502,7 @@ impl GPUBackend {
                 .map(|d| usize::from(*d).try_into().unwrap())
                 .chain(Some(usize::from(leftover).try_into().unwrap()))
                 .chain(Some(if offset { 1 } else { 0 })),
+            None,
         );
 
         let mu = self.shape.get(dims[0]) as u32;
@@ -536,9 +534,10 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
     }
 
-    pub fn run_global_sweep(&mut self) {
+    pub fn run_global_sweep(&mut self, skip_last: Option<usize>) {
         self.state = None;
-        self.write_arguments(None);
+        let num_replicas = self.num_replicas - skip_last.unwrap_or_default();
+        self.write_arguments(None, Some(num_replicas));
 
         // get command encoder
         let mut command_encoder = self
@@ -556,7 +555,7 @@ impl GPUBackend {
 
             let (t, x, y, z) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z);
             let planes_per_replica = t * (x + y + z) + x * (y + z) + y * z;
-            let nneeded = self.num_replicas * planes_per_replica;
+            let nneeded = num_replicas * planes_per_replica;
             let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
 
             cpass.dispatch_workgroups(ndispatch, 1, 1);
@@ -566,16 +565,18 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
     }
 
-    pub fn swap_replica_potentials<It>(&mut self, offset: bool, it: It)
+    pub fn swap_replica_potentials<It>(&mut self, start: usize, stop: usize, it: It)
     where
         It: IntoIterator<Item = bool>,
     {
-        let offset = if offset { 1 } else { 0 };
-
-        let entries = &mut self.vn_index_to_replica_index[offset..];
-        if let Some(state) = &mut self.state {
+        let entries = &mut self.vn_index_to_replica_index[start..stop];
+        let state = self
+            .state
+            .as_mut()
+            .and_then(|(i, s)| if *i == stop { Some(s) } else { None });
+        if let Some(state) = state {
             state
-                .slice_mut(s![offset.., .., .., .., .., ..])
+                .slice_axis_mut(Axis(0), ndarray::Slice::from(start..stop))
                 .axis_chunks_iter_mut(Axis(0), 2)
                 .zip(entries.chunks_exact_mut(2))
                 .zip(it.into_iter())
@@ -635,19 +636,25 @@ impl GPUBackend {
         }
     }
 
-    pub fn run_parallel_tempering_sweep(&mut self, offset: bool) -> Result<(), String> {
-        let base_energies = self.get_energy()?;
-        self.swap_replica_potentials(offset, repeat(true));
-        let modified_energies = self.get_energy()?;
-        self.swap_replica_potentials(offset, repeat(true));
+    pub fn run_parallel_tempering_sweep(
+        &mut self,
+        offset: bool,
+        skip_last: Option<usize>,
+    ) -> Result<(), String> {
+        let start = if offset { 1 } else { 0 };
+        let stop = self.num_replicas - skip_last.unwrap_or_default();
+
+        let base_energies = self.get_energy(skip_last)?;
+        self.swap_replica_potentials(start, stop, repeat(true));
+        let modified_energies = self.get_energy(skip_last)?;
+        self.swap_replica_potentials(start, stop, repeat(true));
         // Should now be back to where we were before.
-        debug_assert_eq!(base_energies, self.get_energy()?);
+        debug_assert_eq!(base_energies, self.get_energy(skip_last)?);
 
         let mut rng = self.rng.take().unwrap();
         let mut tempering_debug = self.tempering_debug.take().unwrap();
-        let i_offset = if offset { 1 } else { 0 };
-        let bases = &base_energies.as_slice().unwrap()[i_offset..];
-        let modifieds = &modified_energies.as_slice().unwrap()[i_offset..];
+        let bases = &base_energies.as_slice().unwrap()[start..stop];
+        let modifieds = &modified_energies.as_slice().unwrap()[start..stop];
 
         let swap_choices = modifieds
             .chunks_exact(2)
@@ -661,12 +668,12 @@ impl GPUBackend {
             .enumerate()
             .map(|(i, b)| {
                 // Log the bools
-                let r = 2 * i + i_offset;
+                let r = 2 * i + start;
                 tempering_debug.add_attempt(r, b);
                 b
             });
 
-        self.swap_replica_potentials(offset, swap_choices);
+        self.swap_replica_potentials(start, stop, swap_choices);
         self.rng = Some(rng);
         self.tempering_debug = Some(tempering_debug);
         Ok(())
@@ -681,16 +688,28 @@ impl GPUBackend {
         self.state = None;
     }
 
-    pub fn get_energy_from_cpu(&mut self) -> Result<Array1<f32>, String> {
+    pub fn get_energy_from_cpu(&mut self, skip_last: Option<usize>) -> Result<Array1<f32>, String> {
         // If forced and not calculated.
-        self.calculate_state()?;
+        self.calculate_state(skip_last)?;
         // sum t, x, y, z
         let potentials = self.get_potentials();
         let state = self.get_precalculated_state().unwrap();
         let res = state
+            .slice_axis(
+                Axis(0),
+                ndarray::Slice::from(..self.num_replicas - skip_last.unwrap_or_default()),
+            )
             .axis_iter(Axis(0))
             .into_par_iter()
-            .zip(potentials.axis_iter(Axis(0)).into_par_iter())
+            .zip(
+                potentials
+                    .slice_axis(
+                        Axis(0),
+                        ndarray::Slice::from(..self.num_replicas - skip_last.unwrap_or_default()),
+                    )
+                    .axis_iter(Axis(0))
+                    .into_par_iter(),
+            )
             .map(|(s, potential)| {
                 s.into_par_iter()
                     .map(|s| potential[s.unsigned_abs() as usize])
@@ -701,12 +720,13 @@ impl GPUBackend {
         Ok(res)
     }
 
-    pub fn get_energy_from_gpu(&mut self) -> Result<Array1<f32>, String> {
+    pub fn get_energy_from_gpu(&mut self, skip_last: Option<usize>) -> Result<Array1<f32>, String> {
         let (t, x, y, z, p) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z, 6);
         let buff_size = t * x * y * z * p / INIT_REDUX;
         let mut threads_per_replica = buff_size;
 
-        self.write_arguments(None);
+        let num_replicas = self.num_replicas - skip_last.unwrap_or_default();
+        self.write_arguments(None, Some(num_replicas));
 
         // get command encoder
         let mut command_encoder = self
@@ -722,7 +742,7 @@ impl GPUBackend {
             cpass.set_pipeline(&self.sum_energy_planes.init_sum_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 
-            let nneeded = self.num_replicas * threads_per_replica;
+            let nneeded = num_replicas * threads_per_replica;
             let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
 
             cpass.dispatch_workgroups(ndispatch, 1, 1);
@@ -733,7 +753,7 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
 
         while threads_per_replica > 1 {
-            self.write_arguments(Some(threads_per_replica as u32));
+            self.write_arguments(Some(threads_per_replica as u32), Some(num_replicas));
 
             // get command encoder
             let mut command_encoder = self
@@ -749,7 +769,7 @@ impl GPUBackend {
                 cpass.set_bind_group(0, &self.bindgroup, &[]);
 
                 threads_per_replica = threads_per_replica / 2 + threads_per_replica % 2;
-                let nneeded = self.num_replicas * threads_per_replica;
+                let nneeded = num_replicas * threads_per_replica;
                 let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
                 cpass.dispatch_workgroups(ndispatch, 1, 1);
             }
@@ -757,15 +777,17 @@ impl GPUBackend {
 
             self.queue.submit(Some(command_encoder.finish()));
         }
-        self.read_energy_from_gpu(None)
+        self.read_energy_from_gpu(Some(num_replicas))
     }
 
     /// Get the energy of each replica, allow forcing from stored state, or not.
-    pub fn get_energy(&mut self) -> Result<Array1<f32>, String> {
+    pub fn get_energy(&mut self, skip_last: Option<usize>) -> Result<Array1<f32>, String> {
         match self.energy_option {
-            EnergyOption::Gpu => self.get_energy_from_gpu(),
-            EnergyOption::CpuIfPresent if self.state.is_none() => self.get_energy_from_gpu(),
-            _ => self.get_energy_from_cpu(),
+            EnergyOption::Gpu => self.get_energy_from_gpu(skip_last),
+            EnergyOption::CpuIfPresent if self.state.is_none() => {
+                self.get_energy_from_gpu(skip_last)
+            }
+            _ => self.get_energy_from_cpu(skip_last),
         }
     }
 
@@ -776,17 +798,20 @@ impl GPUBackend {
         self.energy_option = method;
     }
 
-    pub fn get_winding_nums(&mut self) -> Result<Array2<i32>, String> {
+    pub fn get_winding_nums(&mut self, skip_last: Option<usize>) -> Result<Array2<i32>, String> {
         match self.winding_nums_option {
-            WindingNumsOption::Gpu => self.get_winding_nums_gpu(),
-            WindingNumsOption::Cpu => self.get_winding_nums_cpu(),
-            WindingNumsOption::OldCpu => self.get_winding_nums_cpu_old(),
+            WindingNumsOption::Gpu => self.get_winding_nums_gpu(skip_last),
+            WindingNumsOption::Cpu => self.get_winding_nums_cpu(skip_last),
+            WindingNumsOption::OldCpu => self.get_winding_nums_cpu_old(skip_last),
         }
     }
 
-    pub fn get_winding_nums_cpu_old(&mut self) -> Result<Array2<i32>, String> {
+    pub fn get_winding_nums_cpu_old(
+        &mut self,
+        skip_last: Option<usize>,
+    ) -> Result<Array2<i32>, String> {
         let mut sum = self
-            .get_state()?
+            .get_state(skip_last)?
             .sum_axis(Axis(1))
             .sum_axis(Axis(1))
             .sum_axis(Axis(1))
@@ -808,9 +833,13 @@ impl GPUBackend {
         Ok(sum)
     }
 
-    pub fn get_winding_nums_cpu(&mut self) -> Result<Array2<i32>, String> {
-        let mut res = Array2::zeros((self.num_replicas, 6));
-        let state = self.get_state()?;
+    pub fn get_winding_nums_cpu(
+        &mut self,
+        skip_last: Option<usize>,
+    ) -> Result<Array2<i32>, String> {
+        let num_replicas = self.num_replicas - skip_last.unwrap_or_default();
+        let mut res = Array2::zeros((num_replicas, 6));
+        let state = self.get_state(skip_last)?;
         ndarray::Zip::indexed(&mut res)
             .into_par_iter()
             .for_each(|((rep, p), res)| {
@@ -829,11 +858,15 @@ impl GPUBackend {
         Ok(res)
     }
 
-    pub fn get_winding_nums_gpu(&mut self) -> Result<Array2<i32>, String> {
+    pub fn get_winding_nums_gpu(
+        &mut self,
+        skip_last: Option<usize>,
+    ) -> Result<Array2<i32>, String> {
         let p = 6;
         let threads_per_replica = p;
+        let num_replicas = self.num_replicas - skip_last.unwrap_or_default();
 
-        self.write_arguments(None);
+        self.write_arguments(None, Some(num_replicas));
 
         // get command encoder
         let mut command_encoder = self
@@ -849,7 +882,7 @@ impl GPUBackend {
             cpass.set_pipeline(&self.sum_winding_planes.winding_sum_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 
-            let nneeded = self.num_replicas * threads_per_replica;
+            let nneeded = num_replicas * threads_per_replica;
             let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
 
             cpass.dispatch_workgroups(ndispatch, 1, 1);
@@ -860,14 +893,14 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
 
         let raw_windings = self
-            .read_sumbuffer_from_gpu(p * self.num_replicas)
+            .read_sumbuffer_from_gpu(p * num_replicas)
             .into_iter()
             .map(|f| f as i32)
             .collect::<Array1<i32>>()
-            .into_shape((self.num_replicas, p))
+            .into_shape((num_replicas, p))
             .map_err(|se| se.to_string())?;
         // Now reorder by parallel temperings.
-        let mut result = Array2::zeros((self.num_replicas, p));
+        let mut result = Array2::zeros((num_replicas, p));
         ndarray::Zip::indexed(&mut result)
             .into_par_iter()
             .for_each(|((ir, ip), v)| {
@@ -886,7 +919,7 @@ impl GPUBackend {
         self.vn = vn;
     }
 
-    pub fn write_arguments<It>(&mut self, it: It)
+    pub fn write_arguments<It>(&mut self, it: It, num_replicas_overwrite: Option<usize>)
     where
         It: IntoIterator<Item = u32>,
     {
@@ -895,7 +928,7 @@ impl GPUBackend {
             self.shape.x as u32,
             self.shape.y as u32,
             self.shape.z as u32,
-            self.num_replicas as u32,
+            num_replicas_overwrite.unwrap_or(self.num_replicas) as u32,
         ]
         .into_iter()
         // Put in all the vn offsets.
@@ -975,10 +1008,17 @@ impl GPUBackend {
         Ok(result)
     }
 
-    pub fn calculate_state(&mut self) -> Result<(), String> {
-        if self.state.is_none() {
+    pub fn calculate_state(&mut self, skip_last: Option<usize>) -> Result<(), String> {
+        let num_replicas = self.num_replicas - skip_last.unwrap_or_default();
+        let should_run = self
+            .state
+            .as_ref()
+            .map(|(i, _)| num_replicas.ne(i))
+            .unwrap_or(true);
+
+        if should_run {
             let (t, x, y, z, p) = (self.shape.t, self.shape.x, self.shape.y, self.shape.z, 6);
-            let n_faces = self.num_replicas * t * x * y * z * p;
+            let n_faces = num_replicas * t * x * y * z * p;
             let int_size = std::mem::size_of::<i32>();
             let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -1017,7 +1057,7 @@ impl GPUBackend {
             // Gets contents of buffer
             let data = buffer_slice.get_mapped_range();
             let data_vec: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
-            let mut result = Array6::zeros((self.num_replicas, t, x, y, z, 6));
+            let mut result = Array6::zeros((num_replicas, t, x, y, z, 6));
             ndarray::Zip::indexed(&mut result).into_par_iter().for_each(
                 |((ir, it, ix, iy, iz, ip), v)| {
                     let ir = self.vn_index_to_replica_index[ir];
@@ -1032,7 +1072,7 @@ impl GPUBackend {
                     *v = data_vec[indx];
                 },
             );
-            self.state = Some(result);
+            self.state = Some((num_replicas, result));
 
             // // // With the current interface, we have to make sure all mapped views are
             // // // dropped before we unmap the buffer.
@@ -1045,16 +1085,17 @@ impl GPUBackend {
         }
     }
 
-    pub fn get_state(&mut self) -> Result<&Array6<i32>, String> {
-        self.calculate_state()?;
+    pub fn get_state(&mut self, skip_last: Option<usize>) -> Result<&Array6<i32>, String> {
+        self.calculate_state(skip_last)?;
         // Returns data from buffer
         self.state
             .as_ref()
+            .map(|(_, s)| s)
             .ok_or_else(|| "State not stored".to_string())
     }
 
     pub fn get_precalculated_state(&self) -> Option<&Array6<i32>> {
-        self.state.as_ref()
+        self.state.as_ref().map(|(_, s)| s)
     }
 
     pub fn get_edges_with_violations(
@@ -1074,7 +1115,7 @@ impl GPUBackend {
                 })
             })
         });
-        self.calculate_state()?;
+        self.calculate_state(None)?;
         let state = self.get_precalculated_state().unwrap();
         let res = edge_iterator
             .par_bridge()
@@ -1111,6 +1152,45 @@ mod gpu_tests {
     use super::*;
 
     #[test]
+    fn test_run_global_except_last() -> Result<(), String> {
+        let (r, t, x, y, z) = (6, 4, 4, 4, 4);
+        let mut vn = Array2::zeros((r, 3));
+        vn.axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(r, mut ax)| {
+                ax.iter_mut().enumerate().for_each(|(i, v)| {
+                    if i == 0 {
+                        *v = 0.0;
+                    } else {
+                        *v = 10.0;
+                    }
+                })
+            });
+        let mut graph = pollster::block_on(GPUBackend::new_async(
+            SiteIndex::new(t, x, y, z),
+            vn,
+            Some(Array6::ones((r, t, x, y, z, 6))),
+            None,
+            None,
+        ))?;
+
+        graph.run_global_sweep(Some(1));
+        let state = graph.get_state(Some(1))?;
+        state.indexed_iter().for_each(|((ir, _, _, _, _, _), v)| {
+            assert_eq!(*v, 0);
+        });
+        let state = graph.get_state(None)?;
+        state.indexed_iter().for_each(|((ir, _, _, _, _, _), v)| {
+            if ir == r - 1 {
+                assert_eq!(*v, 1);
+            } else {
+                assert_eq!(*v, 0);
+            }
+        });
+        Ok(())
+    }
+
+    #[test]
     fn test_global_respect_replica_potential() -> Result<(), String> {
         let (r, t, x, y, z) = (4, 4, 4, 4, 4);
         let mut vn = Array2::zeros((r, 3));
@@ -1124,12 +1204,18 @@ mod gpu_tests {
                     }
                 })
             });
-        let mut graph =
-            pollster::block_on(GPUBackend::new_async(t, x, y, z, vn, None, None, None))?;
+        let mut graph = pollster::block_on(GPUBackend::new_async(
+            SiteIndex::new(t, x, y, z),
+            vn,
+            None,
+            None,
+            None,
+        ))?;
 
-        graph.run_global_sweep();
+        graph.run_global_sweep(None);
 
-        let state = graph.get_state()?;
+        let state = graph.get_state(None)?;
+        println!("{:?}", state);
 
         state.indexed_iter().for_each(|((r, _, _, _, _, _), v)| {
             if r % 2 == 0 {
@@ -1139,9 +1225,9 @@ mod gpu_tests {
             }
         });
 
-        graph.run_global_sweep();
+        graph.run_global_sweep(None);
 
-        let state = graph.get_state()?;
+        let state = graph.get_state(None)?;
 
         state.indexed_iter().for_each(|((r, _, _, _, _, _), v)| {
             if r % 2 == 0 {
@@ -1175,10 +1261,7 @@ mod gpu_tests {
                 *v = r as i32;
             });
         pollster::block_on(GPUBackend::new_async(
-            t,
-            x,
-            t,
-            z,
+            SiteIndex::new(t, x, y, z),
             vn,
             Some(state),
             None,
@@ -1190,12 +1273,12 @@ mod gpu_tests {
     fn test_winding_num_calc() -> Result<(), String> {
         let mut s = make_replica_value_state(3, 4, 4, 4, 4)?;
         for i in 0..100 {
-            s.run_global_sweep();
-            s.swap_replica_potentials(i % 2 == 0, repeat(true));
-            s.swap_replica_potentials(i % 2 == 1, repeat(true));
-            let cpu_w = s.get_winding_nums_cpu()?;
-            let gpu_w = s.get_winding_nums_gpu()?;
-            let old_w = s.get_winding_nums_cpu_old()?;
+            s.run_global_sweep(None);
+            s.swap_replica_potentials(i % 2, 3, repeat(true));
+            s.swap_replica_potentials(i % 2, 3, repeat(true));
+            let cpu_w = s.get_winding_nums_cpu(None)?;
+            let gpu_w = s.get_winding_nums_gpu(None)?;
+            let old_w = s.get_winding_nums_cpu_old(None)?;
             assert_eq!(cpu_w, gpu_w);
             assert_eq!(cpu_w, old_w);
         }
@@ -1206,13 +1289,13 @@ mod gpu_tests {
     #[test]
     fn test_energy_calc() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let energies = s.get_energy_from_gpu()?;
-        s.swap_replica_potentials(false, repeat(true));
-        let swapped_state = s.get_energy_from_gpu()?;
+        let energies = s.get_energy_from_gpu(None)?;
+        s.swap_replica_potentials(0, 4, repeat(true));
+        let swapped_state = s.get_energy_from_gpu(None)?;
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.swap_replica_potentials(false, repeat(true));
-        let calced_swapped_state = s.get_energy_from_gpu()?;
+        s.swap_replica_potentials(0, 4, repeat(true));
+        let calced_swapped_state = s.get_energy_from_gpu(None)?;
 
         let n_faces = 4 * 4 * 4 * 4 * 6;
         let energies_slice = energies
@@ -1250,13 +1333,13 @@ mod gpu_tests {
     #[test]
     fn test_energy_calc_cpu() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let energies = s.get_energy_from_cpu()?;
-        s.swap_replica_potentials(false, repeat(true));
-        let swapped_state = s.get_energy_from_cpu()?;
+        let energies = s.get_energy_from_cpu(None)?;
+        s.swap_replica_potentials(0, 4, repeat(true));
+        let swapped_state = s.get_energy_from_cpu(None)?;
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.swap_replica_potentials(false, repeat(true));
-        let calced_swapped_state = s.get_energy_from_cpu()?;
+        s.swap_replica_potentials(0, 4, repeat(true));
+        let calced_swapped_state = s.get_energy_from_cpu(None)?;
 
         let n_faces = 4 * 4 * 4 * 4 * 6;
         let energies_slice = energies
@@ -1294,15 +1377,15 @@ mod gpu_tests {
     #[test]
     fn test_swap_states() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let basic_state = s.get_state()?.clone();
+        let basic_state = s.get_state(None)?.clone();
         s.clear_stored_state();
-        s.swap_replica_potentials(false, repeat(true));
-        let cleared_swapped_state = s.get_state()?.clone();
+        s.swap_replica_potentials(0, 4, repeat(true));
+        let cleared_swapped_state = s.get_state(None)?.clone();
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.calculate_state()?;
-        s.swap_replica_potentials(false, repeat(true));
-        let calced_swapped_state = s.get_state()?.clone();
+        s.calculate_state(None)?;
+        s.swap_replica_potentials(0, 4, repeat(true));
+        let calced_swapped_state = s.get_state(None)?.clone();
 
         let rubrick = [0, 1, 2, 3];
         basic_state
@@ -1327,15 +1410,15 @@ mod gpu_tests {
     #[test]
     fn test_offset_swap_states() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let basic_state = s.get_state()?.clone();
+        let basic_state = s.get_state(None)?.clone();
         s.clear_stored_state();
-        s.swap_replica_potentials(true, repeat(true));
-        let cleared_swapped_state = s.get_state()?.clone();
+        s.swap_replica_potentials(1, 4, repeat(true));
+        let cleared_swapped_state = s.get_state(None)?.clone();
 
         let mut s = make_replica_value_state(3, 4, 4, 4, 4)?;
-        s.calculate_state()?;
-        s.swap_replica_potentials(true, repeat(true));
-        let calced_swapped_state = s.get_state()?.clone();
+        s.calculate_state(None)?;
+        s.swap_replica_potentials(1, 3, repeat(true));
+        let calced_swapped_state = s.get_state(None)?.clone();
 
         let rubrick = [0, 1, 2, 3];
         basic_state
@@ -1360,15 +1443,15 @@ mod gpu_tests {
     #[test]
     fn test_swap_states_some() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let basic_state = s.get_state()?.clone();
+        let basic_state = s.get_state(None)?.clone();
         s.clear_stored_state();
-        s.swap_replica_potentials(false, [true, false]);
-        let cleared_swapped_state = s.get_state()?.clone();
+        s.swap_replica_potentials(0, 4, [true, false]);
+        let cleared_swapped_state = s.get_state(None)?.clone();
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.calculate_state()?;
-        s.swap_replica_potentials(false, [true, false]);
-        let calced_swapped_state = s.get_state()?.clone();
+        s.calculate_state(None)?;
+        s.swap_replica_potentials(0, 4, [true, false]);
+        let calced_swapped_state = s.get_state(None)?.clone();
 
         let rubrick = [0, 1, 2, 3];
         basic_state
@@ -1389,15 +1472,15 @@ mod gpu_tests {
             });
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let basic_state = s.get_state()?.clone();
+        let basic_state = s.get_state(None)?.clone();
         s.clear_stored_state();
-        s.swap_replica_potentials(false, [false, true]);
-        let cleared_swapped_state = s.get_state()?.clone();
+        s.swap_replica_potentials(0, 4, [false, true]);
+        let cleared_swapped_state = s.get_state(None)?.clone();
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.calculate_state()?;
-        s.swap_replica_potentials(false, [false, true]);
-        let calced_swapped_state = s.get_state()?.clone();
+        s.calculate_state(None)?;
+        s.swap_replica_potentials(0, 4, [false, true]);
+        let calced_swapped_state = s.get_state(None)?.clone();
 
         let rubrick = [0, 1, 2, 3];
         basic_state
@@ -1422,15 +1505,15 @@ mod gpu_tests {
     #[test]
     fn test_offset_swap_states_some() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let basic_state = s.get_state()?.clone();
+        let basic_state = s.get_state(None)?.clone();
         s.clear_stored_state();
-        s.swap_replica_potentials(true, [true]);
-        let cleared_swapped_state = s.get_state()?.clone();
+        s.swap_replica_potentials(1, 4, [true]);
+        let cleared_swapped_state = s.get_state(None)?.clone();
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.calculate_state()?;
-        s.swap_replica_potentials(true, [true]);
-        let calced_swapped_state = s.get_state()?.clone();
+        s.calculate_state(None)?;
+        s.swap_replica_potentials(1, 4, [true]);
+        let calced_swapped_state = s.get_state(None)?.clone();
 
         let rubrick = [0, 1, 2, 3];
         basic_state
@@ -1451,15 +1534,15 @@ mod gpu_tests {
             });
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let basic_state = s.get_state()?.clone();
+        let basic_state = s.get_state(None)?.clone();
         s.clear_stored_state();
-        s.swap_replica_potentials(false, [false]);
-        let cleared_swapped_state = s.get_state()?.clone();
+        s.swap_replica_potentials(0, 4, [false]);
+        let cleared_swapped_state = s.get_state(None)?.clone();
 
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.calculate_state()?;
-        s.swap_replica_potentials(false, [false]);
-        let calced_swapped_state = s.get_state()?.clone();
+        s.calculate_state(None)?;
+        s.swap_replica_potentials(0, 4, [false]);
+        let calced_swapped_state = s.get_state(None)?.clone();
 
         let rubrick = [0, 1, 2, 3];
         basic_state
@@ -1485,17 +1568,17 @@ mod gpu_tests {
         // Make a state where np is higher for larger potentials,
         // energetically preferable to swap back.
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        let energies = s.get_energy()?;
-        s.swap_replica_potentials(false, repeat(true));
-        let swapped_energy = s.get_energy()?;
-        let swap_state = s.get_state()?;
+        let energies = s.get_energy(None)?;
+        s.swap_replica_potentials(0, 4, repeat(true));
+        let swapped_energy = s.get_energy(None)?;
+        let swap_state = s.get_state(None)?;
 
         // Reinit, and check if it swaps.
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
-        s.run_parallel_tempering_sweep(false)?;
+        s.run_parallel_tempering_sweep(false, None)?;
 
-        assert_eq!(swapped_energy, s.get_energy()?);
-        assert_eq!(swap_state, s.get_state()?);
+        assert_eq!(swapped_energy, s.get_energy(None)?);
+        assert_eq!(swap_state, s.get_state(None)?);
 
         Ok(())
     }
