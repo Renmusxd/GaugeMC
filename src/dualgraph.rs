@@ -20,6 +20,14 @@ impl SiteIndex {
         Self { t, x, y, z }
     }
 
+    pub fn volume(&self) -> usize {
+        self.t * self.x * self.y * self.z
+    }
+
+    pub fn shape(&self) -> [usize; 4] {
+        [self.t, self.x, self.y, self.z]
+    }
+
     pub fn get(&self, dim: Dimension) -> usize {
         match dim {
             Dimension::T => self.t,

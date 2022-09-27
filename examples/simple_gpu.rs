@@ -1,3 +1,4 @@
+use env_logger;
 use gaugemc::{NDDualGraph, SiteIndex};
 use ndarray::{Array2, Array6, Axis};
 use std::iter::repeat;
@@ -38,6 +39,7 @@ fn main() -> Result<(), String> {
         }
         state.run_global_sweep(None);
         state.run_pcg_rotate();
+        state.get_edges_with_violations()?;
     }
 
     // TODO

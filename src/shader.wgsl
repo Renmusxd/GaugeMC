@@ -86,6 +86,7 @@ fn prng(index: u32) -> f32 {
     return f32(pcgstate.state[index]) / f32(0xffffffffu);
 }
 
+
 @compute
 @workgroup_size(256,1,1)
 fn rotate_pcg(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -253,6 +254,7 @@ fn incremental_sum_energy(@builtin(global_invocation_id) global_id: vec3<u32>) {
     sumbuffer.buff[fold_index] = 0.0;
 }
 
+
 @compute
 @workgroup_size(256,1,1)
 fn main_global(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -389,6 +391,7 @@ fn main_global(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 }
+
 
 @compute
 @workgroup_size(256,1,1)
@@ -538,4 +541,57 @@ fn main_local(@builtin(global_invocation_id) global_id: vec3<u32>) {
         state.state[replica_base_offset + pos_index] = pos_np + choice;
         state.state[replica_base_offset + neg_index] = neg_np - choice;
     }
+}
+
+
+@compute
+@workgroup_size(256,1,1)
+fn copy_replica(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    var index = global_id.x;
+
+    // Get the bounds.
+    let t = dim_indices.data[0];
+    let x = dim_indices.data[1];
+    let y = dim_indices.data[2];
+    let z = dim_indices.data[3];
+    let p = 6u;
+    let num_replicas = dim_indices.data[4];
+
+    // Each thread responsible for 6 ps
+    if (global_id.x >= t*x*y*z) {
+        return;
+    }
+
+    // Skip 5 through 5+num_replicas
+    let from_r = dim_indices.data[5u + num_replicas + 0u];
+    let to_r = dim_indices.data[5u + num_replicas + 1u];
+    let flip_values = dim_indices.data[5u + num_replicas + 2u];
+    let swap = select(-1, 1, (flip_values & 1u) == 0u);
+
+    let r_off = t*x*y*z*p;
+    let t_off = x*y*z*p;
+    let x_off = y*z*p;
+    let y_off = z*p;
+    let z_off = p;
+
+    let t = index / (x*y*z);
+    let index = index % (x*y*z);
+    let x = index / (y*z);
+    let index = index % (y*z);
+    let y = index / z;
+    let index = index % z;
+    let z = index;
+
+    let to_off = to_r*r_off;
+    let from_off = from_r*r_off;
+    let pos_index = t*t_off + x*x_off + y*y_off + z*z_off;
+    let to_index = to_off + pos_index;
+    let from_index = from_off + pos_index;
+
+    state.state[to_index + 0u] = swap * state.state[from_index + 0u];
+    state.state[to_index + 1u] = swap * state.state[from_index + 1u];
+    state.state[to_index + 2u] = swap * state.state[from_index + 2u];
+    state.state[to_index + 3u] = swap * state.state[from_index + 3u];
+    state.state[to_index + 4u] = swap * state.state[from_index + 4u];
+    state.state[to_index + 5u] = swap * state.state[from_index + 5u];
 }

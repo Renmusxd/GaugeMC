@@ -1,7 +1,8 @@
 use crate::{Dimension, NDDualGraph, SiteIndex};
 use bytemuck;
 use log::{info, warn};
-use ndarray::{s, Array1, Array2, Array6, Axis};
+use ndarray::parallel::prelude::*;
+use ndarray::{s, Array1, Array2, Array6, ArrayView5, Axis};
 use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -44,6 +45,7 @@ pub struct GPUBackend {
     pcgupdate: PCGRotatePipeline,
     sum_energy_planes: SumEnergyPipeline,
     sum_winding_planes: WindingPipeline,
+    copy_state_pipeline: CopyPipeline,
     bindgroup: wgpu::BindGroup,
     // Debugging information
     tempering_debug: Option<ParallelTemperingDebug>,
@@ -87,6 +89,11 @@ impl ParallelTemperingDebug {
             self.swap_successes[lower_replica] += 1;
         }
     }
+
+    fn clear(&mut self) {
+        self.swap_attempts.iter_mut().for_each(|x| *x = 0);
+        self.swap_successes.iter_mut().for_each(|x| *x = 0);
+    }
 }
 
 struct LocalUpdatePipeline {
@@ -106,6 +113,9 @@ struct SumEnergyPipeline {
 }
 struct WindingPipeline {
     winding_sum_pipeline: wgpu::ComputePipeline,
+}
+struct CopyPipeline {
+    copy_state_pipeline: wgpu::ComputePipeline,
 }
 
 const WORKGROUP: usize = 256;
@@ -329,6 +339,13 @@ impl GPUBackend {
                 module: &compute_shader,
                 entry_point: "calculate_winding_numbers",
             });
+        let copy_state_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("copy state pipeline"),
+                layout: Some(&compute_pipeline_layout),
+                module: &compute_shader,
+                entry_point: "copy_replica",
+            });
 
         let initial_state = if let Some(initial_state) = initial_state {
             initial_state
@@ -343,7 +360,9 @@ impl GPUBackend {
                     .as_slice()
                     .expect("Initial state not contiguous in memory!"),
             ),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
         });
         let vn_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vn Buffer"),
@@ -435,6 +454,9 @@ impl GPUBackend {
             },
             sum_winding_planes: WindingPipeline {
                 winding_sum_pipeline,
+            },
+            copy_state_pipeline: CopyPipeline {
+                copy_state_pipeline,
             },
             tempering_debug: Some(ParallelTemperingDebug::new(num_replicas)),
             winding_nums_option: WindingNumsOption::Gpu,
@@ -697,22 +719,20 @@ impl GPUBackend {
         // sum t, x, y, z
         let potentials = self.get_potentials();
         let state = self.get_precalculated_state().unwrap();
-        let res = state
-            .slice_axis(
-                Axis(0),
-                ndarray::Slice::from(..self.num_replicas - skip_last.unwrap_or_default()),
-            )
+
+        let state_subslice = state.slice_axis(
+            Axis(0),
+            ndarray::Slice::from(..self.num_replicas - skip_last.unwrap_or_default()),
+        );
+        let potential_subslice = potentials.slice_axis(
+            Axis(0),
+            ndarray::Slice::from(..self.num_replicas - skip_last.unwrap_or_default()),
+        );
+
+        let res = state_subslice
             .axis_iter(Axis(0))
             .into_par_iter()
-            .zip(
-                potentials
-                    .slice_axis(
-                        Axis(0),
-                        ndarray::Slice::from(..self.num_replicas - skip_last.unwrap_or_default()),
-                    )
-                    .axis_iter(Axis(0))
-                    .into_par_iter(),
-            )
+            .zip(potential_subslice.axis_iter(Axis(0)).into_par_iter())
             .map(|(s, potential)| {
                 s.into_par_iter()
                     .map(|s| potential[s.unsigned_abs() as usize])
@@ -922,6 +942,35 @@ impl GPUBackend {
         self.vn = vn;
     }
 
+    pub fn write_state(&mut self, replica: usize, state: ArrayView5<i32>) -> Result<(), String> {
+        let own_shape = self.shape.shape();
+        let own_shape = own_shape.into_iter().chain([6]).collect::<Vec<_>>();
+        if own_shape != state.shape() {
+            return Err(format!(
+                "Given state had shape {:?} but expected {:?}",
+                state.shape(),
+                own_shape.as_slice()
+            ));
+        }
+
+        let volume = self.shape.volume() * 6;
+        let offset = (std::mem::size_of::<u32>() * replica * volume) as u64;
+        let state = state.as_slice().ok_or("state not contiguous")?;
+        self.queue
+            .write_buffer(&self.state_buffer, offset, bytemuck::cast_slice(state));
+        if let Some((_, old_state)) = self.state.as_mut() {
+            if replica < old_state.shape()[0] {
+                old_state
+                    .index_axis_mut(Axis(0), replica)
+                    .iter_mut()
+                    .zip(state.iter().copied())
+                    .for_each(|(v, x)| *v = x)
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn write_arguments<It>(&mut self, it: It, num_replicas_overwrite: Option<usize>)
     where
         It: IntoIterator<Item = u32>,
@@ -944,12 +993,33 @@ impl GPUBackend {
         .collect::<Vec<u32>>();
 
         if Some(&vals) != self.written_arguments.as_ref() {
-            self.queue.write_buffer(
-                &self.localupdate.index_buffer,
-                0_u64,
-                bytemuck::cast_slice(vals.as_slice()),
-            );
-            self.written_arguments = Some(vals);
+            if let Some(old_vals) = self.written_arguments.as_ref() {
+                let first_diff = vals
+                    .iter()
+                    .zip(old_vals.iter())
+                    .enumerate()
+                    .find(|(_, (a, b))| a.ne(b))
+                    .map(|(i, _)| i)
+                    .unwrap_or(old_vals.len());
+                if first_diff < vals.len() {
+                    let offset = (std::mem::size_of::<u32>() * first_diff) as u64;
+                    self.queue.write_buffer(
+                        &self.localupdate.index_buffer,
+                        offset,
+                        bytemuck::cast_slice(&vals[first_diff..]),
+                    );
+                    self.written_arguments = Some(vals);
+                }
+                // If the difference comes after the end of vals (vals is a subsequence of old_vals)
+                // then no need to write.
+            } else {
+                self.queue.write_buffer(
+                    &self.localupdate.index_buffer,
+                    0_u64,
+                    bytemuck::cast_slice(vals.as_slice()),
+                );
+                self.written_arguments = Some(vals);
+            }
         }
     }
 
@@ -1002,7 +1072,7 @@ impl GPUBackend {
     ) -> Result<Array1<f32>, String> {
         let read_num_values = read_num_values.unwrap_or(self.num_replicas);
         let data_vec = self.read_sumbuffer_from_gpu(read_num_values);
-        let mut result = Array1::zeros((self.num_replicas,));
+        let mut result = Array1::zeros((read_num_values,));
         result.iter_mut().enumerate().for_each(|(r, v)| {
             let r_rot = self.vn_index_to_replica_index[r];
             *v = data_vec[r_rot];
@@ -1013,6 +1083,36 @@ impl GPUBackend {
         // drop(data);
         // buf.unmap(); // Unmaps buffer from memory
         Ok(result)
+    }
+
+    pub fn copy_state_on_gpu(&mut self, from: usize, to: usize, swap: bool) {
+        self.state = None;
+        self.write_arguments([from as u32, to as u32, if swap { 1 } else { 0 }], None);
+
+        let buff_size = self.shape.t * self.shape.x * self.shape.y * self.shape.z;
+        let nneeded = buff_size;
+
+        // get command encoder
+        let mut command_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // compute pass
+        command_encoder.push_debug_group("Copy replica.");
+
+        {
+            let mut cpass =
+                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            cpass.set_pipeline(&self.copy_state_pipeline.copy_state_pipeline);
+            cpass.set_bind_group(0, &self.bindgroup, &[]);
+
+            let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
+
+            cpass.dispatch_workgroups(ndispatch, 1, 1);
+        }
+
+        command_encoder.pop_debug_group();
+
+        self.queue.submit(Some(command_encoder.finish()));
     }
 
     pub fn calculate_state(&mut self, skip_last: Option<usize>) -> Result<(), String> {
@@ -1105,6 +1205,10 @@ impl GPUBackend {
         self.state.as_ref().map(|(_, s)| s)
     }
 
+    pub fn clear_parallel_tempering_data(&mut self) {
+        self.tempering_debug.as_mut().map(|x| x.clear());
+    }
+
     pub fn get_edges_with_violations(
         &mut self,
     ) -> Result<Vec<((usize, SiteIndex, Dimension), Vec<(SiteIndex, usize)>)>, String> {
@@ -1157,6 +1261,7 @@ impl GPUBackend {
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
+    use ndarray::{Array, Array5};
 
     #[test]
     fn test_run_global_except_last() -> Result<(), String> {
@@ -1164,7 +1269,7 @@ mod gpu_tests {
         let mut vn = Array2::zeros((r, 3));
         vn.axis_iter_mut(Axis(0))
             .enumerate()
-            .for_each(|(r, mut ax)| {
+            .for_each(|(_r, mut ax)| {
                 ax.iter_mut().enumerate().for_each(|(i, v)| {
                     if i == 0 {
                         *v = 0.0;
@@ -1183,7 +1288,7 @@ mod gpu_tests {
 
         graph.run_global_sweep(Some(1));
         let state = graph.get_state(Some(1))?;
-        state.indexed_iter().for_each(|((ir, _, _, _, _, _), v)| {
+        state.indexed_iter().for_each(|((_ir, _, _, _, _, _), v)| {
             assert_eq!(*v, 0);
         });
         let state = graph.get_state(None)?;
@@ -1586,6 +1691,115 @@ mod gpu_tests {
 
         assert_eq!(swapped_energy, s.get_energy(None)?);
         assert_eq!(swap_state, s.get_state(None)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_copy_replica() -> Result<(), String> {
+        let (r, t, x, y, z) = (3, 2, 2, 2, 2);
+        let vn = Array2::zeros((r, 3));
+        let mut init_state = Array::zeros((r, t, x, y, z, 6));
+        init_state.iter_mut().enumerate().for_each(|(i, x)| {
+            *x = i as i32;
+        });
+
+        let mut graph = pollster::block_on(GPUBackend::new_async(
+            SiteIndex::new(t, x, y, z),
+            vn,
+            Some(init_state),
+            None,
+            None,
+        ))?;
+
+        let state = graph.get_state(None)?;
+        assert_ne!(state.index_axis(Axis(0), 0), state.index_axis(Axis(0), 1));
+        assert_ne!(state.index_axis(Axis(0), 0), state.index_axis(Axis(0), 2));
+        assert_ne!(state.index_axis(Axis(0), 1), state.index_axis(Axis(0), 2));
+        graph.copy_state_on_gpu(0, 2, false);
+        let state = graph.get_state(None)?;
+        assert_ne!(state.index_axis(Axis(0), 0), state.index_axis(Axis(0), 1));
+        assert_eq!(state.index_axis(Axis(0), 0), state.index_axis(Axis(0), 2));
+        assert_ne!(state.index_axis(Axis(0), 1), state.index_axis(Axis(0), 2));
+        graph.copy_state_on_gpu(0, 1, false);
+        let state = graph.get_state(None)?;
+        assert_eq!(state.index_axis(Axis(0), 0), state.index_axis(Axis(0), 1));
+        assert_eq!(state.index_axis(Axis(0), 0), state.index_axis(Axis(0), 2));
+        assert_eq!(state.index_axis(Axis(0), 1), state.index_axis(Axis(0), 2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_skip_tempering() -> Result<(), String> {
+        let (r, t, x, y, z) = (16, 4, 4, 4, 4);
+        let vn = Array2::zeros((r, 32));
+        let mut init_state = Array::zeros((r, t, x, y, z, 6));
+        ndarray::Zip::indexed(&mut init_state).for_each(|i, x| {
+            *x = i.0 as i32;
+        });
+
+        let mut graph = pollster::block_on(GPUBackend::new_async(
+            SiteIndex::new(t, x, y, z),
+            vn,
+            Some(init_state),
+            None,
+            None,
+        ))?;
+
+        let skip_last = 3;
+        for i in 0..10 {
+            graph.clear_stored_state();
+            graph.run_parallel_tempering_sweep(i % 2 == 0, Some(skip_last))?;
+        }
+        let state = graph.get_state(None)?;
+        ndarray::Zip::indexed(state).for_each(|(ir, _, _, _, _, _), val| {
+            if ir >= r - skip_last {
+                assert_eq!(*val, ir as i32);
+            }
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_state() -> Result<(), String> {
+        let (r, t, x, y, z) = (6, 2, 2, 2, 2);
+        let vn = Array2::zeros((r, 3));
+        let mut init_state = Array::zeros((r, t, x, y, z, 6));
+        init_state.iter_mut().enumerate().for_each(|(i, x)| {
+            *x = i as i32;
+        });
+
+        let mut graph = pollster::block_on(GPUBackend::new_async(
+            SiteIndex::new(t, x, y, z),
+            vn,
+            Some(init_state),
+            None,
+            None,
+        ))?;
+
+        let mut set_to = Array5::zeros((t, x, y, z, 6));
+        for ir in 0..r {
+            set_to.iter_mut().for_each(|x| *x = ir as i32);
+            graph.write_state(ir, set_to.view())?;
+        }
+        graph.clear_stored_state();
+
+        let gpu_state = graph.get_state(None)?;
+        ndarray::Zip::indexed(gpu_state).for_each(|(r, _, _, _, _, _), v| {
+            assert_eq!(*v, r as i32);
+        });
+        graph.clear_stored_state();
+
+        for ir in (0..r).rev() {
+            set_to.iter_mut().for_each(|x| *x = ir as i32);
+            graph.write_state(ir, set_to.view())?;
+        }
+        graph.clear_stored_state();
+
+        let gpu_state = graph.get_state(None)?;
+        ndarray::Zip::indexed(gpu_state).for_each(|(r, _, _, _, _, _), v| {
+            assert_eq!(*v, r as i32);
+        });
 
         Ok(())
     }
