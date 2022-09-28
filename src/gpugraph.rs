@@ -1,6 +1,6 @@
 use crate::{Dimension, NDDualGraph, SiteIndex};
 use bytemuck;
-use log::{debug, info, trace, warn};
+use log::{info, warn};
 use ndarray::parallel::prelude::*;
 use ndarray::{s, Array1, Array2, Array6, ArrayView5, Axis};
 use ndarray_rand::rand::rngs::SmallRng;
@@ -1301,7 +1301,9 @@ impl GPUBackend {
     }
 
     pub fn clear_parallel_tempering_data(&mut self) {
-        self.tempering_debug.as_mut().map(|x| x.clear());
+        if let Some(x) = self.tempering_debug.as_mut() {
+            x.clear()
+        }
     }
 
     pub fn get_edges_with_violations(

@@ -22,9 +22,9 @@ impl From<(usize, usize, usize, usize)> for SiteIndex {
     }
 }
 
-impl Into<(usize, usize, usize, usize)> for SiteIndex {
-    fn into(self) -> (usize, usize, usize, usize) {
-        (self.t, self.x, self.y, self.z)
+impl From<SiteIndex> for (usize, usize, usize, usize) {
+    fn from(s: SiteIndex) -> Self {
+        (s.t, s.x, s.y, s.z)
     }
 }
 
