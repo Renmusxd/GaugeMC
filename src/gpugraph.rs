@@ -1,6 +1,6 @@
 use crate::{Dimension, NDDualGraph, SiteIndex};
 use bytemuck;
-use log::{info, warn};
+use log::{debug, info, trace, warn};
 use ndarray::parallel::prelude::*;
 use ndarray::{s, Array1, Array2, Array6, ArrayView5, Axis};
 use ndarray_rand::rand::rngs::SmallRng;
@@ -52,6 +52,7 @@ pub struct GPUBackend {
     winding_nums_option: WindingNumsOption,
     energy_option: EnergyOption,
 
+    optimize_writing_args: Option<bool>,
     written_arguments: Option<Vec<u32>>,
     heatbath: Option<bool>,
 }
@@ -375,7 +376,9 @@ impl GPUBackend {
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
             contents: bytemuck::cast_slice(&vec![0_u32; index_buffer_entries]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
         });
         let mut rng = if let Some(seed) = seed {
             SmallRng::seed_from_u64(seed)
@@ -462,6 +465,7 @@ impl GPUBackend {
             tempering_debug: Some(ParallelTemperingDebug::new(num_replicas)),
             winding_nums_option: WindingNumsOption::Gpu,
             energy_option: EnergyOption::CpuIfPresent,
+            optimize_writing_args: None,
             written_arguments: None,
             heatbath: None,
         })
@@ -469,6 +473,10 @@ impl GPUBackend {
 
     pub fn set_heatbath(&mut self, use_heatbath: Option<bool>) {
         self.heatbath = use_heatbath;
+    }
+
+    pub fn set_optimize_args(&mut self, use_optimized_args: Option<bool>) {
+        self.optimize_writing_args = use_optimized_args;
     }
 
     pub fn get_bounds(&self) -> SiteIndex {
@@ -501,6 +509,7 @@ impl GPUBackend {
             0_u64,
             bytemuck::cast_slice(&[self.num_pcgs as u32, if offset { 1 } else { 0 }]),
         );
+        self.written_arguments = None;
 
         // get command encoder
         let mut command_encoder = self
@@ -563,6 +572,7 @@ impl GPUBackend {
         command_encoder.pop_debug_group();
 
         self.queue.submit(Some(command_encoder.finish()));
+        debug_assert_eq!(self.get_edges_with_violations(), Ok(vec![]));
     }
 
     pub fn run_global_sweep(&mut self, skip_last: Option<usize>) {
@@ -594,6 +604,7 @@ impl GPUBackend {
         command_encoder.pop_debug_group();
 
         self.queue.submit(Some(command_encoder.finish()));
+        debug_assert_eq!(self.get_edges_with_violations(), Ok(vec![]));
     }
 
     pub fn swap_replica_potentials<It>(&mut self, start: usize, stop: usize, it: It)
@@ -717,6 +728,7 @@ impl GPUBackend {
         self.swap_replica_potentials(start, stop, swap_choices);
         self.rng = Some(rng);
         self.tempering_debug = Some(tempering_debug);
+        debug_assert_eq!(self.get_edges_with_violations(), Ok(vec![]));
         Ok(())
     }
 
@@ -1007,36 +1019,103 @@ impl GPUBackend {
         // Add the additional arguments
         .chain(it.into_iter())
         .collect::<Vec<u32>>();
+        let nvals = vals.len();
 
-        if Some(&vals) != self.written_arguments.as_ref() {
-            if let Some(old_vals) = self.written_arguments.as_ref() {
-                let first_diff = vals
-                    .iter()
-                    .zip(old_vals.iter())
-                    .enumerate()
-                    .find(|(_, (a, b))| a.ne(b))
-                    .map(|(i, _)| i)
-                    .unwrap_or(old_vals.len());
-                if first_diff < vals.len() {
-                    let offset = (std::mem::size_of::<u32>() * first_diff) as u64;
+        let optimize_args = self.optimize_writing_args.unwrap_or(true);
+        if optimize_args {
+            if Some(&vals) != self.written_arguments.as_ref() {
+                if let Some(old_vals) = self.written_arguments.as_ref() {
+                    let first_diff = vals
+                        .iter()
+                        .zip(old_vals.iter())
+                        .enumerate()
+                        .find(|(_, (a, b))| a.ne(b))
+                        .map(|(i, _)| i)
+                        .unwrap_or(old_vals.len());
+                    if first_diff < vals.len() {
+                        let offset = (std::mem::size_of::<u32>() * first_diff) as u64;
+                        self.queue.write_buffer(
+                            &self.localupdate.index_buffer,
+                            offset,
+                            bytemuck::cast_slice(&vals[first_diff..]),
+                        );
+                        self.written_arguments = Some(vals);
+                    }
+                    // If the difference comes after the end of vals (vals is a subsequence of old_vals)
+                    // then no need to write.
+                } else {
                     self.queue.write_buffer(
                         &self.localupdate.index_buffer,
-                        offset,
-                        bytemuck::cast_slice(&vals[first_diff..]),
+                        0_u64,
+                        bytemuck::cast_slice(vals.as_slice()),
                     );
                     self.written_arguments = Some(vals);
                 }
-                // If the difference comes after the end of vals (vals is a subsequence of old_vals)
-                // then no need to write.
-            } else {
-                self.queue.write_buffer(
-                    &self.localupdate.index_buffer,
-                    0_u64,
-                    bytemuck::cast_slice(vals.as_slice()),
-                );
-                self.written_arguments = Some(vals);
             }
+        } else {
+            self.queue.write_buffer(
+                &self.localupdate.index_buffer,
+                0_u64,
+                bytemuck::cast_slice(vals.as_slice()),
+            );
+            self.written_arguments = Some(vals);
         }
+
+        debug_assert_eq!(
+            Some(
+                self.read_argbuffer_from_gpu(max(
+                    nvals,
+                    self.written_arguments
+                        .as_ref()
+                        .map(|x| x.len())
+                        .unwrap_or_default()
+                ))
+            ),
+            self.written_arguments
+        );
+    }
+
+    pub fn read_argbuffer_from_gpu(&mut self, read_num_values: usize) -> Vec<u32> {
+        let to_read = read_num_values * std::mem::size_of::<u32>();
+
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: to_read as _,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // get command encoder
+        let mut command_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            command_encoder.push_debug_group("Copy args");
+            command_encoder.copy_buffer_to_buffer(
+                &self.localupdate.index_buffer,
+                0,
+                &staging_buffer,
+                0,
+                to_read as _,
+            );
+            command_encoder.pop_debug_group();
+        }
+        self.queue.submit(Some(command_encoder.finish()));
+
+        // Note that we're not calling `.await` here.
+        let buffer_slice = staging_buffer.slice(..);
+        // Gets the future representing when `staging_buffer` can be read from
+        buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
+
+        // Poll the device in a blocking manner so that our future resolves.
+        // In an actual application, `device.poll(...)` should
+        // be called in an event loop or on another thread.
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Gets contents of buffer
+        // location R uses potential Vi = rotation[R]
+        let data = buffer_slice.get_mapped_range();
+        bytemuck::cast_slice(&data).to_vec()
     }
 
     pub fn read_sumbuffer_from_gpu(&mut self, read_num_values: usize) -> Vec<f32> {

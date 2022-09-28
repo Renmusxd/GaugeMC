@@ -1,7 +1,6 @@
 use env_logger;
 use gaugemc::{NDDualGraph, SiteIndex};
 use ndarray::{Array2, Array6, Axis};
-use std::iter::repeat;
 
 fn main() -> Result<(), String> {
     env_logger::init();
