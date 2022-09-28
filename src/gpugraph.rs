@@ -53,6 +53,7 @@ pub struct GPUBackend {
     energy_option: EnergyOption,
 
     written_arguments: Option<Vec<u32>>,
+    heatbath: Option<bool>,
 }
 
 struct ParallelTemperingDebug {
@@ -462,7 +463,12 @@ impl GPUBackend {
             winding_nums_option: WindingNumsOption::Gpu,
             energy_option: EnergyOption::CpuIfPresent,
             written_arguments: None,
+            heatbath: None,
         })
+    }
+
+    pub fn set_heatbath(&mut self, use_heatbath: Option<bool>) {
+        self.heatbath = use_heatbath;
     }
 
     pub fn get_bounds(&self) -> SiteIndex {
@@ -668,6 +674,7 @@ impl GPUBackend {
     ) -> Result<(), String> {
         let start = if offset { 1 } else { 0 };
         let stop = self.num_replicas - skip_last.unwrap_or_default();
+        let heatbath = self.heatbath.unwrap_or_default();
 
         let base_energies = self.get_energy(skip_last)?;
         self.swap_replica_potentials(start, stop, repeat(true));
@@ -685,10 +692,19 @@ impl GPUBackend {
             .chunks_exact(2)
             .zip(bases.chunks_exact(2))
             .map(|(chunk_mod, chunk_base)| {
-                (chunk_mod[0] - chunk_base[0]) + (chunk_mod[1] - chunk_base[1])
+                // mod - base
+                let action = (chunk_mod[0] - chunk_base[0]) + (chunk_mod[1] - chunk_base[1]);
+                if heatbath {
+                    // e(-mod) / e(-base) + e(-mod) == e(-mod + base) / 1 + e(-mod + base);
+                    let weight = (-action).exp();
+                    weight / (1.0 + weight)
+                } else {
+                    // min(1.0, e(-mod)/e(-base)) = min(1.0, e(-mod + base))
+                    // = e(max(0.0, -mod+base))
+                    let metro_minus_action = if action < 0.0 { 0.0 } else { -action };
+                    metro_minus_action.exp()
+                }
             })
-            .map(|action| if action < 0.0 { 0.0 } else { -action })
-            .map(|minus_action| minus_action.exp())
             .map(|prob| rng.gen_bool(prob as f64))
             .enumerate()
             .map(|(i, b)| {
