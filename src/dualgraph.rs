@@ -15,6 +15,19 @@ pub struct SiteIndex {
     pub z: usize,
 }
 
+impl From<(usize, usize, usize, usize)> for SiteIndex {
+    fn from(d: (usize, usize, usize, usize)) -> Self {
+        let (t, x, y, z) = d;
+        Self::new(t, x, y, z)
+    }
+}
+
+impl Into<(usize, usize, usize, usize)> for SiteIndex {
+    fn into(self) -> (usize, usize, usize, usize) {
+        (self.t, self.x, self.y, self.z)
+    }
+}
+
 impl SiteIndex {
     pub fn new(t: usize, x: usize, y: usize, z: usize) -> Self {
         Self { t, x, y, z }

@@ -1254,10 +1254,7 @@ impl GPUBackend {
                     .map(|p| (p, 1))
                     .chain(negs.iter().cloned().map(|n| (n, -1)))
                     .map(|((site, p), mult)| {
-                        state
-                            .get(ndarray::Ix6(r, site.t, site.x, site.y, site.z, p))
-                            .unwrap()
-                            * mult
+                        state.get([r, site.t, site.x, site.y, site.z, p]).unwrap() * mult
                     })
                     .sum::<i32>();
                 if sum != 0 {
