@@ -1118,6 +1118,10 @@ impl GPUBackend {
         bytemuck::cast_slice(&data).to_vec()
     }
 
+    pub fn wait_for_gpu(&mut self) {
+        self.device.poll(wgpu::Maintain::Wait);
+    }
+
     pub fn read_sumbuffer_from_gpu(&mut self, read_num_values: usize) -> Vec<f32> {
         let to_read = read_num_values * std::mem::size_of::<f32>();
 
