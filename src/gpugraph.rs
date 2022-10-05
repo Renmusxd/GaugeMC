@@ -33,7 +33,7 @@ pub enum EnergyOption {
 
 impl Default for EnergyOption {
     fn default() -> Self {
-        Self::CpuIfPresent
+        Self::Gpu
     }
 }
 
@@ -45,7 +45,7 @@ pub enum ParallelTemperingOption {
 
 impl Default for ParallelTemperingOption {
     fn default() -> Self {
-        Self::CpuIfPresent
+        Self::Gpu
     }
 }
 
