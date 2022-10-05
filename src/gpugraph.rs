@@ -18,10 +18,35 @@ pub enum WindingNumsOption {
     Cpu,
     OldCpu,
 }
+
+impl Default for WindingNumsOption {
+    fn default() -> Self {
+        Self::Gpu
+    }
+}
+
 pub enum EnergyOption {
     Gpu,
     Cpu,
     CpuIfPresent,
+}
+
+impl Default for EnergyOption {
+    fn default() -> Self {
+        Self::CpuIfPresent
+    }
+}
+
+pub enum ParallelTemperingOption {
+    Gpu,
+    Cpu,
+    CpuIfPresent,
+}
+
+impl Default for ParallelTemperingOption {
+    fn default() -> Self {
+        Self::CpuIfPresent
+    }
 }
 
 pub struct GPUBackend {
@@ -51,6 +76,7 @@ pub struct GPUBackend {
     tempering_debug: Option<ParallelTemperingDebug>,
     winding_nums_option: WindingNumsOption,
     energy_option: EnergyOption,
+    parallel_tempering_option: ParallelTemperingOption,
 
     optimize_writing_args: Option<bool>,
     written_arguments: Option<Vec<u32>>,
@@ -463,8 +489,9 @@ impl GPUBackend {
                 copy_state_pipeline,
             },
             tempering_debug: Some(ParallelTemperingDebug::new(num_replicas)),
-            winding_nums_option: WindingNumsOption::Gpu,
-            energy_option: EnergyOption::CpuIfPresent,
+            winding_nums_option: WindingNumsOption::default(),
+            energy_option: EnergyOption::default(),
+            parallel_tempering_option: ParallelTemperingOption::default(),
             optimize_writing_args: None,
             written_arguments: None,
             heatbath: None,
@@ -629,36 +656,20 @@ impl GPUBackend {
                         None
                     }
                 })
-                .for_each(|(mut state_chunk, vn_chunk)| {
+                .for_each(|(state_chunk, vn_chunk)| {
                     let a = vn_chunk[0];
                     let b = vn_chunk[1];
                     vn_chunk[0] = b;
                     vn_chunk[1] = a;
-                    state_chunk
-                        .axis_iter_mut(Axis(5))
+
+                    let (a_s, b_s) = state_chunk.split_at(Axis(0), 1);
+                    ndarray::Zip::from(a_s)
+                        .and(b_s)
                         .into_par_iter()
-                        .for_each(|mut ax| {
-                            ax.axis_iter_mut(Axis(4))
-                                .into_par_iter()
-                                .for_each(|mut ax| {
-                                    ax.axis_iter_mut(Axis(3))
-                                        .into_par_iter()
-                                        .for_each(|mut ax| {
-                                            ax.axis_iter_mut(Axis(2)).into_par_iter().for_each(
-                                                |mut ax| {
-                                                    ax.axis_iter_mut(Axis(1))
-                                                        .into_par_iter()
-                                                        .for_each(|mut ax| {
-                                                            debug_assert_eq!(ax.shape(), &[2]);
-                                                            let a = ax[0];
-                                                            let b = ax[1];
-                                                            ax[0] = b;
-                                                            ax[1] = a;
-                                                        })
-                                                },
-                                            )
-                                        })
-                                })
+                        .for_each(|(a, b)| {
+                            let tmp = *a;
+                            *a = *b;
+                            *b = tmp;
                         });
                 });
         } else {
@@ -678,6 +689,39 @@ impl GPUBackend {
         }
     }
 
+    pub fn get_base_and_modified_energies(
+        &mut self,
+        start: usize,
+        stop: usize,
+        skip_last: Option<usize>,
+    ) -> Result<(Array1<f32>, Array1<f32>), String> {
+        let reset_to = match self.parallel_tempering_option {
+            // Remove precalculated state so it cannot be used.
+            ParallelTemperingOption::Gpu => Some(self.state.take()),
+            // Calculate the state to force it to be present.
+            ParallelTemperingOption::Cpu => {
+                self.calculate_state(skip_last)?;
+                None
+            }
+            // Do nothing, use CPU if available otherwise use gpu.
+            ParallelTemperingOption::CpuIfPresent => None,
+        };
+
+        let base_energies = self.get_energy(skip_last)?;
+        self.swap_replica_potentials(start, stop, repeat(true));
+        let modified_energies = self.get_energy(skip_last)?;
+        self.swap_replica_potentials(start, stop, repeat(true));
+        // Should now be back to where we were before.
+        debug_assert_eq!(base_energies, self.get_energy(skip_last)?);
+
+        // Put precalculated state back if it was stored.
+        if let Some(reset_to) = reset_to {
+            self.state = reset_to;
+        }
+
+        Ok((base_energies, modified_energies))
+    }
+
     pub fn run_parallel_tempering_sweep(
         &mut self,
         offset: bool,
@@ -687,12 +731,8 @@ impl GPUBackend {
         let stop = self.num_replicas - skip_last.unwrap_or_default();
         let heatbath = self.heatbath.unwrap_or_default();
 
-        let base_energies = self.get_energy(skip_last)?;
-        self.swap_replica_potentials(start, stop, repeat(true));
-        let modified_energies = self.get_energy(skip_last)?;
-        self.swap_replica_potentials(start, stop, repeat(true));
-        // Should now be back to where we were before.
-        debug_assert_eq!(base_energies, self.get_energy(skip_last)?);
+        let (base_energies, modified_energies) =
+            self.get_base_and_modified_energies(start, stop, skip_last)?;
 
         let mut rng = self.rng.take().unwrap();
         let mut tempering_debug = self.tempering_debug.take().unwrap();
@@ -847,6 +887,10 @@ impl GPUBackend {
     }
     pub fn set_energy_method(&mut self, method: EnergyOption) {
         self.energy_option = method;
+    }
+
+    pub fn set_parallel_tempering_method(&mut self, method: ParallelTemperingOption) {
+        self.parallel_tempering_option = method;
     }
 
     pub fn get_winding_nums(&mut self, skip_last: Option<usize>) -> Result<Array2<i32>, String> {
@@ -1774,10 +1818,33 @@ mod gpu_tests {
     }
 
     #[test]
-    fn test_parallel_swap_back() -> Result<(), String> {
+    fn test_parallel_swap_back_gpu() -> Result<(), String> {
         // Make a state where np is higher for larger potentials,
         // energetically preferable to swap back.
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
+        s.set_parallel_tempering_method(ParallelTemperingOption::Gpu);
+        let energies = s.get_energy(None)?;
+        s.swap_replica_potentials(0, 4, repeat(true));
+        let swapped_energy = s.get_energy(None)?;
+        let swap_state = s.get_state(None)?;
+
+        // Reinit, and check if it swaps.
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
+        s.run_parallel_tempering_sweep(false, None)?;
+
+        assert_eq!(swapped_energy, s.get_energy(None)?);
+        assert_eq!(swap_state, s.get_state(None)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_swap_back_cpu() -> Result<(), String> {
+        // Make a state where np is higher for larger potentials,
+        // energetically preferable to swap back.
+        let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
+        s.set_parallel_tempering_method(ParallelTemperingOption::Cpu);
+
         let energies = s.get_energy(None)?;
         s.swap_replica_potentials(0, 4, repeat(true));
         let swapped_energy = s.get_energy(None)?;
