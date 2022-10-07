@@ -816,8 +816,7 @@ impl GPUBackend {
         let buff_size = t * x * y * z * p / INIT_REDUX;
         let mut threads_per_replica = buff_size;
 
-        let num_replicas = self.num_replicas - skip_last.unwrap_or_default();
-        self.write_arguments(None, Some(num_replicas));
+        self.write_arguments(None, None);
 
         // get command encoder
         let mut command_encoder = self
@@ -833,7 +832,7 @@ impl GPUBackend {
             cpass.set_pipeline(&self.sum_energy_planes.init_sum_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 
-            let nneeded = num_replicas * threads_per_replica;
+            let nneeded = self.num_replicas * threads_per_replica;
             let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
 
             cpass.dispatch_workgroups(ndispatch, 1, 1);
@@ -844,7 +843,7 @@ impl GPUBackend {
         self.queue.submit(Some(command_encoder.finish()));
 
         while threads_per_replica > 1 {
-            self.write_arguments(Some(threads_per_replica as u32), Some(num_replicas));
+            self.write_arguments(Some(threads_per_replica as u32), None);
 
             // get command encoder
             let mut command_encoder = self
@@ -860,7 +859,7 @@ impl GPUBackend {
                 cpass.set_bind_group(0, &self.bindgroup, &[]);
 
                 threads_per_replica = threads_per_replica / 2 + threads_per_replica % 2;
-                let nneeded = num_replicas * threads_per_replica;
+                let nneeded = self.num_replicas * threads_per_replica;
                 let ndispatch = ((nneeded + (WORKGROUP - 1)) / WORKGROUP) as u32;
                 cpass.dispatch_workgroups(ndispatch, 1, 1);
             }
@@ -868,6 +867,8 @@ impl GPUBackend {
 
             self.queue.submit(Some(command_encoder.finish()));
         }
+
+        let num_replicas = self.num_replicas - skip_last.unwrap_or_default();
         self.read_energy_from_gpu(Some(num_replicas))
     }
 
@@ -1585,6 +1586,29 @@ mod gpu_tests {
     }
 
     #[test]
+    fn test_energy_calc_skip_last() -> Result<(), String> {
+        for skip in [0, 1, 2] {
+            let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
+            let energies = s.get_energy_from_gpu(Some(skip))?;
+
+            let n_faces = 4 * 4 * 4 * 4 * 6;
+            let energies_slice = energies
+                .as_slice()
+                .ok_or_else(|| "Not a slice".to_string())?;
+            assert_eq!(
+                energies_slice,
+                &[
+                    1.0 * 0.0 * (n_faces as f32),
+                    2.0 * 1.0 * (n_faces as f32),
+                    3.0 * 4.0 * (n_faces as f32),
+                    4.0 * 9.0 * (n_faces as f32),
+                ][..4 - skip]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_energy_calc_cpu() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let energies = s.get_energy_from_cpu(None)?;
@@ -1625,6 +1649,29 @@ mod gpu_tests {
         );
         assert_eq!(calced_swapped_energies_slice, swapped_energies_slice);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_energy_calc_cpu_skip_last() -> Result<(), String> {
+        for skip in [0, 1, 2] {
+            let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
+            let energies = s.get_energy_from_cpu(Some(skip))?;
+
+            let n_faces = 4 * 4 * 4 * 4 * 6;
+            let energies_slice = energies
+                .as_slice()
+                .ok_or_else(|| "Not a slice".to_string())?;
+            assert_eq!(
+                energies_slice,
+                &[
+                    1.0 * 0.0 * (n_faces as f32),
+                    2.0 * 1.0 * (n_faces as f32),
+                    3.0 * 4.0 * (n_faces as f32),
+                    4.0 * 9.0 * (n_faces as f32),
+                ][..4 - skip]
+            );
+        }
         Ok(())
     }
 
