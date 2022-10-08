@@ -1,3 +1,4 @@
+use crate::util::MeshIterator;
 use ndarray::{Array1, Array4, Array5};
 use ndarray_rand::rand::Rng;
 use ndarray_rand::rand_distr::Uniform;
@@ -261,19 +262,17 @@ impl NDDualGraph {
     }
 
     pub fn get_edges_with_violations(&self) -> Vec<(SiteIndex, Dimension)> {
-        let edge_iterator = (0..self.bounds.t).flat_map(|t| {
-            (0..self.bounds.x).flat_map(move |x| {
-                (0..self.bounds.y).flat_map(move |y| {
-                    (0..self.bounds.z).flat_map(move |z| {
-                        (0..4usize)
-                            .map(Dimension::from)
-                            .map(move |d| (SiteIndex { t, x, y, z }, d))
-                    })
-                })
-            })
-        });
+        let edge_iterator = MeshIterator::new([
+            self.bounds.t,
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.z,
+            4,
+        ])
+        .build_parallel_iterator()
+        .map(|[t, x, y, z, d]| (SiteIndex { t, x, y, z }, Dimension::from(d)));
+
         edge_iterator
-            .par_bridge()
             .filter(|(s, d)| {
                 let (poss, negs) = Self::plaquettes_next_to_edge(s, *d, &self.bounds);
                 let sum = poss

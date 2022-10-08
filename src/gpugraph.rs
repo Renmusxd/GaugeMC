@@ -1,3 +1,4 @@
+use crate::util::MeshIterator;
 use crate::{Dimension, NDDualGraph, SiteIndex};
 use bytemuck;
 use log::{info, warn};
@@ -5,7 +6,6 @@ use ndarray::parallel::prelude::*;
 use ndarray::{s, Array1, Array2, Array6, ArrayView5, Axis};
 use ndarray_rand::rand::rngs::SmallRng;
 use ndarray_rand::rand::{Rng, SeedableRng};
-use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cmp::max;
 use std::iter::repeat;
@@ -666,11 +666,7 @@ impl GPUBackend {
                     ndarray::Zip::from(a_s)
                         .and(b_s)
                         .into_par_iter()
-                        .for_each(|(a, b)| {
-                            let tmp = *a;
-                            *a = *b;
-                            *b = tmp;
-                        });
+                        .for_each(|(a, b)| std::mem::swap(&mut (*a), &mut (*b)));
                 });
         } else {
             entries
@@ -1359,23 +1355,20 @@ impl GPUBackend {
         &mut self,
     ) -> Result<Vec<((usize, SiteIndex, Dimension), Vec<(SiteIndex, usize)>)>, String> {
         let shape = self.shape.clone();
-        let edge_iterator = (0..self.get_num_replicas()).flat_map(|r| {
-            (0..shape.t).flat_map(move |t| {
-                (0..shape.x).flat_map(move |x| {
-                    (0..shape.y).flat_map(move |y| {
-                        (0..shape.z).flat_map(move |z| {
-                            (0..4usize)
-                                .map(Dimension::from)
-                                .map(move |d| (r, SiteIndex { t, x, y, z }, d))
-                        })
-                    })
-                })
-            })
-        });
+        let edge_iterator = MeshIterator::new([
+            self.get_num_replicas(),
+            shape.t,
+            shape.x,
+            shape.y,
+            shape.z,
+            4,
+        ])
+        .build_parallel_iterator()
+        .map(|[r, t, x, y, z, d]| (r, SiteIndex { t, x, y, z }, Dimension::from(d)));
+
         self.calculate_state(None)?;
         let state = self.get_precalculated_state().unwrap();
         let res = edge_iterator
-            .par_bridge()
             .filter_map(|(r, s, d)| {
                 let (poss, negs) = NDDualGraph::plaquettes_next_to_edge(&s, d, &self.shape);
                 let sum = poss
