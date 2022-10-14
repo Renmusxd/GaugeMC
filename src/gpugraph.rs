@@ -1535,6 +1535,23 @@ mod gpu_tests {
     }
 
     #[test]
+    fn test_winding_num_calc_skip() -> Result<(), String> {
+        let mut s = make_replica_value_state(8, 4, 4, 4, 4)?;
+        for i in 0..100 {
+            s.run_global_sweep(None);
+            s.swap_replica_potentials(i % 2, 3, repeat(true));
+            s.swap_replica_potentials(i % 2, 3, repeat(true));
+            let cpu_w = s.get_winding_nums_cpu(Some(5))?;
+            let gpu_w = s.get_winding_nums_gpu(Some(5))?;
+            let old_w = s.get_winding_nums_cpu_old(Some(5))?;
+            assert_eq!(cpu_w, gpu_w);
+            assert_eq!(cpu_w, old_w);
+        }
+        println!("{:?}", s.get_parallel_tempering_success_rate());
+        Ok(())
+    }
+
+    #[test]
     fn test_energy_calc() -> Result<(), String> {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         let energies = s.get_energy_from_gpu(None)?;
