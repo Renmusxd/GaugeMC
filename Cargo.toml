@@ -8,14 +8,14 @@ default = []
 gpu-wgpu = ["wgpu", "bytemuck", "pollster", "log", "env_logger"]
 
 [dependencies]
-rayon = ">=1.5"
+rayon = ">=1.6"
 num-traits = ">=0.2"
 ndarray-rand = ">=0.14"
-wgpu = {version=">=0.13", optional=true}
-bytemuck = { version = ">=1.9", features = [ "derive" ],optional=true }
+wgpu = {version=">=0.14", optional=true}
+bytemuck = { version = ">=1.12", features = [ "derive" ],optional=true }
 pollster = {version=">=0.2",optional=true }
 log = {version=">=0.4",optional=true }
-env_logger = {version=">=0.9",optional=true }
+env_logger = {version=">=0.10",optional=true }
 
 [dependencies.ndarray]
 version = ">=0.15"
