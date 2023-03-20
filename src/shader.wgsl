@@ -243,7 +243,7 @@ fn incremental_sum_energy(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Want to fold ith with (N-i)th - reduces by 2 each time and keeps arrangement of replicas.
     let fold_index = (size_in_replica - 1u - index)*num_replicas + replica_index;
-    let index = (index * num_replicas) + replica_index;
+    index = (index * num_replicas) + replica_index;
 
     if (fold_index == index) {
         return;
@@ -373,8 +373,8 @@ fn main_global(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let add_one_p = select(exp(-inc_energy_increase), 0.0, inc_energy_increase >= 32.0);
     let sub_one_p = select(exp(-dec_energy_increase), 0.0, dec_energy_increase >= 32.0);
 
-    let random_float = prng(global_id.x);
-    let random_float = random_float * (add_zer_p + add_one_p + sub_one_p) - add_zer_p;
+    var random_float = prng(global_id.x);
+    random_float = random_float * (add_zer_p + add_one_p + sub_one_p) - add_zer_p;
 
     if (random_float <= 0.0) {
         return;
@@ -447,50 +447,50 @@ fn main_local(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var neg_indices : vec3<u32> = vec3<u32>(0u, 0u, 0u);
 
     // First do the ones attached to the calculated point
-    let first = mu;
-    let second = nu;
-    let p_index = p_from_dims(first, second);
-    let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
+    var first = mu;
+    var second = nu;
+    var p_index = p_from_dims(first, second);
+    index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     pos_indices[0] = index;
 
-    let first = mu;
-    let second = sigma;
-    let p_index = p_from_dims(first, second);
-    let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
+    first = mu;
+    second = sigma;
+    p_index = p_from_dims(first, second);
+    index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     neg_indices[0] = index;
 
-    let first = nu;
-    let second = sigma;
-    let p_index = p_from_dims(first, second);
-    let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
+    first = nu;
+    second = sigma;
+    p_index = p_from_dims(first, second);
+    index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     pos_indices[1] = index;
 
     // Now the opposing faces.
-    let first = mu;
-    let second = nu;
-    let normal = sigma;
+    first = mu;
+    second = nu;
+    var normal = sigma;
     cube_index[normal] = (cube_index[normal] + 1u) % dim_indices.data[normal];
-    let p_index = p_from_dims(first, second);
-    let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
+    p_index = p_from_dims(first, second);
+    index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     cube_index[normal] = (cube_index[normal] + dim_indices.data[normal] - 1u) % dim_indices.data[normal];
     neg_indices[1] = index;
 
-    let first = mu;
-    let second = sigma;
-    let normal = nu;
+    first = mu;
+    second = sigma;
+    normal = nu;
     cube_index[normal] = (cube_index[normal] + 1u) % dim_indices.data[normal];
-    let p_index = p_from_dims(first, second);
-    let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
+    p_index = p_from_dims(first, second);
+    index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     cube_index[normal] = (cube_index[normal] + dim_indices.data[normal] - 1u) % dim_indices.data[normal];
     pos_indices[2] = index;
 
-    let first = nu;
-    let second = sigma;
-    let normal = mu;
+    first = nu;
+    second = sigma;
+    normal = mu;
     cube_index[normal] = (cube_index[normal] + 1u) % dim_indices.data[normal];
-    let sign = (second - first) % 2u;
-    let p_index = p_from_dims(first, second);
-    let index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
+    var sign = (second - first) % 2u;
+    p_index = p_from_dims(first, second);
+    index = cube_index[0]*(x*y*z*p) + cube_index[1]*(y*z*p) + cube_index[2]*(z*p) + cube_index[3]*p + p_index;
     cube_index[normal] = (cube_index[normal] + dim_indices.data[normal] - 1u) % dim_indices.data[normal];
     neg_indices[2] = index;
 
@@ -519,8 +519,8 @@ fn main_local(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let add_one_p = select(exp(-add_one_dv), 0.0, add_one_dv >= 32.0);
     let sub_one_p = select(exp(-sub_one_dv), 0.0, sub_one_dv >= 32.0);
 
-    let random_float = prng(global_id.x);
-    let random_float = random_float * (zero_p + add_one_p + sub_one_p) - zero_p;
+    var random_float = prng(global_id.x);
+    random_float = random_float * (zero_p + add_one_p + sub_one_p) - zero_p;
 
     if (random_float <= 0.0) {
         return;
@@ -530,7 +530,7 @@ fn main_local(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // random_float is between 0.0 and add_one_p + sub_one_p
     // If between 0.0 and add_one_p then random_float < add_one_p == true so choose 1.
     let choice = select(-1, 1, random_float < add_one_p);
-    let index = pos_indices[0];
+    index = pos_indices[0];
 
     // Apply choice
     for(var i: i32 = 0; i < 3; i = i + 1) {
@@ -550,11 +550,11 @@ fn copy_replica(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var index = global_id.x;
 
     // Get the bounds.
-    let t = dim_indices.data[0];
-    let x = dim_indices.data[1];
-    let y = dim_indices.data[2];
-    let z = dim_indices.data[3];
-    let p = 6u;
+    var t = dim_indices.data[0];
+    var x = dim_indices.data[1];
+    var y = dim_indices.data[2];
+    var z = dim_indices.data[3];
+    var p = 6u;
     let num_replicas = dim_indices.data[4];
 
     // Each thread responsible for 6 ps
@@ -574,13 +574,13 @@ fn copy_replica(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let y_off = z*p;
     let z_off = p;
 
-    let t = index / (x*y*z);
-    let index = index % (x*y*z);
-    let x = index / (y*z);
-    let index = index % (y*z);
-    let y = index / z;
-    let index = index % z;
-    let z = index;
+    t = index / (x*y*z);
+    index = index % (x*y*z);
+    x = index / (y*z);
+    index = index % (y*z);
+    y = index / z;
+    index = index % z;
+    z = index;
 
     let to_off = to_r*r_off;
     let from_off = from_r*r_off;

@@ -191,7 +191,7 @@ impl GPUBackend {
         let index_size = std::mem::size_of::<u32>();
 
         // Instantiates instance of WebGPU
-        let instance = wgpu::Instance::new(wgpu::Backends::all());
+        let instance = wgpu::Instance::default();
 
         // `request_adapter` instantiates the general connection to the GPU
         let adapter = if let Some(device_id) = device_id {
