@@ -155,7 +155,7 @@ impl GPUBackend {
         vn: Array2<f32>,
         initial_state: Option<Array6<i32>>,
         seed: Option<u64>,
-        device_id: Option<usize>,
+        device_id: Option<u32>,
     ) -> Result<Self, String> {
         let (t, x, y, z) = (bounds.t, bounds.x, bounds.y, bounds.z);
         for d in [t, x, y, z] {
@@ -547,8 +547,10 @@ impl GPUBackend {
         command_encoder.push_debug_group(&format!("PCG Rotate Sweep: {}", offset));
 
         {
-            let mut cpass =
-                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Run PCG update"),
+                timestamp_writes: None,
+            });
             cpass.set_pipeline(&self.pcgupdate.update_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 
@@ -586,8 +588,10 @@ impl GPUBackend {
         command_encoder.push_debug_group(&format!("Local Sweep: {:?}", dims));
 
         {
-            let mut cpass =
-                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Run local sweep"),
+                timestamp_writes: None,
+            });
             cpass.set_pipeline(&self.localupdate.update_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 
@@ -616,8 +620,10 @@ impl GPUBackend {
         command_encoder.push_debug_group("Global Sweep");
 
         {
-            let mut cpass =
-                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Run global sweep"),
+                timestamp_writes: None,
+            });
             cpass.set_pipeline(&self.globalupdate.update_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 
@@ -823,8 +829,10 @@ impl GPUBackend {
         command_encoder.push_debug_group("Initial Energy Summation");
 
         {
-            let mut cpass =
-                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Run initial sum pipeline"),
+                timestamp_writes: None,
+            });
             cpass.set_pipeline(&self.sum_energy_planes.init_sum_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 
@@ -849,8 +857,10 @@ impl GPUBackend {
             // compute pass
             command_encoder.push_debug_group("Incremental Energy Summation");
             {
-                let mut cpass = command_encoder
-                    .begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+                let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Run incremental sum pipeline"),
+                    timestamp_writes: None,
+                });
                 cpass.set_pipeline(&self.sum_energy_planes.inc_sum_pipeline);
                 cpass.set_bind_group(0, &self.bindgroup, &[]);
 
@@ -969,8 +979,10 @@ impl GPUBackend {
         command_encoder.push_debug_group("Winding Num Summation");
 
         {
-            let mut cpass =
-                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Run winding sum pipeline"),
+                timestamp_writes: None,
+            });
             cpass.set_pipeline(&self.sum_winding_planes.winding_sum_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 
@@ -1240,8 +1252,10 @@ impl GPUBackend {
         command_encoder.push_debug_group("Copy replica.");
 
         {
-            let mut cpass =
-                command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            let mut cpass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Copy replica onto device"),
+                timestamp_writes: None,
+            });
             cpass.set_pipeline(&self.copy_state_pipeline.copy_state_pipeline);
             cpass.set_bind_group(0, &self.bindgroup, &[]);
 

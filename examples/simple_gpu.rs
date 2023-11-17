@@ -1,5 +1,5 @@
 use env_logger;
-use gaugemc::{NDDualGraph, SiteIndex};
+use gaugemc::{GPUBackend, NDDualGraph, SiteIndex};
 use ndarray::{Array2, Array6, Axis};
 
 fn main() -> Result<(), String> {
@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
             })
         });
 
-    let mut state = pollster::block_on(gaugemc::GPUBackend::new_async(
+    let mut state = pollster::block_on(GPUBackend::new_async(
         SiteIndex::new(t, x, y, z),
         vns,
         Some(init_state),
