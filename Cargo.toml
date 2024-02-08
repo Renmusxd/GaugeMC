@@ -4,23 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["gpu-cuda"]
 gpu-wgpu = ["wgpu", "bytemuck", "pollster", "log", "env_logger"]
+gpu-cuda = ["cudarc"]
 
 [dependencies]
 rayon = ">=1.8"
 num-traits = ">=0.2"
 ndarray-rand = ">=0.14"
-wgpu = {version=">=0.18", optional=true}
+wgpu = {version="^0.18", optional=true}
 bytemuck = { version = ">=1.14", features = [ "derive" ],optional=true }
 pollster = {version=">=0.3",optional=true }
 log = {version=">=0.4",optional=true }
-env_logger = {version=">=0.10",optional=true }
+env_logger = {version=">=0.11",optional=true }
+cudarc = {version=">=0.10", optional=true}
 
 [dependencies.ndarray]
 version = ">=0.15"
 features = ["rayon"]
 
 [dev-dependencies]
-env_logger = ">=0.10"
+env_logger = ">=0.11"
 pollster = ">=0.3"

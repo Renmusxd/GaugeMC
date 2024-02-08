@@ -254,7 +254,7 @@ impl GPUBackend {
 
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("kernels/shader.wgsl"))),
         });
 
         let index_buffer_entries = 10 + num_replicas;
