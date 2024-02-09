@@ -4,8 +4,9 @@ use cudarc::curand::result::CurandError;
 use cudarc::curand::CudaRng;
 use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx, CompileError};
-use ndarray::{Array2, Array6};
-use ndarray_rand::rand::random;
+use ndarray::{Array1, Array2, Array6};
+use ndarray_rand::rand::prelude::SliceRandom;
+use ndarray_rand::rand::{random, thread_rng};
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ struct CudaBackend {
     potential_buffer: CudaSlice<f32>,
     rng_buffer: CudaSlice<f32>,
     cuda_rng: CudaRng,
+    local_update_types: Option<Vec<(u16, bool)>>,
 }
 
 /// A state in the language of integer plaquettes
@@ -42,7 +44,7 @@ impl DualState {
 
         const CUBE_TYPES_FOR_PLANE_TYPE: [[usize; 2]; 6] = [
             [0, 1], // tx -- txy, txz
-            [2, 3], // ty -- tyz, xyz
+            [0, 2], // ty -- txy, tyz
             [1, 2], // tz -- txz, tyz
             [0, 3], // xy -- txy, xyz
             [1, 3], // xz -- txz, xyz
@@ -74,6 +76,8 @@ impl DualState {
                     coords[1 + *normal] =
                         (coords[1 + *normal] + bounds[*normal] - 1) % bounds[*normal];
                     let lower_cube_val = volumes[coords];
+
+                    assert_ne!(SIGN_CONVENTION[*cube_type][p], 0);
                     *np += SIGN_CONVENTION[*cube_type][p] * (cube_val - lower_cube_val);
                 }
             },
@@ -107,7 +111,12 @@ impl CudaBackend {
             .load_ptx(
                 local_updates_ptx,
                 "gauge_kernel",
-                &["single_local_update_plaquettes", "calculate_edge_sums"],
+                &[
+                    "single_local_update_plaquettes",
+                    "calculate_edge_sums",
+                    "partial_sum_energies",
+                    "sum_buffer",
+                ],
             )
             .map_err(CudaError::from)?;
 
@@ -183,6 +192,10 @@ impl CudaBackend {
         let cuda_rng =
             CudaRng::new(seed.unwrap_or(random()), device.clone()).map_err(CudaError::from)?;
 
+        let local_update_types = (0..4)
+            .flat_map(|volume_type| [false, true].map(|offset| (volume_type, offset)))
+            .collect();
+
         Ok(Self {
             nreplicas,
             bounds,
@@ -193,6 +206,7 @@ impl CudaBackend {
             potential_buffer,
             rng_buffer,
             cuda_rng,
+            local_update_types: Some(local_update_types),
         })
     }
 
@@ -229,6 +243,73 @@ impl CudaBackend {
 
         let edges = Array6::from_shape_vec((self.nreplicas, t, x, y, z, 4), output).unwrap();
         Ok(edges)
+    }
+
+    fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
+        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let mut threads_to_sum = self.nreplicas * t * x * y; // each thread starts with z*6
+
+        let mut sum_buffer = self
+            .device
+            .alloc_zeros::<f32>(threads_to_sum)
+            .map_err(CudaError::from)?;
+
+        // Initial copying
+        let cfg = LaunchConfig::for_num_elems(threads_to_sum as u32);
+        let partial_sum_energies = self
+            .device
+            .get_func("gauge_kernel", "partial_sum_energies")
+            .unwrap();
+        unsafe {
+            partial_sum_energies
+                .launch(
+                    cfg,
+                    (
+                        &self.state,
+                        &mut sum_buffer,
+                        &mut self.potential_buffer,
+                        self.potential_size,
+                        self.nreplicas,
+                        self.bounds.t,
+                        self.bounds.x,
+                        self.bounds.y,
+                        self.bounds.z,
+                    ),
+                )
+                .map_err(CudaError::from)?
+        };
+
+        // Now for each of y, x, t, and r: sum the potentials
+        for n in [y, x, t, self.nreplicas] {
+            threads_to_sum /= n;
+
+            let cfg = LaunchConfig::for_num_elems(threads_to_sum as u32);
+            let partial_sum_energies = self.device.get_func("gauge_kernel", "sum_buffer").unwrap();
+            unsafe {
+                partial_sum_energies
+                    .launch(cfg, (&mut sum_buffer, threads_to_sum, n))
+                    .map_err(CudaError::from)?
+            };
+        }
+
+        // Copy out the subslice.
+        let subslice = sum_buffer.slice(0..self.nreplicas);
+        self.device
+            .dtoh_sync_copy(&subslice)
+            .map(|x| Array1::from_vec(x))
+            .map_err(CudaError::from)
+    }
+
+    fn run_local_update_sweep(&mut self) -> Result<(), CudaError> {
+        let mut rng = thread_rng();
+        let mut local_update_types = self.local_update_types.take().unwrap();
+        local_update_types.shuffle(&mut rng);
+        let res = local_update_types
+            .iter()
+            .copied()
+            .try_for_each(|(volume, offset)| self.run_single_local_update_sweep(volume, offset));
+        self.local_update_types = Some(local_update_types);
+        res
     }
 
     fn run_single_local_update_sweep(
@@ -419,7 +500,7 @@ mod tests {
             SiteIndex::new(6, 8, 10, 12),
             make_potentials(4, 32),
             None,
-            None,
+            Some(31415),
             None,
         )?;
         Ok(())
@@ -430,7 +511,7 @@ mod tests {
             SiteIndex::new(4, 4, 4, 4),
             make_potentials(1, 2),
             None,
-            None,
+            Some(31415),
             None,
         )?;
         state.run_single_local_update_sweep(0, false)
@@ -442,7 +523,7 @@ mod tests {
             SiteIndex::new(4, 4, 4, 4),
             make_potentials(1, 2),
             None,
-            None,
+            Some(31415),
             None,
         )?;
         let plaquettes = state.get_plaquettes()?;
@@ -455,12 +536,11 @@ mod tests {
         let (r, t, x, y, z) = (1, 6, 6, 6, 6);
         let mut state = Array::zeros((r, t, x, y, z, 4));
         state[[0, 0, 0, 0, 0, 0]] = 1;
-        let state = DualState::new_volumes(state);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 2),
-            Some(state),
-            None,
+            Some(DualState::new_volumes(state)),
+            Some(31415),
             None,
         )?;
         let plaquettes = state.get_plaquettes()?;
@@ -482,7 +562,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 2),
             Some(state),
-            None,
+            Some(31415),
             None,
         )?;
         let _plaquettes = state.get_plaquettes()?;
@@ -520,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_get_plaquettes_single_inc_random_fill() -> Result<(), CudaError> {
-        let (r, t, x, y, z) = (12, 6, 6, 6, 6);
+        let (r, t, x, y, z) = (16, 6, 6, 6, 6);
         for _ in 0..10 {
             let state = Array6::random((r, t, x, y, z, 4), Uniform::new(-32, 32));
             let state = DualState::new_volumes(state);
@@ -550,7 +630,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
-            None,
+            Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -569,7 +649,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
-            None,
+            Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -589,7 +669,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
-            None,
+            Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -617,7 +697,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
-            None,
+            Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -645,7 +725,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
-            None,
+            Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -673,7 +753,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
-            None,
+            Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -699,7 +779,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
-            None,
+            Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -719,7 +799,7 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(state),
-            None,
+            Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -740,14 +820,21 @@ mod tests {
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
             Some(state),
-            None,
+            Some(31415),
             None,
         )?;
         let plaquettes = state.get_plaquettes()?;
         let nonzero = plaquettes.iter().filter(|x| !x.is_zero()).count();
-        let violations = state.get_edges_with_violations()?;
         assert_eq!(nonzero, 10);
-        assert!(violations.is_empty());
+        // Should never have edge violations.
+        let nnonzero = state.get_edges_with_violations()?.len();
+        assert_eq!(nnonzero, 0);
+        let nnonzero = state
+            .get_edge_violations()?
+            .into_iter()
+            .filter(|x| !x.is_zero())
+            .count();
+        assert_eq!(nnonzero, 0);
         Ok(())
     }
     #[test]
@@ -760,7 +847,7 @@ mod tests {
             Some(DualState::new_volumes(Array::zeros((
                 nreplicas, t, x, y, z, 4,
             )))),
-            None,
+            Some(31415),
             None,
         )?;
         state.run_single_local_update_sweep(0, false)?;
@@ -771,6 +858,8 @@ mod tests {
         assert_ne!(nnnonzero, 0);
 
         // Should never have edge violations.
+        let nnonzero = state.get_edges_with_violations()?.len();
+        assert_eq!(nnonzero, 0);
         let nnonzero = state
             .get_edge_violations()?
             .into_iter()
@@ -790,7 +879,7 @@ mod tests {
             Some(DualState::new_plaquettes(Array6::zeros((
                 nreplicas, t, x, y, z, 6,
             )))),
-            None,
+            Some(31415),
             None,
         )?;
         state.run_single_local_update_sweep(0, false)?;
@@ -801,12 +890,79 @@ mod tests {
         assert_ne!(nnnonzero, 0);
 
         // Should never have edge violations.
+        let nnonzero = state.get_edges_with_violations()?.len();
+        assert_eq!(nnonzero, 0);
         let nnonzero = state
             .get_edge_violations()?
             .into_iter()
             .filter(|x| !x.is_zero())
             .count();
         assert_eq!(nnonzero, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sweep_launch_replicas_plaquettes() -> Result<(), CudaError> {
+        let nreplicas = 1;
+        let (t, x, y, z) = (8, 8, 8, 8);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_potentials(nreplicas, 32),
+            Some(DualState::new_plaquettes(Array6::zeros((
+                nreplicas, t, x, y, z, 6,
+            )))),
+            Some(31415),
+            None,
+        )?;
+        state.run_local_update_sweep()?;
+
+        // Exceedingly unlikely to get 0.
+        let plaquettes = state.get_plaquettes()?;
+        let nnnonzero = plaquettes.iter().copied().filter(|x| !x.is_zero()).count();
+        assert_ne!(nnnonzero, 0);
+
+        // Should never have edge violations.
+        let nnonzero = state.get_edges_with_violations()?.len();
+        assert_eq!(nnonzero, 0);
+        let nnonzero = state
+            .get_edge_violations()?
+            .into_iter()
+            .filter(|x| !x.is_zero())
+            .count();
+        assert_eq!(nnonzero, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_edges_constructed_full_cube_txy_energy() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (3, 4, 4, 4, 4);
+        let mut plaquette_state = Array::zeros((r, t, x, y, z, 6));
+
+        plaquette_state[[0, 0, 0, 0, 0, 0]] = 1; // tx
+        plaquette_state[[0, 0, 0, 1, 0, 0]] = -1; // tx + y
+
+        plaquette_state[[0, 0, 0, 0, 0, 1]] = -1; // ty
+        plaquette_state[[0, 0, 1, 0, 0, 1]] = 1; // ty + x
+
+        plaquette_state[[0, 0, 0, 0, 0, 3]] = 1; // xy
+        plaquette_state[[0, 1, 0, 0, 0, 3]] = -1; // xy + t
+
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_potentials(r, 32),
+            Some(DualState::new_plaquettes(plaquette_state)),
+            Some(31415),
+            None,
+        )?;
+        let edges = state.get_edge_violations()?;
+        let nonzero = edges.iter().filter(|x| !x.is_zero()).count();
+
+        assert_eq!(nonzero, 0);
+
+        let actions = state.get_action_per_replica()?;
+        assert_eq!(actions, Array1::from_vec(vec![3.0, 0.0, 0.0]));
+
         Ok(())
     }
 }

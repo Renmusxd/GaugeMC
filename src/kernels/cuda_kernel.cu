@@ -102,6 +102,40 @@ const int normal_dim_for_cube_planeindex[4][3] = {
     {3, 2, 1}  // xyz - xy, xz, yz
 };
 
+extern "C" __global__ void sum_buffer(float* buffer, int num_threads, int num_steps)
+{
+    int globalThreadNum = get_thread_number();
+    if (globalThreadNum >= num_threads) {
+        return;
+    }
+    for (int i = 1; i < num_steps; i++) {
+        buffer[globalThreadNum] += buffer[globalThreadNum + (i * num_threads)];
+        buffer[globalThreadNum + (i * num_threads)] = 0.0;
+    }
+}
+
+extern "C" __global__ void partial_sum_energies(int* plaquette_buffer, float* sum_buffer,
+          float* potential_buffer, int potential_vector_size,
+          int replicas, int t, int x, int y, int z)
+{
+    // Go through each of the 6 plaquette types for each site
+    // iterate over z and p, thread for each r, t, x, y
+    int num_threads = replicas * t * x * y;
+
+    int globalThreadNum = get_thread_number();
+    if (globalThreadNum >= num_threads) {
+        return;
+    }
+    int replica_index = globalThreadNum / (t * x * y);
+
+    float pot = 0.0;
+    for (int i = 0; i < z * 6; i++) {
+        int np = plaquette_buffer[(globalThreadNum * z * 6) + i];
+        pot += potential_buffer[(replica_index * potential_vector_size) + abs(np)];
+    }
+    sum_buffer[globalThreadNum] = pot;
+}
+
 extern "C" __global__ void calculate_edge_sums(int* plaquette_buffer, int* edge_sums_buffer,
           int replicas, int t, int x, int y, int z)
 {
@@ -138,12 +172,16 @@ extern "C" __global__ void calculate_edge_sums(int* plaquette_buffer, int* edge_
     int build_plaquettes_per_tslice = x * build_plaquettes_per_txslice;
     int build_plaquettes_per_replica = t * build_plaquettes_per_tslice;
 
-    int coord_index = replica_index * (edges_per_replica/4) + (globalThreadNum / 4);
+
+    int coords_per_replica = t * x * y * z;
+    int replica_offset = replica_index * coords_per_replica;
+    int coord_index = globalThreadNum / 4;
     int coords[] = {t_index, x_index, y_index, z_index};
     int bounds[] = {t, x, y, z};
     int deltas[] = {build_plaquettes_per_tslice, build_plaquettes_per_txslice, build_plaquettes_per_txyslice, build_plaquettes_per_txyzslice};
 
     int edge_sum = get_edge_sum_from_plaquettes(plaquette_buffer, edge_type, coord_index, coords, bounds, deltas);
+
     edge_sums_buffer[globalThreadNum] = edge_sum;
 }
 
@@ -180,7 +218,7 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
 
     int soft_z_index = within_y_index / volumes_per_txyzslice;
     int int_offset = (int) offset;
-    int z_index = 2*soft_z_index + (int_offset + (t_index + x_index + y_index)%2);
+    int z_index = 2*soft_z_index + (int_offset + t_index + x_index + y_index)%2;
 
     int coords_per_z = 1;
     int coords_per_yz = z * coords_per_z;
@@ -188,7 +226,7 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
     int coords_per_txyz = x * coords_per_xyz;
     int coords_per_replica = t * coords_per_txyz;
     int coord_index = t_index * coords_per_txyz + x_index * coords_per_xyz + y_index * coords_per_yz + z_index;
-    int replica_offset = replica_index * coords_per_replica;
+    int replica_offset = replica_index * t * x * y * z;
 
     int coords_delta[4] = {coords_per_txyz, coords_per_xyz, coords_per_yz, coords_per_z};
     int coords[4] = {t_index, x_index, y_index, z_index};
@@ -241,6 +279,7 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
         int np_up = plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type];
         int new_np = np + delta * sign_convention[cube_type][plaquette_type];
         int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
+
         plaquette_buffer[replica_offset + coord_index*6 + plaquette_type] = new_np;
         plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type] = new_np_up;
     }
