@@ -654,7 +654,7 @@ impl GPUBackend {
                 .slice_axis_mut(Axis(0), ndarray::Slice::from(start..stop))
                 .axis_chunks_iter_mut(Axis(0), 2)
                 .zip(entries.chunks_exact_mut(2))
-                .zip(it.into_iter())
+                .zip(it)
                 .filter_map(|((a, b), c)| {
                     if c && a.shape()[0] == 2 {
                         Some((a, b))
@@ -677,7 +677,7 @@ impl GPUBackend {
         } else {
             entries
                 .chunks_exact_mut(2)
-                .zip(it.into_iter())
+                .zip(it)
                 .filter(|(_, b)| *b)
                 .for_each(|(chunk, _)| {
                     let a = chunk[0];
@@ -1070,7 +1070,7 @@ impl GPUBackend {
             (self.vn.shape()[1] * r_rot) as u32
         }))
         // Add the additional arguments
-        .chain(it.into_iter())
+        .chain(it)
         .collect::<Vec<u32>>();
         let nvals = vals.len();
 
@@ -1395,10 +1395,7 @@ impl GPUBackend {
                     })
                     .sum::<i32>();
                 if sum != 0 {
-                    Some((
-                        (r, s, d),
-                        poss.into_iter().chain(negs.into_iter()).collect::<Vec<_>>(),
-                    ))
+                    Some(((r, s, d), poss.into_iter().chain(negs).collect::<Vec<_>>()))
                 } else {
                     None
                 }

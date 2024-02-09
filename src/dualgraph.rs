@@ -860,7 +860,7 @@ mod tests {
             assert_eq!(
                 site,
                 SiteIndex {
-                    t: 0 + if i == 0 { 1 } else { 0 },
+                    t: if i == 0 { 1 } else { 0 },
                     x: 1 + if i == 1 { 1 } else { 0 },
                     y: 2 + if i == 2 { 1 } else { 0 },
                     z: 3 + if i == 3 { 1 } else { 0 },
@@ -957,7 +957,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(graph.get_edges_with_violations(), vec![]);
-        assert_eq!(graph.currents.iter().map(|(_, c)| c.abs()).sum::<i32>(), 4);
+        assert_eq!(graph.currents.values().map(|c| c.abs()).sum::<i32>(), 4);
         graph.add_flux(
             SiteIndex {
                 t: 0,
@@ -979,7 +979,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(graph.get_edges_with_violations(), vec![]);
-        assert_eq!(graph.currents.iter().map(|(_, c)| c.abs()).sum::<i32>(), 6);
+        assert_eq!(graph.currents.values().map(|c| c.abs()).sum::<i32>(), 6);
         Ok(())
     }
 
