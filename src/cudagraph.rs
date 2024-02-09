@@ -896,10 +896,15 @@ mod tests {
     }
     #[test]
     fn test_simple_launch_replicas() -> Result<(), CudaError> {
+        let nreplicas = 1;
+        let (t, x, y, z) = (8, 8, 8, 8);
         let mut state = CudaBackend::new(
-            SiteIndex::new(8, 8, 8, 8),
-            make_potentials(1, 32),
-            None,
+            SiteIndex::new(t, x, y, z),
+            make_potentials(nreplicas, 32),
+            Some(DualState::new_volumes(
+                Array::zeros((nreplicas, t, x, y, z, 4)),
+                None,
+            )),
             None,
             None,
         )?;
@@ -922,14 +927,17 @@ mod tests {
 
     #[test]
     fn test_simple_launch_replicas_plaquettes() -> Result<(), CudaError> {
+        let nreplicas = 1;
+        let (t, x, y, z) = (8, 8, 8, 8);
         let mut state = CudaBackend::new(
-            SiteIndex::new(8, 8, 8, 8),
-            make_potentials(1, 32),
-            None,
+            SiteIndex::new(t, x, y, z),
+            make_potentials(nreplicas, 32),
+            Some(DualState::Plaquettes(Array6::zeros((
+                nreplicas, t, x, y, z, 6,
+            )))),
             None,
             None,
         )?;
-        state.convert_to_plaquette_state()?;
         state.run_single_local_update_sweep(0, false)?;
 
         // Exceedingly unlikely to get 0.

@@ -67,8 +67,8 @@ int __device__ edge_mask_to_edge_type(int mask) {
     return -1;
 }
 
-__device__ void print_cube_info(int t, int x, int y, int z, int index) {
-    int build_volumes_per_txyzslice = 4;
+__device__ void print_info(int t, int x, int y, int z, int per_z, int index) {
+    int build_volumes_per_txyzslice = per_z;
     int build_volumes_per_txyslice = z * build_volumes_per_txyzslice;
     int build_volumes_per_txslice = y * build_volumes_per_txyslice;
     int build_volumes_per_tslice = x * build_volumes_per_txslice;
@@ -172,6 +172,7 @@ const int sign_convention[4][6] = {
 // global_index is the index for cube 0 at coords.
 __device__ int get_np_from_state(int* state_buffer,
         int plane_axis_one, int plane_axis_two,
+        int replica_index,
         int coord_index, int* coords, int* bounds, int* cube_deltas)
 {
     if (plane_axis_one == plane_axis_two) {
@@ -247,8 +248,10 @@ __device__ int get_np_from_state(int* state_buffer,
         default:
             return ~0;
     }
+    int cubes_per_replica = bounds[0] * cube_deltas[0];
+    int replica_offset = replica_index * cubes_per_replica;
 
-    int global_index = coord_index * 4;
+    int global_index = coord_index * 4 + replica_offset;
     int cube_index = global_index + cube_type;
     int down_index = calculate_index_down_difference(bounds[free_edge_one], coords[free_edge_one], cube_deltas[free_edge_one]) + cube_index;
     int down_diff = state_buffer[cube_index] - state_buffer[down_index];
@@ -308,16 +311,20 @@ __device__ void get_dec_stay_inc_potentials(int* state_buffer,
         int starting_value = state_buffer[cube_index];
         for (int delta = -1; delta < 2; delta++) {
             state_buffer[cube_index] = starting_value + delta;
-            int plane_np = get_np_from_state(state_buffer, dim_a, dim_b, coord_index, coords, bounds, cube_deltas);
+            int plane_np = get_np_from_state(state_buffer, dim_a, dim_b, coord_index, replica_index, coords, bounds, cube_deltas);
             potential_changes[delta+1] += potential_buffer[potential_offset + abs(plane_np)];
         }
 
         int coord_up_index = calculate_index_up_difference(bounds[remaining_dim], coords[remaining_dim], coords_delta[remaining_dim]) + coord_index;
+        int old_coord = coords[remaining_dim];
+        coords[remaining_dim] = (coords[remaining_dim] + 1) % bounds[remaining_dim];
         for (int delta = -1; delta < 2; delta++) {
             state_buffer[cube_index] = starting_value + delta;
-            int plane_np = get_np_from_state(state_buffer, dim_a, dim_b, coord_up_index, coords, bounds, cube_deltas);
+            int plane_np = get_np_from_state(state_buffer, dim_a, dim_b, coord_up_index, replica_index, coords, bounds, cube_deltas);
             potential_changes[delta+1] += potential_buffer[potential_offset + abs(plane_np)];
         }
+        coords[remaining_dim] = old_coord;
+
         state_buffer[cube_index] = starting_value;
     }
 }
@@ -438,7 +445,7 @@ extern "C" __global__ void calculate_plaquettes(int* state_buffer, int* plaquett
     int bounds[] = {t, x, y, z};
     int deltas[] = {build_volumes_per_tslice, build_volumes_per_txslice, build_volumes_per_txyslice, build_volumes_per_txyzslice};
 
-    int np = get_np_from_state(state_buffer, plane_axis_one, plane_axis_two, coord_index, coords, bounds, deltas);
+    int np = get_np_from_state(state_buffer, plane_axis_one, plane_axis_two, coord_index, replica_index, coords, bounds, deltas);
     plaquette_buffer[globalThreadNum] = np;
 }
 
@@ -500,22 +507,22 @@ extern "C" __global__ void single_local_update_cubes(int* state_buffer,
     float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
     float total_weight = 0.0;
     for (int i = 0; i < 3; i++) {
-        boltzman_weights[i] -= exp(-boltzman_weights[i] + min_potential);
+        boltzman_weights[i] = exp(-boltzman_weights[i] + min_potential);
         total_weight += boltzman_weights[i];
     }
     // Now they are boltzman weights
 
     float rng = rng_buffer[globalThreadNum] * total_weight;
-    int i = 0;
-    for (; i < 3; i++) {
+    int i;
+    for (i = 0; i < 3; i++) {
         rng -= boltzman_weights[i];
         if (rng <= 0.0) {
             break;
         }
     }
 
-    int delta = i-1;
-    state_buffer[coord_index*4 + cube_type] += delta;
+    state_buffer[coord_index*4 + cube_type] += i-1;
+    // TODO: figure out why changing delta to = 1 fixes the crash?
 }
 
 
@@ -558,7 +565,9 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
     int coords_per_yz = z * coords_per_z;
     int coords_per_xyz = y * coords_per_yz;
     int coords_per_txyz = x * coords_per_xyz;
+    int coords_per_replica = t * coords_per_txyz;
     int coord_index = t_index * coords_per_txyz + x_index * coords_per_xyz + y_index * coords_per_yz + z_index;
+    int replica_offset = replica_index * coords_per_replica;
 
     int coords_delta[4] = {coords_per_txyz, coords_per_xyz, coords_per_yz, coords_per_z};
     int coords[4] = {t_index, x_index, y_index, z_index};
@@ -573,8 +582,8 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
         int plaquette_type = planes_for_cube[cube_type][i];
         int normal_dim = normal_dim_for_cube_planeindex[cube_type][i];
         int coord_up_index = calculate_index_up_difference(bounds[normal_dim], coords[normal_dim], coords_delta[normal_dim]) + coord_index;
-        int np = plaquette_buffer[coord_index*6 + plaquette_type];
-        int np_up = plaquette_buffer[coord_up_index*6 + plaquette_type];
+        int np = plaquette_buffer[replica_offset + coord_index*6 + plaquette_type];
+        int np_up = plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type];
         for (int delta = -1; delta <= 1; delta++) {
             int new_np = np + delta * sign_convention[cube_type][plaquette_type];
             int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
@@ -607,11 +616,11 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
         int plaquette_type = planes_for_cube[cube_type][i];
         int normal_dim = normal_dim_for_cube_planeindex[cube_type][i];
         int coord_up_index = calculate_index_up_difference(bounds[normal_dim], coords[normal_dim], coords_delta[normal_dim]) + coord_index;
-        int np = plaquette_buffer[coord_index*6 + plaquette_type];
-        int np_up = plaquette_buffer[coord_up_index*6 + plaquette_type];
+        int np = plaquette_buffer[replica_offset + coord_index*6 + plaquette_type];
+        int np_up = plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type];
         int new_np = np + delta * sign_convention[cube_type][plaquette_type];
         int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
-        plaquette_buffer[coord_index*6 + plaquette_type] = new_np;
-        plaquette_buffer[coord_up_index*6 + plaquette_type] = new_np_up;
+        plaquette_buffer[replica_offset + coord_index*6 + plaquette_type] = new_np;
+        plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type] = new_np_up;
     }
 }
