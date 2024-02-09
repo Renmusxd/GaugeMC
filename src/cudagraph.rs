@@ -4,50 +4,81 @@ use cudarc::curand::result::CurandError;
 use cudarc::curand::CudaRng;
 use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx, CompileError};
-use ndarray::{Array2, Array4, Array6};
+use ndarray::{Array2, Array6};
 use ndarray_rand::rand::random;
 use rayon::prelude::*;
 use std::sync::Arc;
-
-enum CudaState {
-    Volumes {
-        volumes: CudaSlice<i32>,
-        planes: CudaSlice<i32>,
-    },
-    Plaquettes(CudaSlice<i32>),
-}
 
 struct CudaBackend {
     nreplicas: usize,
     bounds: SiteIndex,
     potential_size: usize,
     device: Arc<CudaDevice>,
-    state: CudaState,
+    state: CudaSlice<i32>,
     potential_redirect_buffer: CudaSlice<u32>,
     potential_buffer: CudaSlice<f32>,
     rng_buffer: CudaSlice<f32>,
     cuda_rng: CudaRng,
 }
 
-/// A state in the language of integer volumes
-///
-enum DualState {
-    Volumes {
-        // Shape (replicas, T, X, Y, Z, 4)
-        state: Array6<i32>,
-        // Spanning planes (replicas, 4, max(T,X,Y,Z), max(T,X,Y,Z))
-        planes: Option<Array4<i32>>,
-    },
+/// A state in the language of integer plaquettes
+struct DualState {
     // Shape (replicas, T, X, Y, Z, 5)
-    Plaquettes(Array6<i32>),
+    plaquettes: Array6<i32>,
 }
 
 impl DualState {
-    fn new_volumes(state: Array6<i32>, planes: Option<Array4<i32>>) -> Self {
-        Self::Volumes { state, planes }
+    fn new_plaquettes(plaquettes: Array6<i32>) -> Self {
+        assert_eq!(plaquettes.shape()[5], 6);
+        Self { plaquettes }
     }
-    fn new_plaquettes(state: Array6<i32>) -> Self {
-        Self::Plaquettes(state)
+
+    fn new_volumes(volumes: Array6<i32>) -> Self {
+        assert_eq!(volumes.shape()[5], 4);
+        let mut shape = volumes.shape().to_vec();
+        shape[5] = 6;
+        let new_shape: [usize; 6] = shape.clone().try_into().unwrap();
+        let mut plaquettes = Array6::<i32>::zeros(new_shape);
+
+        const CUBE_TYPES_FOR_PLANE_TYPE: [[usize; 2]; 6] = [
+            [0, 1], // tx -- txy, txz
+            [2, 3], // ty -- tyz, xyz
+            [1, 2], // tz -- txz, tyz
+            [0, 3], // xy -- txy, xyz
+            [1, 3], // xz -- txz, xyz
+            [2, 3], // yz -- tyz, xyz
+        ];
+        const NORMAL_DIM_FOR_CUBE_PLANEINDEX: [[usize; 2]; 6] = [
+            [2, 3], // tx: y, z
+            [1, 3], // ty: x, z
+            [1, 2], // tz: x, y
+            [0, 3], // xy: t, z
+            [0, 2], // xz: t, y
+            [0, 1], // yz: t, x
+        ];
+        const SIGN_CONVENTION: [[i32; 6]; 4] = [
+            [1, -1, 0, 1, 0, 0],
+            [1, 0, -1, 0, 1, 0],
+            [0, 1, -1, 0, 0, 1],
+            [0, 0, 0, 1, -1, 1],
+        ];
+
+        let bounds = &shape[1..5];
+        ndarray::Zip::indexed(&mut plaquettes).for_each(
+            |(r, t, x, y, z, p): (usize, usize, usize, usize, usize, usize), np: &mut i32| {
+                let cubes = &CUBE_TYPES_FOR_PLANE_TYPE[p];
+                let normals = &NORMAL_DIM_FOR_CUBE_PLANEINDEX[p];
+                for (cube_type, normal) in cubes.iter().zip(normals) {
+                    let mut coords = [r, t, x, y, z, *cube_type];
+                    let cube_val = volumes[coords];
+                    coords[1 + *normal] =
+                        (coords[1 + *normal] + bounds[*normal] - 1) % bounds[*normal];
+                    let lower_cube_val = volumes[coords];
+                    *np += SIGN_CONVENTION[*cube_type][p] * (cube_val - lower_cube_val);
+                }
+            },
+        );
+        Self::new_plaquettes(plaquettes)
     }
 }
 
@@ -76,12 +107,7 @@ impl CudaBackend {
             .load_ptx(
                 local_updates_ptx,
                 "gauge_kernel",
-                &[
-                    "single_local_update_cubes",
-                    "single_local_update_plaquettes",
-                    "calculate_plaquettes",
-                    "calculate_edge_sums",
-                ],
+                &["single_local_update_plaquettes", "calculate_edge_sums"],
             )
             .map_err(CudaError::from)?;
 
@@ -103,53 +129,13 @@ impl CudaBackend {
 
         let state = match dual_initial_state {
             None => {
-                let state_buffer_size = Self::calculate_state_volumes(nreplicas, &bounds);
-                let mut state_buffer = device
-                    .alloc_zeros::<i32>(state_buffer_size)
+                let num_plaquettes = nreplicas * t * x * y * z * 6;
+                let state_buffer = device
+                    .alloc_zeros::<i32>(num_plaquettes)
                     .map_err(CudaError::from)?;
-                let num_spanning_planes = Self::calculate_global_updates_planes(nreplicas, &bounds);
-                let mut winding_buffer = device
-                    .alloc_zeros::<i32>(num_spanning_planes)
-                    .map_err(CudaError::from)?;
-                CudaState::Volumes {
-                    volumes: state_buffer,
-                    planes: winding_buffer,
-                }
+                state_buffer
             }
-            Some(DualState::Volumes {
-                state: mv,
-                planes: spanning_planes,
-            }) => {
-                // Set up the initial state
-                let initial_state = mv.iter().copied().collect::<Vec<_>>();
-                let state_buffer_size = Self::calculate_state_volumes(nreplicas, &bounds);
-                debug_assert_eq!(initial_state.len(), state_buffer_size);
-
-                let mut state_buffer = device
-                    .alloc_zeros::<i32>(state_buffer_size)
-                    .map_err(CudaError::from)?;
-                device
-                    .htod_copy_into(initial_state, &mut state_buffer)
-                    .map_err(CudaError::from)?;
-
-                // Set up the winding state
-                let num_spanning_planes = Self::calculate_global_updates_planes(nreplicas, &bounds);
-                let mut winding_buffer = device
-                    .alloc_zeros::<i32>(num_spanning_planes)
-                    .map_err(CudaError::from)?;
-                if let Some(spanning_planes) = spanning_planes {
-                    let winding_state = spanning_planes.iter().copied().collect::<Vec<_>>();
-                    debug_assert_eq!(winding_state.len(), num_spanning_planes);
-                    device
-                        .htod_copy_into(winding_state, &mut winding_buffer)
-                        .map_err(CudaError::from)?;
-                }
-                CudaState::Volumes {
-                    volumes: state_buffer,
-                    planes: winding_buffer,
-                }
-            }
-            Some(DualState::Plaquettes(plaquettes)) => {
+            Some(DualState { plaquettes }) => {
                 let num_plaquettes = nreplicas * t * x * y * z * 6;
                 debug_assert_eq!(plaquettes.len(), num_plaquettes);
                 let mut plaquette_buffer = device
@@ -159,7 +145,7 @@ impl CudaBackend {
                 device
                     .htod_copy_into(plaquettes, &mut plaquette_buffer)
                     .map_err(CudaError::from)?;
-                CudaState::Plaquettes(plaquette_buffer)
+                plaquette_buffer
             }
         };
 
@@ -212,48 +198,12 @@ impl CudaBackend {
 
     fn get_plaquettes(&mut self) -> Result<Array6<i32>, CudaError> {
         let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
-
-        let output = match &self.state {
-            CudaState::Volumes { .. } => {
-                let num_plaquettes = self.nreplicas * t * x * y * z * 6;
-
-                let mut plaquette_buffer = self
-                    .device
-                    .alloc_zeros::<i32>(num_plaquettes)
-                    .map_err(CudaError::from)?;
-
-                self.calculate_plaquettes(&mut plaquette_buffer)?;
-
-                self.device
-                    .dtoh_sync_copy(&plaquette_buffer)
-                    .map_err(CudaError::from)?
-            }
-            CudaState::Plaquettes(plaquette_buffer) => self
-                .device
-                .dtoh_sync_copy(plaquette_buffer)
-                .map_err(CudaError::from)?,
-        };
-
+        let output = self
+            .device
+            .dtoh_sync_copy(&self.state)
+            .map_err(CudaError::from)?;
         let plaquettes = Array6::from_shape_vec((self.nreplicas, t, x, y, z, 6), output).unwrap();
         Ok(plaquettes)
-    }
-
-    fn convert_to_plaquette_state(&mut self) -> Result<bool, CudaError> {
-        if matches!(&self.state, CudaState::Volumes { .. }) {
-            let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
-            let num_plaquettes = self.nreplicas * t * x * y * z * 6;
-
-            let mut plaquette_buffer = self
-                .device
-                .alloc_zeros::<i32>(num_plaquettes)
-                .map_err(CudaError::from)?;
-            self.calculate_plaquettes(&mut plaquette_buffer)?;
-
-            self.state = CudaState::Plaquettes(plaquette_buffer);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     fn get_edge_violations(&mut self) -> Result<Array6<i32>, CudaError> {
@@ -264,27 +214,13 @@ impl CudaBackend {
             .device
             .alloc_zeros::<i32>(num_edges)
             .map_err(CudaError::from)?;
-
-        match &mut self.state {
-            CudaState::Volumes { .. } => {
-                let num_plaquettes = self.nreplicas * t * x * y * z * 6;
-                let mut plaquette_buffer = self
-                    .device
-                    .alloc_zeros::<i32>(num_plaquettes)
-                    .map_err(CudaError::from)?;
-                self.calculate_plaquettes(&mut plaquette_buffer)?;
-                self.calculate_edge_violations(&mut edge_buffer, &plaquette_buffer)?;
-            }
-            CudaState::Plaquettes(plaquette_buffer) => {
-                Self::calculate_edge_violations_static(
-                    self.device.clone(),
-                    &mut edge_buffer,
-                    plaquette_buffer,
-                    self.bounds.clone(),
-                    self.nreplicas,
-                )?;
-            }
-        }
+        Self::calculate_edge_violations_static(
+            self.device.clone(),
+            &mut edge_buffer,
+            &self.state,
+            self.bounds.clone(),
+            self.nreplicas,
+        )?;
 
         let output = self
             .device
@@ -308,79 +244,34 @@ impl CudaBackend {
         let n = self.simultaneous_local_updates();
         let cfg = LaunchConfig::for_num_elems(n as u32);
 
-        match &mut self.state {
-            CudaState::Volumes {
-                volumes: state_buffer,
-                ..
-            } => {
-                let single_local_update = self
-                    .device
-                    .get_func("gauge_kernel", "single_local_update_cubes")
-                    .unwrap();
-                unsafe {
-                    single_local_update
-                        .launch(
-                            cfg,
-                            (
-                                state_buffer,
-                                &mut self.potential_buffer,
-                                self.potential_size,
-                                &mut self.rng_buffer,
-                                volume_type,
-                                offset,
-                                self.nreplicas,
-                                self.bounds.t,
-                                self.bounds.x,
-                                self.bounds.y,
-                                self.bounds.z,
-                            ),
-                        )
-                        .map_err(CudaError::from)
-                }
-            }
-            CudaState::Plaquettes(plaquettes_buffer) => {
-                let single_local_update = self
-                    .device
-                    .get_func("gauge_kernel", "single_local_update_plaquettes")
-                    .unwrap();
-                unsafe {
-                    single_local_update
-                        .launch(
-                            cfg,
-                            (
-                                plaquettes_buffer,
-                                &mut self.potential_buffer,
-                                self.potential_size,
-                                &mut self.rng_buffer,
-                                volume_type,
-                                offset,
-                                self.nreplicas,
-                                self.bounds.t,
-                                self.bounds.x,
-                                self.bounds.y,
-                                self.bounds.z,
-                            ),
-                        )
-                        .map_err(CudaError::from)
-                }
-            }
+        let single_local_update = self
+            .device
+            .get_func("gauge_kernel", "single_local_update_plaquettes")
+            .unwrap();
+        unsafe {
+            single_local_update
+                .launch(
+                    cfg,
+                    (
+                        &self.state,
+                        &mut self.potential_buffer,
+                        self.potential_size,
+                        &mut self.rng_buffer,
+                        volume_type,
+                        offset,
+                        self.nreplicas,
+                        self.bounds.t,
+                        self.bounds.x,
+                        self.bounds.y,
+                        self.bounds.z,
+                    ),
+                )
+                .map_err(CudaError::from)
         }
     }
 }
 
 impl CudaBackend {
-    fn state_volumes(&self) -> usize {
-        Self::calculate_simultaneous_local_updates(self.nreplicas, &self.bounds)
-    }
-
-    fn calculate_state_volumes(nreplicas: usize, bounds: &SiteIndex) -> usize {
-        nreplicas * Self::calculate_state_volumes_per_replica(bounds)
-    }
-
-    fn calculate_state_volumes_per_replica(bounds: &SiteIndex) -> usize {
-        bounds.t * bounds.x * bounds.y * bounds.z * 4
-    }
-
     fn simultaneous_local_updates(&self) -> usize {
         Self::calculate_simultaneous_local_updates(self.nreplicas, &self.bounds)
     }
@@ -441,41 +332,6 @@ impl CudaBackend {
             self.bounds.clone(),
             self.nreplicas,
         )
-    }
-
-    fn calculate_plaquettes(
-        &mut self,
-        plaquette_buffer: &mut CudaSlice<i32>,
-    ) -> Result<(), CudaError> {
-        if let CudaState::Volumes { volumes, planes } = &mut self.state {
-            let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
-            let num_plaquettes = self.nreplicas * t * x * y * z * 6;
-
-            let single_local_update = self
-                .device
-                .get_func("gauge_kernel", "calculate_plaquettes")
-                .unwrap();
-
-            let cfg = LaunchConfig::for_num_elems(num_plaquettes as u32);
-            unsafe {
-                single_local_update
-                    .launch(
-                        cfg,
-                        (
-                            volumes,
-                            plaquette_buffer,
-                            self.nreplicas,
-                            self.bounds.t,
-                            self.bounds.x,
-                            self.bounds.y,
-                            self.bounds.z,
-                        ),
-                    )
-                    .map_err(CudaError::from)
-            }
-        } else {
-            Ok(())
-        }
     }
 
     pub fn get_edges_with_violations(
@@ -599,7 +455,7 @@ mod tests {
         let (r, t, x, y, z) = (1, 6, 6, 6, 6);
         let mut state = Array::zeros((r, t, x, y, z, 4));
         state[[0, 0, 0, 0, 0, 0]] = 1;
-        let state = DualState::new_volumes(state, None);
+        let state = DualState::new_volumes(state);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 2),
@@ -621,7 +477,7 @@ mod tests {
         let (r, t, x, y, z) = (1, 6, 6, 6, 6);
         let mut state = Array::zeros((r, t, x, y, z, 4));
         state[[0, 0, 0, 0, 0, 0]] = 1;
-        let state = DualState::new_volumes(state, None);
+        let state = DualState::new_volumes(state);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 2),
@@ -645,7 +501,7 @@ mod tests {
         for i in 0..4 {
             let mut state = Array::zeros((r, t, x, y, z, 4));
             state[[0, 0, 0, 0, 0, i]] = 1;
-            let state = DualState::new_volumes(state, None);
+            let state = DualState::new_volumes(state);
             let mut state = CudaBackend::new(
                 SiteIndex::new(t, x, y, z),
                 make_potentials(r, 2),
@@ -667,7 +523,7 @@ mod tests {
         let (r, t, x, y, z) = (12, 6, 6, 6, 6);
         for _ in 0..10 {
             let state = Array6::random((r, t, x, y, z, 4), Uniform::new(-32, 32));
-            let state = DualState::new_volumes(state, None);
+            let state = DualState::new_volumes(state);
             let mut state = CudaBackend::new(
                 SiteIndex::new(t, x, y, z),
                 make_potentials(r, 2),
@@ -693,7 +549,7 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
-            Some(DualState::Plaquettes(plaquette_state)),
+            Some(DualState::new_plaquettes(plaquette_state)),
             None,
             None,
         )?;
@@ -712,7 +568,7 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
-            Some(DualState::Plaquettes(plaquette_state)),
+            Some(DualState::new_plaquettes(plaquette_state)),
             None,
             None,
         )?;
@@ -732,7 +588,7 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
-            Some(DualState::Plaquettes(plaquette_state)),
+            Some(DualState::new_plaquettes(plaquette_state)),
             None,
             None,
         )?;
@@ -760,7 +616,7 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
-            Some(DualState::Plaquettes(plaquette_state)),
+            Some(DualState::new_plaquettes(plaquette_state)),
             None,
             None,
         )?;
@@ -788,7 +644,7 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
-            Some(DualState::Plaquettes(plaquette_state)),
+            Some(DualState::new_plaquettes(plaquette_state)),
             None,
             None,
         )?;
@@ -816,7 +672,7 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
-            Some(DualState::Plaquettes(plaquette_state)),
+            Some(DualState::new_plaquettes(plaquette_state)),
             None,
             None,
         )?;
@@ -842,7 +698,7 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
-            Some(DualState::Plaquettes(plaquette_state)),
+            Some(DualState::new_plaquettes(plaquette_state)),
             None,
             None,
         )?;
@@ -858,7 +714,7 @@ mod tests {
         let (r, t, x, y, z) = (1, 6, 6, 6, 6);
         let mut state = Array::zeros((r, t, x, y, z, 4));
         state[[0, 0, 0, 0, 0, 0]] = 1;
-        let state = DualState::new_volumes(state, None);
+        let state = DualState::new_volumes(state);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
@@ -879,7 +735,7 @@ mod tests {
         let mut state = Array::zeros((r, t, x, y, z, 4));
         state[[0, 0, 0, 0, 0, 0]] = 1;
         state[[0, 1, 0, 0, 0, 0]] = 1;
-        let state = DualState::new_volumes(state, None);
+        let state = DualState::new_volumes(state);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(r, 32),
@@ -901,10 +757,9 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(nreplicas, 32),
-            Some(DualState::new_volumes(
-                Array::zeros((nreplicas, t, x, y, z, 4)),
-                None,
-            )),
+            Some(DualState::new_volumes(Array::zeros((
+                nreplicas, t, x, y, z, 4,
+            )))),
             None,
             None,
         )?;
@@ -932,7 +787,7 @@ mod tests {
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_potentials(nreplicas, 32),
-            Some(DualState::Plaquettes(Array6::zeros((
+            Some(DualState::new_plaquettes(Array6::zeros((
                 nreplicas, t, x, y, z, 6,
             )))),
             None,
