@@ -139,10 +139,10 @@ impl CudaBackend {
         let state = match dual_initial_state {
             None => {
                 let num_plaquettes = nreplicas * t * x * y * z * 6;
-                let state_buffer = device
+                
+                device
                     .alloc_zeros::<i32>(num_plaquettes)
-                    .map_err(CudaError::from)?;
-                state_buffer
+                    .map_err(CudaError::from)?
             }
             Some(DualState { plaquettes }) => {
                 let num_plaquettes = nreplicas * t * x * y * z * 6;
@@ -296,7 +296,7 @@ impl CudaBackend {
         let subslice = sum_buffer.slice(0..self.nreplicas);
         self.device
             .dtoh_sync_copy(&subslice)
-            .map(|x| Array1::from_vec(x))
+            .map(Array1::from_vec)
             .map_err(CudaError::from)
     }
 

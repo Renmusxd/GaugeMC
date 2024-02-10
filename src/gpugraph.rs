@@ -1891,7 +1891,7 @@ mod gpu_tests {
         // energetically preferable to swap back.
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.set_parallel_tempering_method(ParallelTemperingOption::Gpu);
-        let energies = s.get_energy(None)?;
+        let _energies = s.get_energy(None)?;
         s.swap_replica_potentials(0, 4, repeat(true));
         let swapped_energy = s.get_energy(None)?;
         let swap_state = s.get_state(None)?;
@@ -1913,7 +1913,7 @@ mod gpu_tests {
         let mut s = make_replica_value_state(4, 4, 4, 4, 4)?;
         s.set_parallel_tempering_method(ParallelTemperingOption::Cpu);
 
-        let energies = s.get_energy(None)?;
+        let _energies = s.get_energy(None)?;
         s.swap_replica_potentials(0, 4, repeat(true));
         let swapped_energy = s.get_energy(None)?;
         let swap_state = s.get_state(None)?;
