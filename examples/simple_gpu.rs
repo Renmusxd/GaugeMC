@@ -1,4 +1,3 @@
-use env_logger;
 use gaugemc::{GPUBackend, NDDualGraph, SiteIndex};
 use ndarray::{Array2, Array6, Axis};
 

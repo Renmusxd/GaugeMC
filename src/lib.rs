@@ -6,6 +6,8 @@ pub mod dualgraph;
 pub mod gpugraph;
 mod util;
 
+#[cfg(feature = "gpu-cuda")]
+pub use cudagraph::*;
 pub use dualgraph::*;
 #[cfg(feature = "gpu-wgpu")]
 pub use gpugraph::*;

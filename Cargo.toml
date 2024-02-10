@@ -26,3 +26,11 @@ features = ["rayon"]
 [dev-dependencies]
 env_logger = ">=0.11"
 pollster = ">=0.3"
+
+[[example]]
+name = "simple_gpu"
+required-features = ["gpu-wgpu"]
+
+[[example]]
+name = "simple_cuda"
+required-features = ["gpu-cuda"]

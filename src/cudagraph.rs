@@ -10,7 +10,7 @@ use ndarray_rand::rand::{random, thread_rng};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-struct CudaBackend {
+pub struct CudaBackend {
     nreplicas: usize,
     bounds: SiteIndex,
     potential_size: usize,
@@ -24,18 +24,18 @@ struct CudaBackend {
 }
 
 /// A state in the language of integer plaquettes
-struct DualState {
+pub struct DualState {
     // Shape (replicas, T, X, Y, Z, 5)
     plaquettes: Array6<i32>,
 }
 
 impl DualState {
-    fn new_plaquettes(plaquettes: Array6<i32>) -> Self {
+    pub fn new_plaquettes(plaquettes: Array6<i32>) -> Self {
         assert_eq!(plaquettes.shape()[5], 6);
         Self { plaquettes }
     }
 
-    fn new_volumes(volumes: Array6<i32>) -> Self {
+    pub fn new_volumes(volumes: Array6<i32>) -> Self {
         assert_eq!(volumes.shape()[5], 4);
         let mut shape = volumes.shape().to_vec();
         shape[5] = 6;
@@ -246,7 +246,7 @@ impl CudaBackend {
     }
 
     fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
-        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let (t, x, y, _) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let mut threads_to_sum = self.nreplicas * t * x * y; // each thread starts with z*6
 
         let mut sum_buffer = self
@@ -280,7 +280,7 @@ impl CudaBackend {
         };
 
         // Now for each of y, x, t, and r: sum the potentials
-        for n in [y, x, t, self.nreplicas] {
+        for n in [y, x, t] {
             threads_to_sum /= n;
 
             let cfg = LaunchConfig::for_num_elems(threads_to_sum as u32);
@@ -300,7 +300,7 @@ impl CudaBackend {
             .map_err(CudaError::from)
     }
 
-    fn run_local_update_sweep(&mut self) -> Result<(), CudaError> {
+    pub fn run_local_update_sweep(&mut self) -> Result<(), CudaError> {
         let mut rng = thread_rng();
         let mut local_update_types = self.local_update_types.take().unwrap();
         local_update_types.shuffle(&mut rng);
@@ -448,7 +448,7 @@ impl CudaBackend {
 }
 
 #[derive(Debug)]
-enum CudaError {
+pub enum CudaError {
     Value(String),
     Compile(CompileError),
     Driver(DriverError),
@@ -487,9 +487,19 @@ mod tests {
     use ndarray_rand::RandomExt;
     use num_traits::Zero;
 
-    fn make_potentials(nreplicas: usize, npots: usize) -> Array2<f32> {
+    fn make_simple_potentials(nreplicas: usize, npots: usize) -> Array2<f32> {
         let mut pots = Array2::zeros((nreplicas, npots));
         ndarray::Zip::indexed(&mut pots).for_each(|(_, p), x| *x = 0.5 * p.pow(2) as f32);
+
+        pots
+    }
+
+    fn make_custom_simple_potentials<F>(nreplicas: usize, npots: usize, f: F) -> Array2<f32>
+    where
+        F: Fn(usize, usize) -> f32,
+    {
+        let mut pots = Array2::zeros((nreplicas, npots));
+        ndarray::Zip::indexed(&mut pots).for_each(|(r, np), x| *x = f(r, np));
 
         pots
     }
@@ -498,7 +508,7 @@ mod tests {
     fn test_construction() -> Result<(), CudaError> {
         let _state = CudaBackend::new(
             SiteIndex::new(6, 8, 10, 12),
-            make_potentials(4, 32),
+            make_simple_potentials(4, 32),
             None,
             Some(31415),
             None,
@@ -509,7 +519,7 @@ mod tests {
     fn test_simple_launch() -> Result<(), CudaError> {
         let mut state = CudaBackend::new(
             SiteIndex::new(4, 4, 4, 4),
-            make_potentials(1, 2),
+            make_simple_potentials(1, 2),
             None,
             Some(31415),
             None,
@@ -521,7 +531,7 @@ mod tests {
     fn test_get_plaquettes() -> Result<(), CudaError> {
         let mut state = CudaBackend::new(
             SiteIndex::new(4, 4, 4, 4),
-            make_potentials(1, 2),
+            make_simple_potentials(1, 2),
             None,
             Some(31415),
             None,
@@ -538,7 +548,7 @@ mod tests {
         state[[0, 0, 0, 0, 0, 0]] = 1;
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 2),
+            make_simple_potentials(r, 2),
             Some(DualState::new_volumes(state)),
             Some(31415),
             None,
@@ -560,7 +570,7 @@ mod tests {
         let state = DualState::new_volumes(state);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 2),
+            make_simple_potentials(r, 2),
             Some(state),
             Some(31415),
             None,
@@ -584,7 +594,7 @@ mod tests {
             let state = DualState::new_volumes(state);
             let mut state = CudaBackend::new(
                 SiteIndex::new(t, x, y, z),
-                make_potentials(r, 2),
+                make_simple_potentials(r, 2),
                 Some(state),
                 None,
                 None,
@@ -606,7 +616,7 @@ mod tests {
             let state = DualState::new_volumes(state);
             let mut state = CudaBackend::new(
                 SiteIndex::new(t, x, y, z),
-                make_potentials(r, 2),
+                make_simple_potentials(r, 2),
                 Some(state),
                 None,
                 None,
@@ -628,7 +638,7 @@ mod tests {
         plaquette_state[[0, 0, 0, 0, 0, 0]] = 1;
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
@@ -647,7 +657,7 @@ mod tests {
         plaquette_state[[0, 1, 0, 0, 0, 0]] = 1;
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
@@ -667,7 +677,7 @@ mod tests {
         plaquette_state[[0, 0, 0, 0, 0, 3]] = 1; // xy
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
@@ -695,7 +705,7 @@ mod tests {
 
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
@@ -723,7 +733,7 @@ mod tests {
 
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
@@ -751,7 +761,7 @@ mod tests {
 
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
@@ -777,7 +787,7 @@ mod tests {
 
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
@@ -797,7 +807,7 @@ mod tests {
         let state = DualState::new_volumes(state);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(state),
             Some(31415),
             None,
@@ -818,7 +828,7 @@ mod tests {
         let state = DualState::new_volumes(state);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_simple_potentials(r, 32),
             Some(state),
             Some(31415),
             None,
@@ -843,7 +853,7 @@ mod tests {
         let (t, x, y, z) = (8, 8, 8, 8);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(nreplicas, 32),
+            make_simple_potentials(nreplicas, 32),
             Some(DualState::new_volumes(Array::zeros((
                 nreplicas, t, x, y, z, 4,
             )))),
@@ -875,7 +885,7 @@ mod tests {
         let (t, x, y, z) = (8, 8, 8, 8);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(nreplicas, 32),
+            make_simple_potentials(nreplicas, 32),
             Some(DualState::new_plaquettes(Array6::zeros((
                 nreplicas, t, x, y, z, 6,
             )))),
@@ -907,7 +917,7 @@ mod tests {
         let (t, x, y, z) = (8, 8, 8, 8);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(nreplicas, 32),
+            make_simple_potentials(nreplicas, 32),
             Some(DualState::new_plaquettes(Array6::zeros((
                 nreplicas, t, x, y, z, 6,
             )))),
@@ -936,32 +946,31 @@ mod tests {
 
     #[test]
     fn test_get_edges_constructed_full_cube_txy_energy() -> Result<(), CudaError> {
-        let (r, t, x, y, z) = (3, 4, 4, 4, 4);
+        let (r, t, x, y, z) = (4, 8, 8, 8, 8);
         let mut plaquette_state = Array::zeros((r, t, x, y, z, 6));
 
-        plaquette_state[[0, 0, 0, 0, 0, 0]] = 1; // tx
-        plaquette_state[[0, 0, 0, 1, 0, 0]] = -1; // tx + y
-
-        plaquette_state[[0, 0, 0, 0, 0, 1]] = -1; // ty
-        plaquette_state[[0, 0, 1, 0, 0, 1]] = 1; // ty + x
-
-        plaquette_state[[0, 0, 0, 0, 0, 3]] = 1; // xy
-        plaquette_state[[0, 1, 0, 0, 0, 3]] = -1; // xy + t
+        for i in 0..r {
+            plaquette_state[[i, 0, 0, 0, 0, 0]] = 1; // tx
+            plaquette_state[[i, 0, 0, 1, 0, 0]] = -1; // tx + y
+            plaquette_state[[i, 0, 0, 0, 0, 1]] = -1; // ty
+            plaquette_state[[i, 0, 1, 0, 0, 1]] = 1; // ty + x
+            plaquette_state[[i, 0, 0, 0, 0, 3]] = 1; // xy
+            plaquette_state[[i, 1, 0, 0, 0, 3]] = -1; // xy + t
+        }
 
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
-            make_potentials(r, 32),
+            make_custom_simple_potentials(r, 32, |r, np| ((r + 1) * np.pow(2)) as f32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
         )?;
         let edges = state.get_edge_violations()?;
         let nonzero = edges.iter().filter(|x| !x.is_zero()).count();
-
         assert_eq!(nonzero, 0);
 
         let actions = state.get_action_per_replica()?;
-        assert_eq!(actions, Array1::from_vec(vec![3.0, 0.0, 0.0]));
+        assert_eq!(actions, Array1::from_vec(vec![6.0, 12.0, 18.0, 24.0]));
 
         Ok(())
     }

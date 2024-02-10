@@ -126,11 +126,15 @@ extern "C" __global__ void partial_sum_energies(int* plaquette_buffer, float* su
     if (globalThreadNum >= num_threads) {
         return;
     }
-    int replica_index = globalThreadNum / (t * x * y);
+    // We work in reverse for this.
+    // Interleave the replicas (0, 1, 2, 0, 1, 2, ...)
+    int replica_index = globalThreadNum % replicas;
+    int in_replica_index = globalThreadNum / replicas;
+    int replica_offset = replica_index * (t * x * y * z * 6);
 
     float pot = 0.0;
     for (int i = 0; i < z * 6; i++) {
-        int np = plaquette_buffer[(globalThreadNum * z * 6) + i];
+        int np = plaquette_buffer[replica_offset + (in_replica_index * z * 6) + i];
         pot += potential_buffer[(replica_index * potential_vector_size) + abs(np)];
     }
     sum_buffer[globalThreadNum] = pot;
