@@ -211,6 +211,10 @@ impl CudaBackend {
         })
     }
 
+    fn wait_for_gpu(&mut self) -> Result<(), CudaError> {
+        self.device.synchronize().map_err(CudaError::from)
+    }
+
     fn get_plaquettes(&mut self) -> Result<Array6<i32>, CudaError> {
         let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let output = self
