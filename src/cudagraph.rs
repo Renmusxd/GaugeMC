@@ -116,6 +116,7 @@ impl CudaBackend {
                     "calculate_edge_sums",
                     "partial_sum_energies",
                     "sum_buffer",
+                    "global_update_sweep",
                 ],
             )
             .map_err(CudaError::from)?;
@@ -139,7 +140,7 @@ impl CudaBackend {
         let state = match dual_initial_state {
             None => {
                 let num_plaquettes = nreplicas * t * x * y * z * 6;
-                
+
                 device
                     .alloc_zeros::<i32>(num_plaquettes)
                     .map_err(CudaError::from)?
@@ -245,6 +246,40 @@ impl CudaBackend {
         Ok(edges)
     }
 
+    fn global_update_sweep(&mut self) -> Result<(), CudaError> {
+        let update_planes = self.global_updates_planes();
+
+        // Can we not subslice it?
+        self.cuda_rng
+            .fill_with_uniform(&mut self.rng_buffer)
+            .map_err(CudaError::from)?;
+
+        let cfg = LaunchConfig::for_num_elems(update_planes as u32);
+        let global_update = self
+            .device
+            .get_func("gauge_kernel", "global_update_sweep")
+            .unwrap();
+        unsafe {
+            global_update
+                .launch(
+                    cfg,
+                    (
+                        &self.state,
+                        &mut self.potential_buffer,
+                        &self.potential_redirect_buffer,
+                        self.potential_size,
+                        &mut self.rng_buffer,
+                        self.nreplicas,
+                        self.bounds.t,
+                        self.bounds.x,
+                        self.bounds.y,
+                        self.bounds.z,
+                    ),
+                )
+                .map_err(CudaError::from)
+        }
+    }
+
     fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
         let (t, x, y, _) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let mut threads_to_sum = self.nreplicas * t * x * y; // each thread starts with z*6
@@ -268,6 +303,7 @@ impl CudaBackend {
                         &self.state,
                         &mut sum_buffer,
                         &mut self.potential_buffer,
+                        &self.potential_redirect_buffer,
                         self.potential_size,
                         self.nreplicas,
                         self.bounds.t,
@@ -336,6 +372,7 @@ impl CudaBackend {
                     (
                         &self.state,
                         &mut self.potential_buffer,
+                        &self.potential_redirect_buffer,
                         self.potential_size,
                         &mut self.rng_buffer,
                         volume_type,
@@ -482,7 +519,7 @@ impl From<CurandError> for CudaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array;
+    use ndarray::{Array, Axis};
     use ndarray_rand::rand_distr::Uniform;
     use ndarray_rand::RandomExt;
     use num_traits::Zero;
@@ -972,6 +1009,100 @@ mod tests {
         let actions = state.get_action_per_replica()?;
         assert_eq!(actions, Array1::from_vec(vec![6.0, 12.0, 18.0, 24.0]));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_simple_global_launch() -> Result<(), CudaError> {
+        let (r, d) = (3, 4);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_custom_simple_potentials(r, 32, |r, n| (r * n.pow(2)) as f32),
+            None,
+            Some(31415),
+            None,
+        )?;
+        state.global_update_sweep()?;
+
+        let plaqs = state.get_plaquettes()?;
+        // We should get global planes in replica 0 and nowhere else.
+        let nonzero = plaqs
+            .axis_iter(Axis(0))
+            .map(|x| x.iter().copied().filter(|x| !x.is_zero()).count())
+            .collect::<Vec<_>>();
+
+        // Check planes
+        let planes_sliding = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+        let planes_indexing = [(2, 3), (1, 3), (1, 2), (0, 2), (0, 2), (0, 1)];
+
+        for p in 0..6 {
+            let (sliding_a, sliding_b) = planes_sliding[p];
+            let (indexing_a, indexing_b) = planes_indexing[p];
+            for rr in 0..r {
+                let mut coords = [rr, 0, 0, 0, 0, p];
+
+                for i in 0..d {
+                    for j in 0..d {
+                        coords[indexing_a + 1] = i;
+                        coords[indexing_b + 1] = j;
+                        let comp_val = plaqs[coords];
+                        for k in 0..d {
+                            for l in 0..d {
+                                coords[sliding_a + 1] = k;
+                                coords[sliding_b + 1] = l;
+                                assert_eq!(
+                                    plaqs[coords], comp_val,
+                                    "Value at {:?} is {} not {}",
+                                    coords, plaqs[coords], comp_val
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_ne!(nonzero[0], 0);
+        assert_eq!(nonzero[0] % (d * d), 0);
+        for rr in 1..r {
+            assert_eq!(nonzero[rr], 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_global_undo_planes() -> Result<(), CudaError> {
+        let (r, d) = (3, 4);
+
+        let mut state = Array6::zeros((r, d, d, d, d, 6));
+        ndarray::Zip::indexed(&mut state).for_each(|(_, _, _, _, _, p), x| {
+            if p % 2 == 0 {
+                *x = 1;
+            } else {
+                *x = -1;
+            }
+        });
+
+        let state = DualState::new_plaquettes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_custom_simple_potentials(r, 32, |_, n| n as f32 * 10.0),
+            Some(state),
+            Some(31415),
+            None,
+        )?;
+        state.global_update_sweep()?;
+
+        let plaqs = state.get_plaquettes()?;
+        // We should get global planes in replica 0 and nowhere else.
+        let nonzero = plaqs
+            .axis_iter(Axis(0))
+            .map(|x| x.iter().copied().filter(|x| !x.is_zero()).count())
+            .collect::<Vec<_>>();
+
+        for rr in 0..r {
+            assert_eq!(nonzero[rr], 0);
+        }
         Ok(())
     }
 }

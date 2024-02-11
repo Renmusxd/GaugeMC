@@ -81,6 +81,114 @@ __device__ int get_edge_sum_from_plaquettes(int* plaquette_buffer, int edge_type
 }
 
 
+extern "C" __global__ void sum_buffer(float* buffer, int num_threads, int num_steps)
+{
+    int globalThreadNum = get_thread_number();
+    if (globalThreadNum >= num_threads) {
+        return;
+    }
+    for (int i = 1; i < num_steps; i++) {
+        buffer[globalThreadNum] += buffer[globalThreadNum + (i * num_threads)];
+        buffer[globalThreadNum + (i * num_threads)] = 0.0;
+    }
+}
+
+extern "C" __global__ void global_update_sweep(int* plaquette_buffer,
+        float* potential_buffer, int* potential_redirect, int potential_vector_size,
+        float* rng_buffer, int replicas, int t, int x, int y, int z)
+{
+    // tx : y * z
+    // ty : x * z
+    // tz : x * y
+    // xy : t * z
+    // xz : t * y
+    // yz : t * x
+    int num_planes_per_replica = t*(x+y+z) + x*(y+z) + y*z;
+    int globalThreadNum = get_thread_number();
+    if (globalThreadNum >= replicas * num_planes_per_replica) {
+        return;
+    }
+
+    int replica_index = globalThreadNum / num_planes_per_replica;
+    int inside_replica_index = globalThreadNum % num_planes_per_replica;
+    int planes_per_type[] = {y*z, x*z, x*y, t*z, t*y, t*x};
+    int dec = inside_replica_index;
+    int p = 0;
+    for (p = 0; p < 6 && dec >= planes_per_type[p]; p++) {
+        dec -= planes_per_type[p];
+    }
+    // We are in plane type p, with local index dec.
+    int plane_one_arr[] = {0, 0, 0, 1, 1, 2};
+    int plane_two_arr[] = {1, 2, 3, 2, 3, 3};
+    int index_one_arr[] = {2, 1, 1, 0, 0, 0};
+    int index_two_arr[] = {3, 3, 2, 3, 2, 1};
+
+    int plaquettes_per_txyzslice = 6;
+    int plaquettes_per_txyslice = z * plaquettes_per_txyzslice;
+    int plaquettes_per_txslice = y * plaquettes_per_txyslice;
+    int plaquettes_per_tslice = x * plaquettes_per_txslice;
+    int strides[] = {plaquettes_per_tslice, plaquettes_per_txslice, plaquettes_per_txyslice, plaquettes_per_txyzslice};
+    int bounds[] = {t,x,y,z};
+
+    // Plane one/two are 0 and 1 if dealing with a tx plane
+    int plane_one = plane_one_arr[p];
+    int plane_two = plane_two_arr[p];
+    // Indexed dim one/two are 2 and 3 if dealing with a tx plane
+    int indexed_dim_one = index_one_arr[p];
+    int indexed_dim_two = index_two_arr[p];
+
+    // First get the actual indices for indexed dims
+    // If dec is between 0 and bounds[a] * bounds[b].
+    // Divide by bounds[b] to get a_index, and mod for b_index
+    int a_index = dec / bounds[indexed_dim_two];
+    int b_index = dec % bounds[indexed_dim_two];
+
+    // Get offsets for replica and for indexing.
+    int replica_offset = replica_index * (t*x*y*z*6);
+    int potential_index = potential_redirect[replica_index];
+    int potential_offset = potential_index * potential_vector_size;
+
+    int plane_index_offset = a_index * strides[indexed_dim_one] + b_index * strides[indexed_dim_two];
+
+    float boltzman_weights[3] = {0.0,0.0,0.0};
+    for (int i = 0; i < bounds[plane_one]; i++) {
+        for (int j = 0; j < bounds[plane_two]; j++) {
+            // Iterate over plane
+            int offset = i*strides[plane_one] + j*strides[plane_two];
+            int np = plaquette_buffer[replica_offset + plane_index_offset + offset + p];
+            for (int k = 0; k < 3; k++) {
+                boltzman_weights[k] += potential_buffer[potential_offset + abs(np+k-1)];
+            }
+        }
+    }
+
+    float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
+    float total_weight = 0.0;
+    for (int i = 0; i < 3; i++) {
+        boltzman_weights[i] = exp(-boltzman_weights[i] + min_potential);
+        total_weight += boltzman_weights[i];
+    }
+
+    float rng = rng_buffer[globalThreadNum] * total_weight;
+    int j;
+    for (j = 0; j < 3; j++) {
+        rng -= boltzman_weights[j];
+        if (rng <= 0.0) {
+            break;
+        }
+    }
+
+    int delta = j-1;
+    for (int i = 0; i < bounds[plane_one]; i++) {
+        for (int j = 0; j < bounds[plane_two]; j++) {
+            // Iterate over plane
+            int offset = i*strides[plane_one] + j*strides[plane_two];
+            plaquette_buffer[replica_offset + plane_index_offset + offset + p] += delta;
+        }
+    }
+}
+
+
 // Sign convention.
 const int sign_convention[4][6] = {
     {1, -1, 0, 1, 0, 0},
@@ -102,20 +210,8 @@ const int normal_dim_for_cube_planeindex[4][3] = {
     {3, 2, 1}  // xyz - xy, xz, yz
 };
 
-extern "C" __global__ void sum_buffer(float* buffer, int num_threads, int num_steps)
-{
-    int globalThreadNum = get_thread_number();
-    if (globalThreadNum >= num_threads) {
-        return;
-    }
-    for (int i = 1; i < num_steps; i++) {
-        buffer[globalThreadNum] += buffer[globalThreadNum + (i * num_threads)];
-        buffer[globalThreadNum + (i * num_threads)] = 0.0;
-    }
-}
-
 extern "C" __global__ void partial_sum_energies(int* plaquette_buffer, float* sum_buffer,
-          float* potential_buffer, int potential_vector_size,
+          float* potential_buffer, int* potential_redirect, int potential_vector_size,
           int replicas, int t, int x, int y, int z)
 {
     // Go through each of the 6 plaquette types for each site
@@ -132,10 +228,13 @@ extern "C" __global__ void partial_sum_energies(int* plaquette_buffer, float* su
     int in_replica_index = globalThreadNum / replicas;
     int replica_offset = replica_index * (t * x * y * z * 6);
 
+    int potential_index = potential_redirect[replica_index];
+    int potential_offset = potential_index * potential_vector_size;
+
     float pot = 0.0;
     for (int i = 0; i < z * 6; i++) {
         int np = plaquette_buffer[replica_offset + (in_replica_index * z * 6) + i];
-        pot += potential_buffer[(replica_index * potential_vector_size) + abs(np)];
+        pot += potential_buffer[potential_offset + abs(np)];
     }
     sum_buffer[globalThreadNum] = pot;
 }
@@ -190,7 +289,7 @@ extern "C" __global__ void calculate_edge_sums(int* plaquette_buffer, int* edge_
 }
 
 extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
-          float* potential_buffer, int potential_vector_size,
+          float* potential_buffer, int* potential_redirect, int potential_vector_size,
           float* rng_buffer,
           unsigned short cube_type, bool offset,
           int replicas, int t, int x, int y, int z)
@@ -240,7 +339,8 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
     float boltzman_weights[3] = {0.0,0.0,0.0};
 
     // Calculate potentials into boltzman_weights
-    int potential_offset = replica_index * potential_vector_size;
+    int potential_index = potential_redirect[replica_index];
+    int potential_offset = potential_index * potential_vector_size;
     for (int i = 0; i<3; i++) {
         int plaquette_type = planes_for_cube[cube_type][i];
         int normal_dim = normal_dim_for_cube_planeindex[cube_type][i];
