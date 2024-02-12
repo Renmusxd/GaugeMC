@@ -74,7 +74,7 @@ __device__ int get_edge_sum_from_plaquettes(int* plaquette_buffer, int edge_type
             sign = -1;
         }
 
-        sum += sign * down_diff; // TODO fix sign
+        sum += sign * down_diff;
     }
 
     return sum;

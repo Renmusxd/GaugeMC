@@ -8,6 +8,7 @@ use ndarray::{Array1, Array2, Array6};
 use ndarray_rand::rand::prelude::SliceRandom;
 use ndarray_rand::rand::{random, thread_rng};
 use rayon::prelude::*;
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 pub struct CudaBackend {
@@ -211,11 +212,11 @@ impl CudaBackend {
         })
     }
 
-    fn wait_for_gpu(&mut self) -> Result<(), CudaError> {
+    pub fn wait_for_gpu(&mut self) -> Result<(), CudaError> {
         self.device.synchronize().map_err(CudaError::from)
     }
 
-    fn get_plaquettes(&mut self) -> Result<Array6<i32>, CudaError> {
+    pub fn get_plaquettes(&mut self) -> Result<Array6<i32>, CudaError> {
         let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let output = self
             .device
@@ -225,7 +226,7 @@ impl CudaBackend {
         Ok(plaquettes)
     }
 
-    fn get_edge_violations(&mut self) -> Result<Array6<i32>, CudaError> {
+    pub fn get_edge_violations(&mut self) -> Result<Array6<i32>, CudaError> {
         let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
 
         let num_edges = self.nreplicas * t * x * y * z * 4;
@@ -250,7 +251,7 @@ impl CudaBackend {
         Ok(edges)
     }
 
-    fn global_update_sweep(&mut self) -> Result<(), CudaError> {
+    pub fn global_update_sweep(&mut self) -> Result<(), CudaError> {
         let update_planes = self.global_updates_planes();
 
         // Can we not subslice it?
@@ -494,6 +495,13 @@ pub enum CudaError {
     Compile(CompileError),
     Driver(DriverError),
     Rand(CurandError),
+}
+
+impl Display for CudaError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // Not great but it'll do. TODO fix.
+        f.write_str(&format!("{:?}", self))
+    }
 }
 
 impl CudaError {
