@@ -162,8 +162,8 @@ extern "C" __global__ void global_update_sweep(int* plaquette_buffer,
         }
     }
     // Add chemical potential
-    boltzman_weights[0] += chemical_potential_buffer[potential_index];
-    boltzman_weights[2] -= chemical_potential_buffer[potential_index];
+    boltzman_weights[0] += chemical_potential_buffer[potential_index] * planes_per_type[p];
+    boltzman_weights[2] -= chemical_potential_buffer[potential_index] * planes_per_type[p];
 
     float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
     float total_weight = 0.0;

@@ -4,11 +4,11 @@ use cudarc::curand::result::CurandError;
 use cudarc::curand::CudaRng;
 use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx, CompileError};
-use ndarray::{Array1, Array2, Array6, ArrayView6, Axis};
+use ndarray::{Array1, Array2, Array6, ArrayView1, ArrayView6, Axis};
 use ndarray_rand::rand::prelude::SliceRandom;
-use ndarray_rand::rand::{random, thread_rng};
+use ndarray_rand::rand::{random, thread_rng, Rng};
 use rayon::prelude::*;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 pub struct CudaBackend {
@@ -29,7 +29,71 @@ pub struct CudaBackend {
 
 enum RedirectArrays {
     None,
-    Redirect(Array1<u32>),
+    Redirect {
+        redirect: Array1<u32>,
+        inverse: Array1<u32>,
+    },
+}
+
+impl RedirectArrays {
+    fn unwrap(&mut self, n: usize) -> (ArrayView1<u32>, ArrayView1<u32>) {
+        match self {
+            RedirectArrays::None => {
+                *self = Self::new((0..n as u32).collect::<Vec<_>>());
+                self.unwrap(n)
+            }
+            RedirectArrays::Redirect { redirect, inverse } => (redirect.view(), inverse.view()),
+        }
+    }
+
+    fn get_redirect(&self) -> Option<&[u32]> {
+        match self {
+            RedirectArrays::None => None,
+            RedirectArrays::Redirect { redirect, .. } => redirect.as_slice(),
+        }
+    }
+
+    fn new<Arr>(redirect: Arr) -> Self
+    where
+        Arr: Into<Array1<u32>>,
+    {
+        let redirect = redirect.into();
+        let mut inverse = redirect.clone();
+
+        for (i, r) in redirect.iter().enumerate() {
+            inverse[*r as usize] = i as u32;
+        }
+        Self::new_both(redirect, inverse)
+    }
+
+    fn new_both<Arr1, Arr2>(redirect: Arr1, inverse: Arr2) -> Self
+    where
+        Arr1: Into<Array1<u32>>,
+        Arr2: Into<Array1<u32>>,
+    {
+        let redirect = redirect.into();
+        let inverse = inverse.into();
+
+        debug_assert!(redirect
+            .iter()
+            .enumerate()
+            .all(|(i, x)| inverse[*x as usize] == i as u32));
+
+        let redirect = Array1::from_vec(redirect.into_iter().map(|x| x).collect::<Vec<_>>());
+        let inverse = Array1::from_vec(inverse.into_iter().map(|x| x).collect::<Vec<_>>());
+
+        Self::Redirect { redirect, inverse }
+    }
+}
+impl Debug for RedirectArrays {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RedirectArrays::None => f.write_str("[Identity]"),
+            RedirectArrays::Redirect { redirect, .. } => {
+                f.write_str(&format!("R{:?}", redirect.as_slice().unwrap()))
+            }
+        }
+    }
 }
 
 /// A state in the language of integer plaquettes
@@ -235,27 +299,70 @@ impl CudaBackend {
 
     pub fn permute_states(&mut self, permutation: &[usize]) -> Result<(), CudaError> {
         let in_order = Array1::from_vec((0..self.nreplicas as u32).collect::<Vec<_>>());
-        let mut redirect = match &self.potential_redirect_array {
-            RedirectArrays::None => in_order.clone(),
-            RedirectArrays::Redirect(redirect) => redirect.clone(),
-        };
-        let mut redirect_clone = redirect.clone();
-        redirect.iter_mut().enumerate().for_each(|(i, x)| {
-            *x = redirect_clone[permutation[i]];
-        });
-        redirect_clone
-            .iter_mut()
-            .zip(redirect.iter().copied())
-            .for_each(|(x, y)| *x = y);
+        let (plaquette_to_potential, potential_to_plaquette) =
+            self.potential_redirect_array.unwrap(self.nreplicas);
+
+        let mut new_redirect = vec![0; self.nreplicas];
+        for (pot_i, pot_j) in permutation.iter().copied().enumerate() {
+            let state_i = potential_to_plaquette[pot_i];
+            let state_j = potential_to_plaquette[pot_j];
+            new_redirect[state_i as usize] = plaquette_to_potential[state_j as usize];
+        }
 
         self.device
-            .htod_copy_into(redirect_clone.to_vec(), &mut self.potential_redirect_buffer)?;
-
-        if redirect == in_order {
+            .htod_copy_into(new_redirect.clone(), &mut self.potential_redirect_buffer)?;
+        let new_redirect = Array1::from_vec(new_redirect);
+        if new_redirect == in_order {
             self.potential_redirect_array = RedirectArrays::None;
         } else {
-            self.potential_redirect_array = RedirectArrays::Redirect(redirect);
+            self.potential_redirect_array = RedirectArrays::new(new_redirect);
         }
+
+        Ok(())
+    }
+
+    pub fn parallel_tempering_step(&mut self, swaps: &[(usize, usize)]) -> Result<(), CudaError> {
+        let mut rng = thread_rng();
+        let rand_values = (0..self.nreplicas).map(|_| rng.gen()).collect::<Vec<f32>>();
+        self.parallel_tempering_step_with_rand(swaps, &rand_values)
+    }
+
+    fn parallel_tempering_step_with_rand(
+        &mut self,
+        swaps: &[(usize, usize)],
+        random_values: &[f32],
+    ) -> Result<(), CudaError> {
+        let base_energies = self.get_action_per_replica()?;
+        let mut perm = (0..self.nreplicas).collect::<Vec<_>>();
+        for (a, b) in swaps.iter().copied() {
+            perm[a] = b;
+            perm[b] = a;
+        }
+        self.permute_states(&perm)?;
+        let swap_energies = self.get_action_per_replica()?;
+
+        for ((a, b), rng_value) in swaps.iter().copied().zip(random_values.iter().copied()) {
+            let base_energy = base_energies[a] + base_energies[b];
+            let swap_energy = swap_energies[a] + swap_energies[b];
+            let weight = if swap_energy < base_energy {
+                1.0 + f32::EPSILON
+            } else {
+                (-(swap_energy - base_energy)).exp()
+            };
+            // If swap energy is larger than base_energy: rng_value must be very small.
+
+            let should_swap = weight >= rng_value;
+            if should_swap {
+                // If swap desired, leave as is.
+                perm[a] = a;
+                perm[b] = b;
+            } else {
+                // If no swap desired, undo the previously added swap.
+                perm[a] = b;
+                perm[b] = a;
+            }
+        }
+        self.permute_states(&perm)?;
 
         Ok(())
     }
@@ -273,25 +380,22 @@ impl CudaBackend {
         let mut plaquettes =
             Array6::from_shape_vec((self.nreplicas, t, x, y, z, 6), output).unwrap();
 
-        match &self.potential_redirect_array {
-            RedirectArrays::None => Ok(plaquettes),
-            RedirectArrays::Redirect(redirect) => {
-                let plaquettes_clone = plaquettes.clone();
-                plaquettes_clone
-                    .axis_iter(Axis(0))
-                    .enumerate()
-                    .for_each(|(ir, x)| {
-                        plaquettes
-                            .index_axis_mut(Axis(0), redirect[ir] as usize)
-                            .iter_mut()
-                            .zip(x)
-                            .for_each(|(x, y)| {
-                                *x = *y;
-                            });
-                    });
-                Ok(plaquettes)
-            }
+        if let Some(redirect) = self.potential_redirect_array.get_redirect() {
+            let plaquettes_clone = plaquettes.clone();
+            plaquettes_clone
+                .axis_iter(Axis(0))
+                .enumerate()
+                .for_each(|(ir, x)| {
+                    plaquettes
+                        .index_axis_mut(Axis(0), redirect[ir] as usize)
+                        .iter_mut()
+                        .zip(x)
+                        .for_each(|(x, y)| {
+                            *x = *y;
+                        });
+                });
         }
+        Ok(plaquettes)
     }
 
     pub fn get_edge_violations(&mut self) -> Result<Array6<i32>, CudaError> {
@@ -315,7 +419,24 @@ impl CudaBackend {
             .dtoh_sync_copy(&edge_buffer)
             .map_err(CudaError::from)?;
 
-        let edges = Array6::from_shape_vec((self.nreplicas, t, x, y, z, 4), output).unwrap();
+        let mut edges = Array6::from_shape_vec((self.nreplicas, t, x, y, z, 4), output).unwrap();
+
+        if let Some(redirect) = self.potential_redirect_array.get_redirect() {
+            let edges_clone = edges.clone();
+            edges_clone
+                .axis_iter(Axis(0))
+                .enumerate()
+                .for_each(|(ir, x)| {
+                    edges
+                        .index_axis_mut(Axis(0), redirect[ir] as usize)
+                        .iter_mut()
+                        .zip(x)
+                        .for_each(|(x, y)| {
+                            *x = *y;
+                        });
+                });
+        }
+
         Ok(edges)
     }
 
@@ -386,23 +507,22 @@ impl CudaBackend {
             .map(|x| Array2::from_shape_vec((self.nreplicas, 6), x).unwrap())
             .map_err(CudaError::from)?;
 
-        match &self.potential_redirect_array {
-            RedirectArrays::None => Ok(windings),
-            RedirectArrays::Redirect(redirect) => {
-                let mut result = windings.clone();
-                windings
-                    .axis_iter(Axis(0))
-                    .enumerate()
-                    .for_each(|(ir, windings)| {
-                        let rr = redirect[ir];
-                        let mut write_axis = result.index_axis_mut(Axis(0), rr as usize);
-                        write_axis
-                            .iter_mut()
-                            .zip(windings)
-                            .for_each(|(x, y)| *x = *y);
-                    });
-                Ok(result)
-            }
+        if let Some(redirect) = self.potential_redirect_array.get_redirect() {
+            let mut result = windings.clone();
+            windings
+                .axis_iter(Axis(0))
+                .enumerate()
+                .for_each(|(ir, windings)| {
+                    let rr = redirect[ir];
+                    let mut write_axis = result.index_axis_mut(Axis(0), rr as usize);
+                    write_axis
+                        .iter_mut()
+                        .zip(windings)
+                        .for_each(|(x, y)| *x = *y);
+                });
+            Ok(result)
+        } else {
+            Ok(windings)
         }
     }
 
@@ -462,16 +582,15 @@ impl CudaBackend {
             .map(Array1::from_vec)
             .map_err(CudaError::from)?;
 
-        let mut energies = match &self.potential_redirect_array {
-            RedirectArrays::None => energies,
-            RedirectArrays::Redirect(redirect) => {
-                let mut result = energies.clone();
-                energies.iter().enumerate().for_each(|(ir, windings)| {
-                    let rr = redirect[ir];
-                    result[rr as usize] = *windings;
-                });
-                result
-            }
+        let mut energies = if let Some(redirect) = self.potential_redirect_array.get_redirect() {
+            let mut result = energies.clone();
+            energies.iter().enumerate().for_each(|(ir, windings)| {
+                let rr = redirect[ir];
+                result[rr as usize] = *windings;
+            });
+            result
+        } else {
+            energies
         };
 
         if let Some(chemical_potentials) = self.using_chemical_potential.take() {
@@ -679,7 +798,7 @@ impl From<CurandError> for CudaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{arr2, s, Array, Axis};
+    use ndarray::{arr1, arr2, s, Array, Axis};
     use ndarray_rand::rand_distr::Uniform;
     use ndarray_rand::RandomExt;
     use num_traits::Zero;
@@ -1245,8 +1364,8 @@ mod tests {
 
         assert_ne!(nonzero[0], 0);
         assert_eq!(nonzero[0] % (d * d), 0);
-        for rr in 1..r {
-            assert_eq!(nonzero[rr], 0);
+        for nonzero_val in &nonzero[1..r] {
+            assert_eq!(*nonzero_val, 0);
         }
         Ok(())
     }
@@ -1320,8 +1439,6 @@ mod tests {
         Ok(())
     }
 
-    // TODO add rearrange tests
-
     #[test]
     fn test_get_edges_single_inc_rotate() -> Result<(), CudaError> {
         let (r, t, x, y, z) = (5, 6, 6, 6, 6);
@@ -1358,5 +1475,170 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_get_edges_single_inc_rotate_swaps() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (5, 6, 6, 6, 6);
+        let mut state = Array::zeros((r, t, x, y, z, 4));
+        state[[0, 0, 0, 0, 0, 0]] = 1;
+        let state = DualState::new_volumes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_simple_potentials(r, 32),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+
+        assert_eq!(state.get_action_per_replica()?, arr1(&[3., 0., 0., 0., 0.]));
+        state.permute_states(&[1, 0, 2, 3, 4])?;
+        assert_eq!(state.get_action_per_replica()?, arr1(&[0., 3., 0., 0., 0.]));
+        state.permute_states(&[0, 2, 1, 3, 4])?;
+        assert_eq!(state.get_action_per_replica()?, arr1(&[0., 0., 3., 0., 0.]));
+        state.permute_states(&[0, 1, 3, 2, 4])?;
+        assert_eq!(state.get_action_per_replica()?, arr1(&[0., 0., 0., 3., 0.]));
+        state.permute_states(&[0, 1, 2, 4, 3])?;
+        assert_eq!(state.get_action_per_replica()?, arr1(&[0., 0., 0., 0., 3.]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reverse_order() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (5, 6, 6, 6, 6);
+        let mut state = Array::zeros((r, t, x, y, z, 4));
+        for rr in 0..r {
+            state[[rr, 0, 0, 0, 0, 0]] = (rr + 1) as i32;
+        }
+        let state = DualState::new_volumes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_custom_simple_potentials(r, 32, |r, n| ((r + 1) * n) as f32),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+
+        let expected_energies = (0..r)
+            .map(|rr| 6 * (rr + 1) * (rr + 1))
+            .map(|x| x as f32)
+            .collect::<Vec<_>>();
+        let energies = state.get_action_per_replica()?;
+
+        assert_eq!(energies, Array1::from_vec(expected_energies));
+
+        let mut perm = (0..r).collect::<Vec<_>>();
+        perm.reverse();
+        state.permute_states(&perm)?;
+        let energies = state.get_action_per_replica()?;
+
+        let expected_energies = (0..r)
+            .map(|rr| 6 * (rr + 1) * ((r + 1) - (rr + 1)))
+            .map(|x| x as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(energies, Array1::from_vec(expected_energies));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tempering() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (6, 8, 8, 8, 8);
+
+        // Make a state in reverse order: biggest ns in the last replica.
+        let mut state = Array::zeros((r, t, x, y, z, 4));
+        for rr in 0..r {
+            state[[rr, 0, 0, 0, 0, 0]] = (1 + rr) as i32;
+        }
+        let state = DualState::new_volumes(state);
+
+        // Make a potential which prefers big ns in the first replica.
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_custom_simple_potentials(r, 32, |r, n| ((r + 1) * n) as f32),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+
+        let perms_a = (0..r / 2).map(|x| (2 * x, 2 * x + 1)).collect::<Vec<_>>();
+        let perms_b = (0..(r - 1) / 2)
+            .map(|x| (2 * x + 1, 2 * (x + 1)))
+            .collect::<Vec<_>>();
+
+        let rands = (0..r / 2).map(|_| 0.5).collect::<Vec<_>>();
+        for i in 0..r {
+            state.parallel_tempering_step_with_rand(
+                if i % 2 == 0 { &perms_a } else { &perms_b },
+                &rands,
+            )?;
+        }
+
+        let plaquettes = state.get_plaquettes()?;
+        let sums = plaquettes
+            .axis_iter(Axis(0))
+            .map(|x| x.iter().map(|y| y.abs()).sum::<i32>() / 6)
+            .collect::<Vec<_>>();
+
+        let mut against = (0..r as i32).map(|x| x + 1).collect::<Vec<_>>();
+        against.reverse();
+        assert_eq!(sums, against);
+
+        // Run it again and make sure it doesn't change.
+
+        for i in 0..r {
+            state.parallel_tempering_step_with_rand(
+                if i % 2 == 0 { &perms_a } else { &perms_b },
+                &rands,
+            )?;
+        }
+
+        let plaquettes = state.get_plaquettes()?;
+        let sums = plaquettes
+            .axis_iter(Axis(0))
+            .map(|x| x.iter().map(|y| y.abs()).sum::<i32>() / 6)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sums, against);
+
+        Ok(())
+    }
+
     // TODO unit tests for chemical potentials.
+
+    #[test]
+    fn test_winding_chemical_potential() -> Result<(), CudaError> {
+        let (r, d) = (3, 8);
+
+        let mut state = Array6::zeros((r, d, d, d, d, 6));
+        state
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(rr, mut x)| {
+                for i in 0..rr {
+                    x.slice_mut(s![.., .., i, i, 0])
+                        .iter_mut()
+                        .for_each(|x| *x = 1);
+                }
+            });
+        let state = DualState::new_plaquettes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_custom_simple_potentials(r, 4, |_, _| 0.0),
+            Some(state),
+            Some(31415),
+            None,
+            Some(Array1::from_vec((0..r).map(|rr| (rr + 1) as f32).collect())),
+        )?;
+        let energies = state.get_action_per_replica()?;
+        assert_eq!(energies, arr1(&[0.0 * 1.0, 1.0 * 2.0, 2.0 * 3.0]));
+
+        state.permute_states(&[2, 1, 0])?;
+        let energies = state.get_action_per_replica()?;
+        assert_eq!(energies, arr1(&[2.0 * 1.0, 1.0 * 2.0, 0.0 * 3.0]));
+
+        Ok(())
+    }
 }
