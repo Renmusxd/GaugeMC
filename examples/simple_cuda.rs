@@ -26,6 +26,7 @@ fn main() -> Result<(), CudaError> {
         Some(DualState::new_plaquettes(init_state)),
         None,
         None,
+        None,
     )?;
 
     for _ in 0..steps_per_sample {

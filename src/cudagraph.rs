@@ -4,7 +4,7 @@ use cudarc::curand::result::CurandError;
 use cudarc::curand::CudaRng;
 use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx, CompileError};
-use ndarray::{Array1, Array2, Array6};
+use ndarray::{Array1, Array2, Array6, ArrayView6, Axis};
 use ndarray_rand::rand::prelude::SliceRandom;
 use ndarray_rand::rand::{random, thread_rng};
 use rayon::prelude::*;
@@ -18,19 +18,32 @@ pub struct CudaBackend {
     device: Arc<CudaDevice>,
     state: CudaSlice<i32>,
     potential_redirect_buffer: CudaSlice<u32>,
+    potential_redirect_array: RedirectArrays,
     potential_buffer: CudaSlice<f32>,
+    winding_chemical_potential_buffer: CudaSlice<f32>, // potential per plane
+    using_chemical_potential: Option<Array1<f32>>,
     rng_buffer: CudaSlice<f32>,
     cuda_rng: CudaRng,
     local_update_types: Option<Vec<(u16, bool)>>,
 }
 
+enum RedirectArrays {
+    None,
+    Redirect(Array1<u32>),
+}
+
 /// A state in the language of integer plaquettes
+#[derive(Clone)]
 pub struct DualState {
     // Shape (replicas, T, X, Y, Z, 5)
     plaquettes: Array6<i32>,
 }
 
 impl DualState {
+    pub fn get_plaquettes(&self) -> ArrayView6<i32> {
+        self.plaquettes.view()
+    }
+
     pub fn new_plaquettes(plaquettes: Array6<i32>) -> Self {
         assert_eq!(plaquettes.shape()[5], 6);
         Self { plaquettes }
@@ -94,6 +107,7 @@ impl CudaBackend {
         dual_initial_state: Option<DualState>,
         seed: Option<u64>,
         device_id: Option<usize>,
+        chemical_potential: Option<Array1<f32>>,
     ) -> Result<Self, CudaError> {
         let local_updates_ptx = compile_ptx(include_str!("kernels/cuda_kernel.cu"));
         let local_updates_ptx = match local_updates_ptx {
@@ -118,6 +132,7 @@ impl CudaBackend {
                     "partial_sum_energies",
                     "sum_buffer",
                     "global_update_sweep",
+                    "sum_winding",
                 ],
             )
             .map_err(CudaError::from)?;
@@ -138,27 +153,18 @@ impl CudaBackend {
             return CudaError::value_error("Replica number must be larger than 0");
         }
 
-        let state = match dual_initial_state {
-            None => {
-                let num_plaquettes = nreplicas * t * x * y * z * 6;
+        let num_plaquettes = nreplicas * t * x * y * z * 6;
 
-                device
-                    .alloc_zeros::<i32>(num_plaquettes)
-                    .map_err(CudaError::from)?
-            }
-            Some(DualState { plaquettes }) => {
-                let num_plaquettes = nreplicas * t * x * y * z * 6;
-                debug_assert_eq!(plaquettes.len(), num_plaquettes);
-                let mut plaquette_buffer = device
-                    .alloc_zeros::<i32>(num_plaquettes)
-                    .map_err(CudaError::from)?;
-                let plaquettes = plaquettes.into_iter().collect::<Vec<_>>();
-                device
-                    .htod_copy_into(plaquettes, &mut plaquette_buffer)
-                    .map_err(CudaError::from)?;
-                plaquette_buffer
-            }
-        };
+        let mut plaquette_buffer = device
+            .alloc_zeros::<i32>(num_plaquettes)
+            .map_err(CudaError::from)?;
+
+        if let Some(DualState { plaquettes }) = dual_initial_state {
+            let plaquettes = plaquettes.into_iter().collect::<Vec<_>>();
+            device
+                .htod_copy_into(plaquettes, &mut plaquette_buffer)
+                .map_err(CudaError::from)?;
+        }
 
         // Set up the potentials
         let vn = vn.iter().copied().collect::<Vec<_>>();
@@ -168,6 +174,18 @@ impl CudaBackend {
         device
             .htod_copy_into(vn, &mut potential_buffer)
             .map_err(CudaError::from)?;
+
+        let mut using_chemical_potential = None;
+        let mut winding_chemical_potential_buffer = device
+            .alloc_zeros::<f32>(nreplicas)
+            .map_err(CudaError::from)?;
+        if let Some(chemical_potential_arr) = chemical_potential {
+            let chemical_potential = chemical_potential_arr.iter().copied().collect::<Vec<_>>();
+            device
+                .htod_copy_into(chemical_potential, &mut winding_chemical_potential_buffer)
+                .map_err(CudaError::from)?;
+            using_chemical_potential = Some(chemical_potential_arr);
+        }
 
         // Set up the potentials redirect
         let vn_redirect = (0..nreplicas as u32).collect::<Vec<_>>();
@@ -203,13 +221,43 @@ impl CudaBackend {
             bounds,
             potential_size,
             device,
-            state,
+            state: plaquette_buffer,
             potential_redirect_buffer,
+            potential_redirect_array: RedirectArrays::None,
             potential_buffer,
+            winding_chemical_potential_buffer,
+            using_chemical_potential,
             rng_buffer,
             cuda_rng,
             local_update_types: Some(local_update_types),
         })
+    }
+
+    pub fn permute_states(&mut self, permutation: &[usize]) -> Result<(), CudaError> {
+        let in_order = Array1::from_vec((0..self.nreplicas as u32).collect::<Vec<_>>());
+        let mut redirect = match &self.potential_redirect_array {
+            RedirectArrays::None => in_order.clone(),
+            RedirectArrays::Redirect(redirect) => redirect.clone(),
+        };
+        let mut redirect_clone = redirect.clone();
+        redirect.iter_mut().enumerate().for_each(|(i, x)| {
+            *x = redirect_clone[permutation[i]];
+        });
+        redirect_clone
+            .iter_mut()
+            .zip(redirect.iter().copied())
+            .for_each(|(x, y)| *x = y);
+
+        self.device
+            .htod_copy_into(redirect_clone.to_vec(), &mut self.potential_redirect_buffer)?;
+
+        if redirect == in_order {
+            self.potential_redirect_array = RedirectArrays::None;
+        } else {
+            self.potential_redirect_array = RedirectArrays::Redirect(redirect);
+        }
+
+        Ok(())
     }
 
     pub fn wait_for_gpu(&mut self) -> Result<(), CudaError> {
@@ -222,8 +270,28 @@ impl CudaBackend {
             .device
             .dtoh_sync_copy(&self.state)
             .map_err(CudaError::from)?;
-        let plaquettes = Array6::from_shape_vec((self.nreplicas, t, x, y, z, 6), output).unwrap();
-        Ok(plaquettes)
+        let mut plaquettes =
+            Array6::from_shape_vec((self.nreplicas, t, x, y, z, 6), output).unwrap();
+
+        match &self.potential_redirect_array {
+            RedirectArrays::None => Ok(plaquettes),
+            RedirectArrays::Redirect(redirect) => {
+                let plaquettes_clone = plaquettes.clone();
+                plaquettes_clone
+                    .axis_iter(Axis(0))
+                    .enumerate()
+                    .for_each(|(ir, x)| {
+                        plaquettes
+                            .index_axis_mut(Axis(0), redirect[ir] as usize)
+                            .iter_mut()
+                            .zip(x)
+                            .for_each(|(x, y)| {
+                                *x = *y;
+                            });
+                    });
+                Ok(plaquettes)
+            }
+        }
     }
 
     pub fn get_edge_violations(&mut self) -> Result<Array6<i32>, CudaError> {
@@ -251,7 +319,7 @@ impl CudaBackend {
         Ok(edges)
     }
 
-    pub fn global_update_sweep(&mut self) -> Result<(), CudaError> {
+    pub fn run_global_update_sweep(&mut self) -> Result<(), CudaError> {
         let update_planes = self.global_updates_planes();
 
         // Can we not subslice it?
@@ -269,11 +337,12 @@ impl CudaBackend {
                 .launch(
                     cfg,
                     (
-                        &self.state,
-                        &mut self.potential_buffer,
+                        &mut self.state,
+                        &self.potential_buffer,
+                        &self.winding_chemical_potential_buffer,
                         &self.potential_redirect_buffer,
                         self.potential_size,
-                        &mut self.rng_buffer,
+                        &self.rng_buffer,
                         self.nreplicas,
                         self.bounds.t,
                         self.bounds.x,
@@ -285,7 +354,59 @@ impl CudaBackend {
         }
     }
 
-    fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
+    pub fn get_winding_per_replica(&mut self) -> Result<Array2<i32>, CudaError> {
+        let threads_to_sum = self.nreplicas * 6;
+        let mut sum_buffer = self
+            .device
+            .alloc_zeros::<i32>(threads_to_sum)
+            .map_err(CudaError::from)?;
+
+        let cfg = LaunchConfig::for_num_elems(threads_to_sum as u32);
+        let partial_sum_energies = self.device.get_func("gauge_kernel", "sum_winding").unwrap();
+
+        unsafe {
+            partial_sum_energies
+                .launch(
+                    cfg,
+                    (
+                        &self.state,
+                        &mut sum_buffer,
+                        self.nreplicas,
+                        self.bounds.t,
+                        self.bounds.x,
+                        self.bounds.y,
+                        self.bounds.z,
+                    ),
+                )
+                .map_err(CudaError::from)?
+        };
+        let windings = self
+            .device
+            .dtoh_sync_copy(&sum_buffer)
+            .map(|x| Array2::from_shape_vec((self.nreplicas, 6), x).unwrap())
+            .map_err(CudaError::from)?;
+
+        match &self.potential_redirect_array {
+            RedirectArrays::None => Ok(windings),
+            RedirectArrays::Redirect(redirect) => {
+                let mut result = windings.clone();
+                windings
+                    .axis_iter(Axis(0))
+                    .enumerate()
+                    .for_each(|(ir, windings)| {
+                        let rr = redirect[ir];
+                        let mut write_axis = result.index_axis_mut(Axis(0), rr as usize);
+                        write_axis
+                            .iter_mut()
+                            .zip(windings)
+                            .for_each(|(x, y)| *x = *y);
+                    });
+                Ok(result)
+            }
+        }
+    }
+
+    pub fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
         let (t, x, y, _) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let mut threads_to_sum = self.nreplicas * t * x * y; // each thread starts with z*6
 
@@ -335,10 +456,37 @@ impl CudaBackend {
 
         // Copy out the subslice.
         let subslice = sum_buffer.slice(0..self.nreplicas);
-        self.device
+        let energies = self
+            .device
             .dtoh_sync_copy(&subslice)
             .map(Array1::from_vec)
-            .map_err(CudaError::from)
+            .map_err(CudaError::from)?;
+
+        let mut energies = match &self.potential_redirect_array {
+            RedirectArrays::None => energies,
+            RedirectArrays::Redirect(redirect) => {
+                let mut result = energies.clone();
+                energies.iter().enumerate().for_each(|(ir, windings)| {
+                    let rr = redirect[ir];
+                    result[rr as usize] = *windings;
+                });
+                result
+            }
+        };
+
+        if let Some(chemical_potentials) = self.using_chemical_potential.take() {
+            let windings = self.get_winding_per_replica()?;
+            energies
+                .iter_mut()
+                .zip(windings.axis_iter(Axis(0)))
+                .zip(chemical_potentials.iter())
+                .map(|((a, b), c)| (a, b, c))
+                .enumerate()
+                .for_each(|(_r, (e, w, mu))| *e += w.sum() as f32 * (*mu));
+            self.using_chemical_potential = Some(chemical_potentials);
+        }
+
+        Ok(energies)
     }
 
     pub fn run_local_update_sweep(&mut self) -> Result<(), CudaError> {
@@ -443,7 +591,7 @@ impl CudaBackend {
         }
     }
 
-    fn calculate_edge_violations(
+    pub fn calculate_edge_violations(
         &mut self,
         edge_buffer: &mut CudaSlice<i32>,
         plaquette_buffer: &CudaSlice<i32>,
@@ -531,7 +679,7 @@ impl From<CurandError> for CudaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array, Axis};
+    use ndarray::{arr2, s, Array, Axis};
     use ndarray_rand::rand_distr::Uniform;
     use ndarray_rand::RandomExt;
     use num_traits::Zero;
@@ -561,6 +709,7 @@ mod tests {
             None,
             Some(31415),
             None,
+            None,
         )?;
         Ok(())
     }
@@ -571,6 +720,7 @@ mod tests {
             make_simple_potentials(1, 2),
             None,
             Some(31415),
+            None,
             None,
         )?;
         state.run_single_local_update_sweep(0, false)
@@ -583,6 +733,7 @@ mod tests {
             make_simple_potentials(1, 2),
             None,
             Some(31415),
+            None,
             None,
         )?;
         let plaquettes = state.get_plaquettes()?;
@@ -600,6 +751,7 @@ mod tests {
             make_simple_potentials(r, 2),
             Some(DualState::new_volumes(state)),
             Some(31415),
+            None,
             None,
         )?;
         let plaquettes = state.get_plaquettes()?;
@@ -622,6 +774,7 @@ mod tests {
             make_simple_potentials(r, 2),
             Some(state),
             Some(31415),
+            None,
             None,
         )?;
         let _plaquettes = state.get_plaquettes()?;
@@ -647,6 +800,7 @@ mod tests {
                 Some(state),
                 None,
                 None,
+                None,
             )?;
             let plaquettes = state.get_plaquettes()?;
             let nonzero = plaquettes.iter().filter(|x| !x.is_zero()).count();
@@ -667,6 +821,7 @@ mod tests {
                 SiteIndex::new(t, x, y, z),
                 make_simple_potentials(r, 2),
                 Some(state),
+                None,
                 None,
                 None,
             )?;
@@ -691,6 +846,7 @@ mod tests {
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
+            None,
         )?;
         let edges = state.get_edge_violations()?;
         let nonzero = edges.iter().filter(|x| !x.is_zero()).count();
@@ -709,6 +865,7 @@ mod tests {
             make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
+            None,
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -729,6 +886,7 @@ mod tests {
             make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
+            None,
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -758,6 +916,7 @@ mod tests {
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
+            None,
         )?;
         let edges = state.get_edge_violations()?;
         let nonzero = edges.iter().filter(|x| !x.is_zero()).count();
@@ -785,6 +944,7 @@ mod tests {
             make_simple_potentials(r, 32),
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
+            None,
             None,
         )?;
         let edges = state.get_edge_violations()?;
@@ -814,6 +974,7 @@ mod tests {
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
+            None,
         )?;
         let edges = state.get_edge_violations()?;
         let nonzero = edges.iter().filter(|x| !x.is_zero()).count();
@@ -840,6 +1001,7 @@ mod tests {
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
+            None,
         )?;
         let edges = state.get_edge_violations()?;
         let nonzero = edges.iter().filter(|x| !x.is_zero()).count();
@@ -860,10 +1022,11 @@ mod tests {
             Some(state),
             Some(31415),
             None,
+            None,
         )?;
         let edges = state.get_edge_violations()?;
 
-        println!("{:?}", edges);
+        assert!(edges.iter().all(|x| x.is_zero()));
 
         Ok(())
     }
@@ -880,6 +1043,7 @@ mod tests {
             make_simple_potentials(r, 32),
             Some(state),
             Some(31415),
+            None,
             None,
         )?;
         let plaquettes = state.get_plaquettes()?;
@@ -907,6 +1071,7 @@ mod tests {
                 nreplicas, t, x, y, z, 4,
             )))),
             Some(31415),
+            None,
             None,
         )?;
         state.run_single_local_update_sweep(0, false)?;
@@ -940,6 +1105,7 @@ mod tests {
             )))),
             Some(31415),
             None,
+            None,
         )?;
         state.run_single_local_update_sweep(0, false)?;
 
@@ -971,6 +1137,7 @@ mod tests {
                 nreplicas, t, x, y, z, 6,
             )))),
             Some(31415),
+            None,
             None,
         )?;
         state.run_local_update_sweep()?;
@@ -1013,6 +1180,7 @@ mod tests {
             Some(DualState::new_plaquettes(plaquette_state)),
             Some(31415),
             None,
+            None,
         )?;
         let edges = state.get_edge_violations()?;
         let nonzero = edges.iter().filter(|x| !x.is_zero()).count();
@@ -1033,8 +1201,9 @@ mod tests {
             None,
             Some(31415),
             None,
+            None,
         )?;
-        state.global_update_sweep()?;
+        state.run_global_update_sweep()?;
 
         let plaqs = state.get_plaquettes()?;
         // We should get global planes in replica 0 and nowhere else.
@@ -1102,8 +1271,9 @@ mod tests {
             Some(state),
             Some(31415),
             None,
+            None,
         )?;
-        state.global_update_sweep()?;
+        state.run_global_update_sweep()?;
 
         let plaqs = state.get_plaquettes()?;
         // We should get global planes in replica 0 and nowhere else.
@@ -1111,10 +1281,82 @@ mod tests {
             .axis_iter(Axis(0))
             .map(|x| x.iter().copied().filter(|x| !x.is_zero()).count())
             .collect::<Vec<_>>();
-
-        for rr in 0..r {
-            assert_eq!(nonzero[rr], 0);
+        assert_eq!(nonzero.len(), r);
+        for nonzero_val in nonzero {
+            assert_eq!(nonzero_val, 0);
         }
         Ok(())
     }
+
+    #[test]
+    fn test_winding_counts() -> Result<(), CudaError> {
+        let (r, d) = (3, 8);
+
+        let mut state = Array6::zeros((r, d, d, d, d, 6));
+        state
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(rr, mut x)| {
+                for i in 0..rr {
+                    x.slice_mut(s![.., .., i, i, 0])
+                        .iter_mut()
+                        .for_each(|x| *x = 1);
+                }
+            });
+        let state = DualState::new_plaquettes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 32),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+        let windings = state.get_winding_per_replica()?;
+        assert_eq!(
+            windings,
+            arr2(&[[0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0]])
+        );
+        Ok(())
+    }
+
+    // TODO add rearrange tests
+
+    #[test]
+    fn test_get_edges_single_inc_rotate() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (5, 6, 6, 6, 6);
+        let mut state = Array::zeros((r, t, x, y, z, 4));
+        state[[0, 0, 0, 0, 0, 0]] = 1;
+        let state = DualState::new_volumes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_simple_potentials(r, 32),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+
+        let perm = (1..r + 1).map(|x| x % r).collect::<Vec<_>>();
+        for i in 0..2 * r {
+            let mut correct_state = Array::zeros((r, t, x, y, z, 4));
+            correct_state[[i % r, 0, 0, 0, 0, 0]] = 1;
+            let correct_state = DualState::new_volumes(correct_state);
+            let correct_plaquettes = correct_state.get_plaquettes().to_owned();
+            let check_plaquettes = state.get_plaquettes()?;
+            assert_eq!(check_plaquettes, correct_plaquettes);
+
+            let mut energies_correct = Array1::from_vec(vec![0.0; r]);
+            energies_correct[i % r] = 3.0;
+
+            let energies = state.get_action_per_replica()?;
+            assert_eq!(energies, energies_correct);
+
+            state.permute_states(&perm)?;
+        }
+
+        Ok(())
+    }
+
+    // TODO unit tests for chemical potentials.
 }

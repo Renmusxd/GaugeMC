@@ -94,7 +94,7 @@ extern "C" __global__ void sum_buffer(float* buffer, int num_threads, int num_st
 }
 
 extern "C" __global__ void global_update_sweep(int* plaquette_buffer,
-        float* potential_buffer, int* potential_redirect, int potential_vector_size,
+        float* potential_buffer, float* chemical_potential_buffer, int* potential_redirect, int potential_vector_size,
         float* rng_buffer, int replicas, int t, int x, int y, int z)
 {
     // tx : y * z
@@ -161,6 +161,9 @@ extern "C" __global__ void global_update_sweep(int* plaquette_buffer,
             }
         }
     }
+    // Add chemical potential
+    boltzman_weights[0] += chemical_potential_buffer[potential_index];
+    boltzman_weights[2] -= chemical_potential_buffer[potential_index];
 
     float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
     float total_weight = 0.0;
@@ -186,6 +189,53 @@ extern "C" __global__ void global_update_sweep(int* plaquette_buffer,
             plaquette_buffer[replica_offset + plane_index_offset + offset + p] += delta;
         }
     }
+}
+
+extern "C" __global__ void sum_winding(int* plaquette_buffer, int* sum_buffer,
+        int replicas, int t, int x, int y, int z)
+{
+    // Sum tx plaquettes along y and z axis.
+    // Start off similar to global updates.
+    // tx : 1  (sum on yz)
+    // ty : 1  (sum on xz)
+    // tz : 1  (sum on xy)
+    // xy : 1  (sum on tz)
+    // xz : 1  (sum on ty)
+    // yz : 1  (sum on tx)
+    int num_planes_per_replica = 6;
+    int globalThreadNum = get_thread_number();
+    if (globalThreadNum >= replicas * num_planes_per_replica) {
+        return;
+    }
+
+    int replica_index = globalThreadNum / num_planes_per_replica;
+    int p = globalThreadNum % num_planes_per_replica;
+
+    int sum_one_arr[] = {2, 1, 1, 0, 0, 0};
+    int sum_two_arr[] = {3, 3, 2, 3, 2, 1};
+
+    int plaquettes_per_txyzslice = 6;
+    int plaquettes_per_txyslice = z * plaquettes_per_txyzslice;
+    int plaquettes_per_txslice = y * plaquettes_per_txyslice;
+    int plaquettes_per_tslice = x * plaquettes_per_txslice;
+    int strides[] = {plaquettes_per_tslice, plaquettes_per_txslice, plaquettes_per_txyslice, plaquettes_per_txyzslice};
+    int bounds[] = {t,x,y,z};
+
+    // Indexed dim one/two are 2 and 3 if dealing with a tx plane
+    int sum_dim_one = sum_one_arr[p];
+    int sum_dim_two = sum_two_arr[p];
+
+    int replica_offset = replica_index * (t*x*y*z*6);
+
+    int wp = 0;
+    for (int i = 0; i < bounds[sum_dim_one]; i++) {
+        for (int j = 0; j < bounds[sum_dim_two]; j++) {
+            // Iterate over plane
+            int offset = i*strides[sum_dim_one] + j*strides[sum_dim_two];
+            wp += plaquette_buffer[replica_offset + offset + p];
+        }
+    }
+    sum_buffer[globalThreadNum] = wp;
 }
 
 
