@@ -142,4 +142,23 @@ mod tests {
         });
         Ok(())
     }
+
+    #[bench]
+    fn bench_get_winding_l16(b: &mut Bencher) -> Result<(), CudaError> {
+        let r = 1;
+        let d = 16;
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 32),
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        b.iter(|| {
+            let _ = state.get_winding_per_replica().unwrap();
+        });
+        Ok(())
+    }
 }

@@ -34,3 +34,11 @@ required-features = ["gpu-wgpu"]
 [[example]]
 name = "simple_cuda"
 required-features = ["gpu-cuda"]
+
+[[bench]]
+name = "cuda_bench"
+required-features = ["gpu-cuda"]
+
+[[bench]]
+name = "wgpu_bench"
+required-features = ["gpu-wgpu"]

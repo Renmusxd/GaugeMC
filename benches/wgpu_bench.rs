@@ -148,4 +148,22 @@ mod tests {
         });
         Ok(())
     }
+
+    #[bench]
+    fn bench_get_winding_l16(b: &mut Bencher) -> Result<(), String> {
+        let r = 1;
+        let d = 16;
+        let mut state = pollster::block_on(GPUBackend::new_async(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 32),
+            None,
+            None,
+            None,
+        ))?;
+
+        b.iter(|| {
+            let _ = state.get_winding_nums_gpu(None);
+        });
+        Ok(())
+    }
 }
