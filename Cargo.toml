@@ -36,6 +36,9 @@ name = "simple_cuda"
 required-features = ["gpu-cuda"]
 
 [[bench]]
+name = "cpu_bench"
+
+[[bench]]
 name = "cuda_bench"
 required-features = ["gpu-cuda"]
 
