@@ -379,7 +379,7 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
     int coords_per_txyz = x * coords_per_xyz;
     int coords_per_replica = t * coords_per_txyz;
     int coord_index = t_index * coords_per_txyz + x_index * coords_per_xyz + y_index * coords_per_yz + z_index;
-    int replica_offset = replica_index * t * x * y * z;
+    int replica_offset = replica_index * coords_per_replica * 6;
 
     int coords_delta[4] = {coords_per_txyz, coords_per_xyz, coords_per_yz, coords_per_z};
     int coords[4] = {t_index, x_index, y_index, z_index};

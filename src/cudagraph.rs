@@ -471,8 +471,16 @@ impl CudaBackend {
                         self.bounds.z,
                     ),
                 )
-                .map_err(CudaError::from)
-        }
+                .map_err(CudaError::from)?
+        };
+
+        debug_assert_eq!(
+            self.get_edge_violations()
+                .map(|x| x.iter().map(|x| x.abs()).sum()),
+            Ok(0)
+        );
+
+        Ok(())
     }
 
     pub fn get_winding_per_replica(&mut self) -> Result<Array2<i32>, CudaError> {
@@ -617,6 +625,13 @@ impl CudaBackend {
             .copied()
             .try_for_each(|(volume, offset)| self.run_single_local_update_sweep(volume, offset));
         self.local_update_types = Some(local_update_types);
+
+        debug_assert_eq!(
+            self.get_edge_violations()
+                .map(|x| x.iter().map(|x| x.abs()).sum()),
+            Ok(0)
+        );
+
         res
     }
 
@@ -656,8 +671,16 @@ impl CudaBackend {
                         self.bounds.z,
                     ),
                 )
-                .map_err(CudaError::from)
-        }
+                .map_err(CudaError::from)?
+        };
+
+        debug_assert_eq!(
+            self.get_edge_violations()
+                .map(|x| x.iter().map(|x| x.abs()).sum()),
+            Ok(0)
+        );
+
+        Ok(())
     }
 }
 
@@ -756,7 +779,7 @@ impl CudaBackend {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum CudaError {
     Value(String),
     Compile(CompileError),
@@ -843,6 +866,26 @@ mod tests {
             None,
         )?;
         state.run_single_local_update_sweep(0, false)
+    }
+
+    #[test]
+    fn test_repeated_launch() -> Result<(), CudaError> {
+        let mut state = CudaBackend::new(
+            SiteIndex::new(8, 8, 8, 8),
+            make_custom_simple_potentials(6, 32, |r, n| {
+                0.25 * (r as f32 + 1.0) * (n.pow(2) as f32)
+            }),
+            None,
+            Some(31415),
+            None,
+            None,
+        )?;
+
+        for _ in 0..100 {
+            state.run_local_update_sweep()?
+        }
+
+        Ok(())
     }
 
     #[test]
