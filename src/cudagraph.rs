@@ -623,7 +623,7 @@ impl CudaBackend {
         let res = local_update_types
             .iter()
             .copied()
-            .try_for_each(|(volume, offset)| self.run_single_local_update_sweep(volume, offset));
+            .try_for_each(|(volume, offset)| self.run_single_local_update_single(volume, offset));
         self.local_update_types = Some(local_update_types);
 
         debug_assert_eq!(
@@ -635,7 +635,7 @@ impl CudaBackend {
         res
     }
 
-    fn run_single_local_update_sweep(
+    pub fn run_single_local_update_single(
         &mut self,
         volume_type: u16,
         offset: bool,
@@ -865,7 +865,7 @@ mod tests {
             None,
             None,
         )?;
-        state.run_single_local_update_sweep(0, false)
+        state.run_single_local_update_single(0, false)
     }
 
     #[test]
@@ -1236,7 +1236,7 @@ mod tests {
             None,
             None,
         )?;
-        state.run_single_local_update_sweep(0, false)?;
+        state.run_single_local_update_single(0, false)?;
 
         // Exceedingly unlikely to get 0.
         let plaquettes = state.get_plaquettes()?;
@@ -1269,7 +1269,7 @@ mod tests {
             None,
             None,
         )?;
-        state.run_single_local_update_sweep(0, false)?;
+        state.run_single_local_update_single(0, false)?;
 
         // Exceedingly unlikely to get 0.
         let plaquettes = state.get_plaquettes()?;
