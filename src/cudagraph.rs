@@ -1699,6 +1699,55 @@ mod tests {
     }
 
     #[test]
+    fn test_chemical_potential_windings_neg() -> Result<(), CudaError> {
+        let (r, d) = (3, 4);
+
+        let mut initial_state = Array6::zeros((r, d, d, d, d, 6));
+        initial_state
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(rr, mut x)| {
+                for i in 0..rr {
+                    x.slice_mut(s![.., .., i, i, 0])
+                        .iter_mut()
+                        .for_each(|x| *x = 1);
+                }
+            });
+        let state = DualState::new_plaquettes(initial_state.clone());
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_custom_simple_potentials(r, 4, |_, _| 0.0),
+            Some(state),
+            Some(31415),
+            None,
+            Some(Array1::from_vec((0..r).map(|_| -5.0).collect())),
+        )?;
+
+        state.run_global_update_sweep()?;
+
+        let initial_rep_winds = initial_state
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1));
+
+        let plaqs = state.get_plaquettes()?;
+        let rep_winds = plaqs
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1))
+            .sum_axis(Axis(1));
+
+        assert_eq!(initial_rep_winds - d.pow(4) as i32, rep_winds);
+
+        let windings = state.get_winding_per_replica()?;
+
+        assert_eq!(windings * d.pow(2) as i32, rep_winds);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_winding_chemical_potential() -> Result<(), CudaError> {
         let (r, d) = (3, 8);
 
