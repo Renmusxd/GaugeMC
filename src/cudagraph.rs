@@ -535,7 +535,7 @@ impl CudaBackend {
     }
 
     pub fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
-        let (t, x, y, _) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let mut threads_to_sum = self.nreplicas * t * x * y; // each thread starts with z*6
 
         let mut sum_buffer = self
@@ -602,14 +602,23 @@ impl CudaBackend {
         };
 
         if let Some(chemical_potentials) = self.using_chemical_potential.take() {
+            let plane_areas = [t * x, t * y, t * z, x * y, x * z, y * z];
             let windings = self.get_winding_per_replica()?;
             energies
                 .iter_mut()
                 .zip(windings.axis_iter(Axis(0)))
-                .zip(chemical_potentials.iter())
+                .zip(chemical_potentials.iter().copied())
                 .map(|((a, b), c)| (a, b, c))
                 .enumerate()
-                .for_each(|(_r, (e, w, mu))| *e += w.sum() as f32 * (*mu));
+                .for_each(|(_r, (e, w, mu))| {
+                    let wsum = w
+                        .iter()
+                        .zip(plane_areas)
+                        .map(|(a, b)| *a * (b as i32))
+                        .sum::<i32>() as f32;
+
+                    *e += mu * wsum
+                });
             self.using_chemical_potential = Some(chemical_potentials);
         }
 
@@ -1772,11 +1781,17 @@ mod tests {
             Some(Array1::from_vec((0..r).map(|rr| (rr + 1) as f32).collect())),
         )?;
         let energies = state.get_action_per_replica()?;
-        assert_eq!(energies, arr1(&[0.0 * 1.0, 1.0 * 2.0, 2.0 * 3.0]));
+        assert_eq!(
+            energies / (d.pow(2) as f32),
+            arr1(&[0.0 * 1.0, 1.0 * 2.0, 2.0 * 3.0])
+        );
 
         state.permute_states(&[2, 1, 0])?;
         let energies = state.get_action_per_replica()?;
-        assert_eq!(energies, arr1(&[2.0 * 1.0, 1.0 * 2.0, 0.0 * 3.0]));
+        assert_eq!(
+            energies / (d.pow(2) as f32),
+            arr1(&[2.0 * 1.0, 1.0 * 2.0, 0.0 * 3.0])
+        );
 
         Ok(())
     }
