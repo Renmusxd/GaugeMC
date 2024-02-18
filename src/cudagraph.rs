@@ -4,10 +4,15 @@ use cudarc::curand::result::CurandError;
 use cudarc::curand::CudaRng;
 use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx, CompileError};
+#[cfg(feature = "hashbrown-hashing")]
+use hashbrown::HashMap;
 use ndarray::{Array1, Array2, Array6, ArrayView1, ArrayView6, Axis};
 use ndarray_rand::rand::prelude::SliceRandom;
 use ndarray_rand::rand::{random, thread_rng, Rng};
 use rayon::prelude::*;
+#[cfg(not(feature = "hashbrown-hashing"))]
+use std::collections::HashMap;
+use std::default::Default;
 use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
@@ -25,6 +30,7 @@ pub struct CudaBackend {
     rng_buffer: CudaSlice<f32>,
     cuda_rng: CudaRng,
     local_update_types: Option<Vec<(u16, bool)>>,
+    parallel_tempering_debug: Option<TemperingTracker>,
 }
 
 enum RedirectArrays {
@@ -294,7 +300,20 @@ impl CudaBackend {
             rng_buffer,
             cuda_rng,
             local_update_types: Some(local_update_types),
+            parallel_tempering_debug: None,
         })
+    }
+
+    pub fn set_parallel_tracking(&mut self, on: bool) {
+        if on {
+            self.parallel_tempering_debug = Some(Default::default())
+        } else {
+            self.parallel_tempering_debug = None
+        }
+    }
+
+    pub fn get_parallel_tracking(&self) -> Option<&HashMap<(usize, usize), (usize, usize)>> {
+        self.parallel_tempering_debug.as_ref().map(|x| x.get_map())
     }
 
     pub fn permute_states(&mut self, permutation: &[usize]) -> Result<(), CudaError> {
@@ -360,6 +379,9 @@ impl CudaBackend {
                 // If no swap desired, undo the previously added swap.
                 perm[a] = b;
                 perm[b] = a;
+            }
+            if let Some(parallel_debug) = self.parallel_tempering_debug.as_mut() {
+                parallel_debug.log(a, b, should_swap);
             }
         }
         self.permute_states(&perm)?;
@@ -611,7 +633,7 @@ impl CudaBackend {
                 .map(|((a, b), c)| (a, b, c))
                 .enumerate()
                 .for_each(|(_r, (e, w, mu))| {
-                    let wsum = w
+                    let wsum = -w
                         .iter()
                         .zip(plane_areas)
                         .map(|(a, b)| *a * (b as i32))
@@ -824,6 +846,28 @@ impl From<DriverError> for CudaError {
 impl From<CurandError> for CudaError {
     fn from(value: CurandError) -> Self {
         Self::Rand(value)
+    }
+}
+
+#[derive(Default)]
+struct TemperingTracker {
+    successes_and_attempts: HashMap<(usize, usize), (usize, usize)>,
+}
+
+impl TemperingTracker {
+    fn log(&mut self, a: usize, b: usize, succeeded: bool) {
+        let (aa, bb) = (a.min(b), a.max(b));
+        let (a, b) = (aa, bb);
+
+        let (succ, att) = self.successes_and_attempts.entry((a, b)).or_default();
+        *att += 1;
+        if succeeded {
+            *succ += 1;
+        }
+    }
+
+    fn get_map(&self) -> &HashMap<(usize, usize), (usize, usize)> {
+        &self.successes_and_attempts
     }
 }
 
@@ -1782,14 +1826,14 @@ mod tests {
         )?;
         let energies = state.get_action_per_replica()?;
         assert_eq!(
-            energies / (d.pow(2) as f32),
+            -energies / (d.pow(2) as f32),
             arr1(&[0.0 * 1.0, 1.0 * 2.0, 2.0 * 3.0])
         );
 
         state.permute_states(&[2, 1, 0])?;
         let energies = state.get_action_per_replica()?;
         assert_eq!(
-            energies / (d.pow(2) as f32),
+            -energies / (d.pow(2) as f32),
             arr1(&[2.0 * 1.0, 1.0 * 2.0, 0.0 * 3.0])
         );
 
