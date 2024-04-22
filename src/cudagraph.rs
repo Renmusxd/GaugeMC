@@ -553,6 +553,9 @@ impl CudaBackend {
     }
 
     pub fn run_global_update_sweep(&mut self) -> Result<(), CudaError> {
+        #[cfg(debug_assertions)]
+            let original_edge_violations = self.get_edge_violations()?;
+
         let update_planes = self.global_updates_planes();
 
         // Can we not subslice it?
@@ -586,12 +589,10 @@ impl CudaBackend {
                 .map_err(CudaError::from)?
         };
 
-        // TODO fix
-        // debug_assert_eq!(
-        //     self.get_edge_violations()
-        //         .map(|x| x.iter().map(|x| x.abs()).sum()),
-        //     Ok(0)
-        // );
+        debug_assert_eq!(
+            self.get_edge_violations(),
+            Ok(original_edge_violations)
+        );
 
         Ok(())
     }
@@ -739,6 +740,9 @@ impl CudaBackend {
     }
 
     pub fn run_local_update_sweep(&mut self) -> Result<(), CudaError> {
+        #[cfg(debug_assertions)]
+            let original_edge_violations = self.get_edge_violations()?;
+
         let mut rng = thread_rng();
         let mut local_update_types = self.local_update_types.take().unwrap();
         local_update_types.shuffle(&mut rng);
@@ -748,12 +752,10 @@ impl CudaBackend {
             .try_for_each(|(volume, offset)| self.run_single_local_update_single(volume, offset));
         self.local_update_types = Some(local_update_types);
 
-        // TODO: fix
-        // debug_assert_eq!(
-        //     self.get_edge_violations()
-        //         .map(|x| x.iter().map(|x| x.abs()).sum()),
-        //     Ok(0)
-        // );
+        debug_assert_eq!(
+            self.get_edge_violations(),
+            Ok(original_edge_violations)
+        );
 
         res
     }
@@ -763,6 +765,9 @@ impl CudaBackend {
         volume_type: u16,
         offset: bool,
     ) -> Result<(), CudaError> {
+        #[cfg(debug_assertions)]
+            let original_edge_violations = self.get_edge_violations()?;
+
         // Get some rng
         self.cuda_rng
             .fill_with_uniform(&mut self.rng_buffer)
@@ -797,12 +802,10 @@ impl CudaBackend {
                 .map_err(CudaError::from)?
         };
 
-        // TODO fix
-        // debug_assert_eq!(
-        //     self.get_edge_violations()
-        //         .map(|x| x.iter().map(|x| x.abs()).sum()),
-        //     Ok(0)
-        // );
+        debug_assert_eq!(
+            self.get_edge_violations(),
+            Ok(original_edge_violations)
+        );
 
         Ok(())
     }
@@ -812,6 +815,9 @@ impl CudaBackend {
         plaquette_type: u16,
         offset: u8,
     ) -> Result<(), CudaError> {
+        #[cfg(debug_assertions)]
+            let original_edge_violations = self.get_edge_violations()?;
+
         // Get some rng
         self.cuda_rng
             .fill_with_uniform(&mut self.rng_buffer)
@@ -851,12 +857,10 @@ impl CudaBackend {
                 .map_err(CudaError::from)?
         };
 
-        // TODO fix
-        // debug_assert_eq!(
-        //     self.get_edge_violations()
-        //         .map(|x| x.iter().map(|x| x.abs()).sum()),
-        //     Ok(0)
-        // );
+        debug_assert_eq!(
+            self.get_edge_violations(),
+            Ok(original_edge_violations)
+        );
 
         Ok(())
     }
