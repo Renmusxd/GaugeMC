@@ -589,6 +589,7 @@ impl CudaBackend {
                 .map_err(CudaError::from)?
         };
 
+        #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.get_edge_violations(),
             Ok(original_edge_violations)
@@ -733,6 +734,7 @@ impl CudaBackend {
             .try_for_each(|(volume, offset)| self.run_single_local_update_single(volume, offset));
         self.local_update_types = Some(local_update_types);
 
+        #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.get_edge_violations(),
             Ok(original_edge_violations)
@@ -783,6 +785,7 @@ impl CudaBackend {
                 .map_err(CudaError::from)?
         };
 
+        #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.get_edge_violations(),
             Ok(original_edge_violations)
