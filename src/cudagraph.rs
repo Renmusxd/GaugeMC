@@ -766,11 +766,11 @@ impl CudaBackend {
                 .launch(
                     cfg,
                     (
-                        &self.state,
-                        &mut self.potential_buffer,
+                        &mut self.state,
+                        &self.potential_buffer,
                         &self.potential_redirect_buffer,
                         self.potential_size,
-                        &mut self.rng_buffer,
+                        &self.rng_buffer,
                         volume_type,
                         offset,
                         self.nreplicas,
@@ -819,7 +819,7 @@ impl CudaBackend {
                 .launch(
                     cfg,
                     (
-                        &self.state,
+                        &mut self.state,
                         &self.potential_buffer,
                         &self.winding_chemical_potential_buffer,
                         &self.potential_redirect_buffer,
