@@ -18,9 +18,14 @@ int __device__ calculate_index_down_difference(int bound, int index, int delta)
     return down_index_diff;
 }
 
+__device__ int sign(float x)
+{
+	int t = x<0 ? -1 : 0;
+	return x > 0 ? 1 : t;
+}
 
-__device__ int get_edge_sum_from_plaquettes(int* plaquette_buffer, int edge_type,
-        int coord_index, int* coords, int* bounds, int* deltas)
+__device__ int get_edge_sum_from_plaquettes(int* plaquette_buffer, unsigned short edge_type,
+        int coord_index, int* coords, int* bounds, int* coord_deltas)
 {
     int other_edges_a = 0;
     int other_edges_b = 0;
@@ -66,7 +71,8 @@ __device__ int get_edge_sum_from_plaquettes(int* plaquette_buffer, int edge_type
         int plaquette_type = plaquette_types[i];
 
         int plaquette_index = global_index + plaquette_type;
-        int down_index = calculate_index_down_difference(bounds[other_edge], coords[other_edge], deltas[other_edge]) + plaquette_index;
+        int down_index = calculate_index_down_difference(bounds[other_edge], coords[other_edge], 6*coord_deltas[other_edge]) + plaquette_index;
+
         int down_diff = plaquette_buffer[plaquette_index] - plaquette_buffer[down_index];
 
         int sign = 1;
@@ -80,6 +86,264 @@ __device__ int get_edge_sum_from_plaquettes(int* plaquette_buffer, int edge_type
     return sum;
 }
 
+__device__ int get_coords_from_index(int globalThreadNum, int* bounds, int* output_coords) {
+    int threads_per_replica = bounds[0] * bounds[1] * bounds[2] * bounds[3];
+    int replica_index = globalThreadNum / threads_per_replica;
+    int remaining = globalThreadNum % threads_per_replica;
+
+    int threads_per_t = bounds[1] * bounds[2] * bounds[3];
+    output_coords[0] = remaining / threads_per_t;
+    remaining = remaining % threads_per_t;
+
+    int threads_per_x = bounds[2] * bounds[3];
+    output_coords[1] = remaining / threads_per_x;
+    remaining = remaining % threads_per_x;
+
+    int threads_per_y = bounds[3];
+    output_coords[2] = remaining / threads_per_y;
+    output_coords[3] = remaining % threads_per_y;
+
+    return replica_index;
+}
+
+const unsigned short edges_a[6] = {0,0,0,1,1,2};
+const unsigned short edges_b[6] = {1,2,3,2,3,3};
+__device__ void edge_types_for_plaquette_type(unsigned short plaquette_type, unsigned short* edge_a,  unsigned short* edge_b) {
+    *edge_a = edges_a[plaquette_type];
+    *edge_b = edges_b[plaquette_type];
+}
+
+__device__ unsigned short matter_flowing_through_coord(int* plaquette_buffer,
+    int replica_and_coord_index,
+    int* coords, int* coord_bounds, int* coord_deltas)
+{
+    unsigned short matter_count = 0;
+    for (unsigned short edge_type = 0; edge_type < 4; edge_type++) {
+        int up_sum = get_edge_sum_from_plaquettes(plaquette_buffer, edge_type, replica_and_coord_index, coords, coord_bounds, coord_deltas);
+
+        int old_val = coords[edge_type];
+        int index_delta = calculate_index_down_difference(coord_bounds[edge_type], coords[edge_type], coord_deltas[edge_type]);
+        coords[edge_type] = (coords[edge_type] - 1 + coord_bounds[edge_type]) % coord_bounds[edge_type];
+        int down_sum = get_edge_sum_from_plaquettes(plaquette_buffer, edge_type, replica_and_coord_index + index_delta, coords, coord_bounds, coord_deltas);
+        coords[edge_type] = old_val;
+
+        matter_count += abs(up_sum) + abs(down_sum);
+    }
+
+    return matter_count / 2;
+}
+
+/*
+Checks the amount of matter flowing through each of the 4 corners of a
+plaquette, writes to output number of flows per corner.
+*/
+__device__ void check_plaquette_matter_corners(int* plaquette_buffer,
+    unsigned short plaquette_type,
+    int replica_and_coord_index, int* coords, int* coord_bounds, int* coord_deltas,
+    unsigned short* output)
+{
+    unsigned short edge_a = 0;
+    unsigned short edge_b = 0;
+    edge_types_for_plaquette_type(plaquette_type, &edge_a, &edge_b);
+
+    int edge_a_delta = calculate_index_up_difference(coord_bounds[edge_a], coords[edge_a], coord_deltas[edge_a]);
+    int edge_b_delta = calculate_index_up_difference(coord_bounds[edge_b], coords[edge_b], coord_deltas[edge_b]);
+
+    int old_a = coords[edge_a];
+    int old_b = coords[edge_b];
+
+    for (unsigned short inc_a = 0; inc_a < 2; inc_a++) {
+        for (unsigned short inc_b = 0; inc_b < 2; inc_b++) {
+            coords[edge_a] = (old_a + inc_a) % coord_bounds[edge_a];
+            coords[edge_b] = (old_b + inc_b) % coord_bounds[edge_b];
+            int corner_coord_index = replica_and_coord_index + inc_a*edge_a_delta + inc_b*edge_b_delta;
+
+            output[(inc_a << 1) | inc_b] = matter_flowing_through_coord(plaquette_buffer, corner_coord_index, coords, coord_bounds, coord_deltas);
+        }
+    }
+
+    coords[edge_a] = old_a;
+    coords[edge_b] = old_b;
+}
+
+/*
+Calculates the violations on each of the 4 edges around a plaquette.
+*/
+__device__ void get_edge_violations_around_plaquette(int* plaquette_buffer,
+    unsigned short plaquette_type,
+    int replica_and_coord_index, int* coords, int* coord_bounds, int* coord_deltas,
+    int* output)
+{
+    unsigned short edge_a = 0;
+    unsigned short edge_b = 0;
+    edge_types_for_plaquette_type(plaquette_type, &edge_a, &edge_b);
+
+    output[0] = get_edge_sum_from_plaquettes(plaquette_buffer, edge_a, replica_and_coord_index, coords, coord_bounds, coord_deltas);
+    output[1] = get_edge_sum_from_plaquettes(plaquette_buffer, edge_b, replica_and_coord_index, coords, coord_bounds, coord_deltas);
+
+    int edge_a_delta = calculate_index_up_difference(coord_bounds[edge_a], coords[edge_a], coord_deltas[edge_a]);
+
+    int old_val = coords[edge_a];
+    coords[edge_a] = (coords[edge_a] + 1) % coord_bounds[edge_a];
+    output[2] = get_edge_sum_from_plaquettes(plaquette_buffer, edge_b, replica_and_coord_index + edge_a_delta, coords, coord_bounds, coord_deltas);
+    coords[edge_a] = old_val;
+
+    int edge_b_delta = calculate_index_up_difference(coord_bounds[edge_b], coords[edge_b], coord_deltas[edge_b]);
+    old_val = coords[edge_b];
+    coords[edge_b] = (coords[edge_b] + 1) % coord_bounds[edge_b];
+    output[3] = get_edge_sum_from_plaquettes(plaquette_buffer, edge_a, replica_and_coord_index + edge_b_delta, coords, coord_bounds, coord_deltas);
+    coords[edge_b] = old_val;
+}
+
+/*
+Count the number of flows through a coordinate. 1 in 1 out = 1 flow.
+*/
+extern "C" __global__ void calculate_matter_flow_through_coords(int* plaquette_buffer, int* matter_flow_buffer,
+    int replicas, int t, int x, int y, int z)
+{
+    int globalThreadNum = get_thread_number();
+
+    if (globalThreadNum >= replicas * t * x * y * z) {
+        return;
+    }
+
+    int bounds[4] = {t,x,y,z};
+    int coords[4] = {0,0,0,0};
+    int replica_index = get_coords_from_index(globalThreadNum, bounds, coords);
+    int coord_deltas[4] = {x*y*z, y*z, z, 1};
+    matter_flow_buffer[globalThreadNum] = matter_flowing_through_coord(plaquette_buffer, globalThreadNum, coords, bounds, coord_deltas);
+}
+
+extern "C" __global__ void calculate_matter_corners_for_plaquettes(int* plaquette_buffer, int* matter_corner_buffer,
+    unsigned short plaquette_type, int replicas, int t, int x, int y, int z)
+{
+    int globalThreadNum = get_thread_number();
+
+    if (globalThreadNum >= replicas * t * x * y * z) {
+        return;
+    }
+
+    int bounds[4] = {t,x,y,z};
+    int coords[4] = {0,0,0,0};
+    int replica_index = get_coords_from_index(globalThreadNum, bounds, coords);
+    int coord_deltas[4] = {x*y*z, y*z, z, 1};
+
+    unsigned short matter[4] = {0,0,0,0};
+    check_plaquette_matter_corners(plaquette_buffer, plaquette_type, globalThreadNum, coords, bounds, coord_deltas, matter);
+
+    for (unsigned short i = 0; i < 4; i++) {
+        matter_corner_buffer[4*globalThreadNum + i] = matter[i];
+    }
+}
+
+extern "C" __global__ void update_matter_loops(int* plaquette_buffer,
+    float* potential_buffer, int* potential_redirect, int potential_vector_size,
+    float* rng_buffer,
+    unsigned short plaquette_type, int offset,
+    int replicas, int t, int x, int y, int z)
+{
+    const int globalThreadNum = get_thread_number();
+
+    // Number of plaquettes to update is 1/4 of sites.
+    //  XO     each of 4
+    //  OO     in tx plane.
+    // We will return early if not in correct place.
+    if (globalThreadNum >= replicas * t * x * y * z / 4) {
+        return;
+    }
+
+    // Plaquette types:
+    unsigned short edge_a = 0;
+    unsigned short edge_b = 0;
+    edge_types_for_plaquette_type(plaquette_type, &edge_a, &edge_b);
+
+    // First -- calculate the index of the cube we are focused on updating
+    int divs[4] = {t,x,y,z};
+    divs[edge_a] /= 2;
+    divs[edge_b] /= 2;
+
+    int coords[4] = {0, 0, 0, 0};
+    int replica_index = get_coords_from_index(globalThreadNum, divs, coords);
+
+    // Adjust offsets
+    coords[edge_a] = 2*coords[edge_a] + (offset & 1);
+    coords[edge_b] = 2*coords[edge_b] + ((offset>>1)&1);
+
+    const int coords_per_replica = t*x*y*z;
+    int coords_delta[4] = {x*y*z, y*z, z, 1};
+    int bounds[4] = {t, x, y, z};
+
+    const int coord_and_replica_index = replica_index*coords_per_replica + coords_delta[0]*coords[0] + coords_delta[1]*coords[1] + coords_delta[2]*coords[2] + coords_delta[3]*coords[3];
+
+    int plaquette_violations[4] = {0,0,0,0};
+    get_edge_violations_around_plaquette(plaquette_buffer, plaquette_type, coord_and_replica_index, coords, bounds, coords_delta, plaquette_violations);
+
+    bool any_above_one = false;
+    unsigned short count_of_ones = 0;
+    for (int i = 0; i<4; i++) {
+        any_above_one |= abs(plaquette_violations[i]) > 1;
+        // Since all violations are enforced to be 0 or 1, this counts 1s.
+        count_of_ones += abs(plaquette_violations[i]);
+    }
+    if (any_above_one || count_of_ones==0 || count_of_ones==4) {
+        return;
+    }
+
+    int violation_location = 0;
+    for (; violation_location < 4; violation_location++) {
+        if (plaquette_violations[violation_location] != 0) {
+            break;
+        }
+    }
+
+    // Special check of count_of_ones==2
+    if (count_of_ones == 2) {
+        // If the 1s are on opposite sides, return early to not close loops.
+        const unsigned short spot_to_check[4] = {3, 2, 1, 0};
+        unsigned short potential_violation_location = spot_to_check[violation_location];
+        if (abs(plaquette_violations[violation_location]) == abs(plaquette_violations[potential_violation_location])) {
+            return;
+        }
+    }
+
+
+    int violation_at_loc = plaquette_violations[violation_location];
+
+    const int inc_incurrs[4] = {1, -1, 1, -1};
+    // violation_at_loc + plaquette_delta * inc_incurrs = 0
+    int plaquette_delta = - sign(violation_at_loc) / sign(inc_incurrs[violation_location]);
+
+    int np = plaquette_buffer[6*coord_and_replica_index + plaquette_type];
+
+    int potential_offset = potential_redirect[replica_index] * potential_vector_size;
+    float base_potential = potential_buffer[potential_offset + abs(np)];
+    float new_potential = potential_buffer[potential_offset + abs(np+plaquette_delta)];
+    float potential_diff = new_potential - base_potential;
+    float min_pot = min(0.0, potential_diff);
+
+    float stay_weight = exp( - (0.0 - min_pot) );
+    float inc_weight = exp( - (potential_diff - min_pot) );
+
+    float rng = rng_buffer[globalThreadNum] * (stay_weight + inc_weight);
+
+    if (rng > stay_weight) {
+        // Now check if we made any crossing matter lines.
+        plaquette_buffer[6*coord_and_replica_index + plaquette_type] += plaquette_delta;
+
+        // Now check if we made any crossing matter lines.
+        unsigned short matter_flows[4] = {0,0,0,0};
+        check_plaquette_matter_corners(plaquette_buffer, plaquette_type, coord_and_replica_index, coords, bounds, coords_delta, matter_flows);
+
+        bool any_cross_flows = false;
+        for (int i = 0; i < 4; i++) {
+            any_cross_flows |= (matter_flows[i] > 1);
+        }
+        // If we cross flows, undo change.
+        if (any_cross_flows) {
+            plaquette_buffer[6*coord_and_replica_index + plaquette_type] -= plaquette_delta;
+        }
+    }
+}
 
 extern "C" __global__ void sum_buffer(float* buffer, int num_threads, int num_steps)
 {
@@ -320,21 +584,19 @@ extern "C" __global__ void calculate_edge_sums(int* plaquette_buffer, int* edge_
     int z_index = within_y_index / edges_per_txyzslice;
     int edge_type = within_x_index % edges_per_txyzslice;
 
-    int build_plaquettes_per_txyzslice = 6;
-    int build_plaquettes_per_txyslice = z * build_plaquettes_per_txyzslice;
-    int build_plaquettes_per_txslice = y * build_plaquettes_per_txyslice;
-    int build_plaquettes_per_tslice = x * build_plaquettes_per_txslice;
-    int build_plaquettes_per_replica = t * build_plaquettes_per_tslice;
-
-
-    int coords_per_replica = t * x * y * z;
+    int coords_per_z = 1;
+    int coords_per_y = z * coords_per_z;
+    int coords_per_x = y * coords_per_y;
+    int coords_per_t = x * coords_per_x;
+    int coords_per_replica = t * coords_per_t;
     int replica_offset = replica_index * coords_per_replica;
-    int coord_index = globalThreadNum / 4;
-    int coords[] = {t_index, x_index, y_index, z_index};
-    int bounds[] = {t, x, y, z};
-    int deltas[] = {build_plaquettes_per_tslice, build_plaquettes_per_txslice, build_plaquettes_per_txyslice, build_plaquettes_per_txyzslice};
 
-    int edge_sum = get_edge_sum_from_plaquettes(plaquette_buffer, edge_type, coord_index, coords, bounds, deltas);
+    int coord_index = globalThreadNum / 4;
+    int coords[4] = {t_index, x_index, y_index, z_index};
+    int bounds[4] = {t, x, y, z};
+    int coord_deltas[4] = {coords_per_t, coords_per_x, coords_per_y, coords_per_z};
+
+    int edge_sum = get_edge_sum_from_plaquettes(plaquette_buffer, edge_type, coord_index, coords, bounds, coord_deltas);
 
     edge_sums_buffer[globalThreadNum] = edge_sum;
 }
