@@ -649,7 +649,7 @@ impl CudaBackend {
     }
 
     pub fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
-        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let (t, x, y, _z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let mut threads_to_sum = self.nreplicas * t * x * y; // each thread starts with z*6
 
         let mut sum_buffer = self
@@ -663,6 +663,7 @@ impl CudaBackend {
             .device
             .get_func("gauge_kernel", "partial_sum_energies")
             .unwrap();
+
         unsafe {
             partial_sum_energies
                 .launch(
@@ -670,7 +671,8 @@ impl CudaBackend {
                     (
                         &self.state,
                         &mut sum_buffer,
-                        &mut self.potential_buffer,
+                        &self.potential_buffer,
+                        &self.winding_chemical_potential_buffer,
                         &self.potential_redirect_buffer,
                         self.potential_size,
                         self.nreplicas,
@@ -704,7 +706,7 @@ impl CudaBackend {
             .map(Array1::from_vec)
             .map_err(CudaError::from)?;
 
-        let mut energies = if let Some(redirect) = self.potential_redirect_array.get_redirect() {
+        let energies = if let Some(redirect) = self.potential_redirect_array.get_redirect() {
             let mut result = energies.clone();
             energies.iter().enumerate().for_each(|(ir, windings)| {
                 let rr = redirect[ir];
@@ -714,27 +716,6 @@ impl CudaBackend {
         } else {
             energies
         };
-
-        if let Some(chemical_potentials) = self.using_chemical_potential.take() {
-            let plane_areas = [t * x, t * y, t * z, x * y, x * z, y * z];
-            let windings = self.get_winding_per_replica()?;
-            energies
-                .iter_mut()
-                .zip(windings.axis_iter(Axis(0)))
-                .zip(chemical_potentials.iter().copied())
-                .map(|((a, b), c)| (a, b, c))
-                .enumerate()
-                .for_each(|(_r, (e, w, mu))| {
-                    let wsum = -w
-                        .iter()
-                        .zip(plane_areas)
-                        .map(|(a, b)| *a * (b as i32))
-                        .sum::<i32>() as f32;
-
-                    *e += mu * wsum
-                });
-            self.using_chemical_potential = Some(chemical_potentials);
-        }
 
         Ok(energies)
     }
@@ -813,11 +794,8 @@ impl CudaBackend {
     pub fn run_single_matter_update_single(
         &mut self,
         plaquette_type: u16,
-        offset: u8,
+        offset: u16,
     ) -> Result<(), CudaError> {
-        #[cfg(debug_assertions)]
-            let original_edge_violations = self.get_edge_violations()?;
-
         // Get some rng
         self.cuda_rng
             .fill_with_uniform(&mut self.rng_buffer)
@@ -835,18 +813,21 @@ impl CudaBackend {
             .device
             .get_func("gauge_kernel", "update_matter_loops")
             .unwrap();
+        let plaquette_type_and_offset = (plaquette_type << 2) | offset;
         unsafe {
             update_matter_loops
                 .launch(
                     cfg,
                     (
                         &self.state,
-                        &mut self.potential_buffer,
+                        &self.potential_buffer,
+                        &self.winding_chemical_potential_buffer,
                         &self.potential_redirect_buffer,
                         self.potential_size,
-                        &mut self.rng_buffer,
-                        plaquette_type,
-                        offset,
+                        &self.rng_buffer,
+                        // plaquette_type,
+                        // offset,
+                        plaquette_type_and_offset,
                         self.nreplicas,
                         self.bounds.t,
                         self.bounds.x,
@@ -856,11 +837,6 @@ impl CudaBackend {
                 )
                 .map_err(CudaError::from)?
         };
-
-        debug_assert_eq!(
-            self.get_edge_violations(),
-            Ok(original_edge_violations)
-        );
 
         Ok(())
     }

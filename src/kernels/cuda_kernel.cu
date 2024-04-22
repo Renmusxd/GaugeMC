@@ -237,9 +237,8 @@ extern "C" __global__ void calculate_matter_corners_for_plaquettes(int* plaquett
 }
 
 extern "C" __global__ void update_matter_loops(int* plaquette_buffer,
-    float* potential_buffer, int* potential_redirect, int potential_vector_size,
-    float* rng_buffer,
-    unsigned short plaquette_type, int offset,
+    float* potential_buffer, float* chemical_potential_buffer, int* potential_redirect, int potential_vector_size,
+    float* rng_buffer, unsigned short plaquette_type_and_offset, // unsigned short plaquette_type, int offset,
     int replicas, int t, int x, int y, int z)
 {
     const int globalThreadNum = get_thread_number();
@@ -251,6 +250,9 @@ extern "C" __global__ void update_matter_loops(int* plaquette_buffer,
     if (globalThreadNum >= replicas * t * x * y * z / 4) {
         return;
     }
+
+    unsigned short plaquette_type = (plaquette_type_and_offset >> 2) | 0b111;
+    unsigned short offset = plaquette_type_and_offset & 0b11;
 
     // Plaquette types:
     unsigned short edge_a = 0;
@@ -315,10 +317,11 @@ extern "C" __global__ void update_matter_loops(int* plaquette_buffer,
 
     int np = plaquette_buffer[6*coord_and_replica_index + plaquette_type];
 
-    int potential_offset = potential_redirect[replica_index] * potential_vector_size;
-    float base_potential = potential_buffer[potential_offset + abs(np)];
-    float new_potential = potential_buffer[potential_offset + abs(np+plaquette_delta)];
-    float potential_diff = new_potential - base_potential;
+    int potential_index = potential_redirect[replica_index];
+    int potential_offset = potential_index * potential_vector_size;
+    float base_potential = potential_buffer[potential_offset + abs(np)]; // - np * chemical_potential_buffer[potential_index]
+    float new_potential = potential_buffer[potential_offset + abs(np+plaquette_delta)];  // - (np+plaquette_delta) * chemical_potential_buffer[potential_index]
+    float potential_diff = new_potential - base_potential - plaquette_delta * chemical_potential_buffer[potential_index];
     float min_pot = min(0.0, potential_diff);
 
     float stay_weight = exp( - (0.0 - min_pot) );
@@ -526,7 +529,7 @@ const int normal_dim_for_cube_planeindex[4][3] = {
 };
 
 extern "C" __global__ void partial_sum_energies(int* plaquette_buffer, float* sum_buffer,
-          float* potential_buffer, int* potential_redirect, int potential_vector_size,
+          float* potential_buffer, float* chemical_potential_buffer, int* potential_redirect, int potential_vector_size,
           int replicas, int t, int x, int y, int z)
 {
     // Go through each of the 6 plaquette types for each site
@@ -550,6 +553,7 @@ extern "C" __global__ void partial_sum_energies(int* plaquette_buffer, float* su
     for (int i = 0; i < z * 6; i++) {
         int np = plaquette_buffer[replica_offset + (in_replica_index * z * 6) + i];
         pot += potential_buffer[potential_offset + abs(np)];
+        pot -= np * chemical_potential_buffer[potential_index];
     }
     sum_buffer[globalThreadNum] = pot;
 }
