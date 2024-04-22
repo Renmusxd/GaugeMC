@@ -669,6 +669,7 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
             int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
             boltzman_weights[delta+1] += potential_buffer[potential_offset + abs(new_np)];
             boltzman_weights[delta+1] += potential_buffer[potential_offset + abs(new_np_up)];
+            // We dont need chemical potential since we always add as many even as odd increments.
         }
     }
 
