@@ -1415,8 +1415,7 @@ mod gpu_tests {
         let (r, t, x, y, z) = (6, 4, 4, 4, 4);
         let mut vn = Array2::zeros((r, 3));
         vn.axis_iter_mut(Axis(0))
-            .enumerate()
-            .for_each(|(_r, mut ax)| {
+            .for_each(|mut ax| {
                 ax.iter_mut().enumerate().for_each(|(i, v)| {
                     if i == 0 {
                         *v = 0.0;
