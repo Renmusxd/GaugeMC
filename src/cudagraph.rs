@@ -26,8 +26,6 @@ pub struct CudaBackend {
     potential_redirect_array: RedirectArrays,
     potential_buffer: CudaSlice<f32>,
     winding_chemical_potential_buffer: CudaSlice<f32>,
-    // potential per plane
-    using_chemical_potential: Option<Array1<f32>>,
     rng_buffer: CudaSlice<f32>,
     cuda_rng: CudaRng,
     local_update_types: Option<Vec<(u16, bool)>>,
@@ -261,7 +259,6 @@ impl CudaBackend {
             .htod_copy_into(vn, &mut potential_buffer)
             .map_err(CudaError::from)?;
 
-        let mut using_chemical_potential = None;
         let mut winding_chemical_potential_buffer = device
             .alloc_zeros::<f32>(nreplicas)
             .map_err(CudaError::from)?;
@@ -270,7 +267,6 @@ impl CudaBackend {
             device
                 .htod_copy_into(chemical_potential, &mut winding_chemical_potential_buffer)
                 .map_err(CudaError::from)?;
-            using_chemical_potential = Some(chemical_potential_arr);
         }
 
         // Set up the potentials redirect
@@ -312,7 +308,6 @@ impl CudaBackend {
             potential_redirect_array: RedirectArrays::None,
             potential_buffer,
             winding_chemical_potential_buffer,
-            using_chemical_potential,
             rng_buffer,
             cuda_rng,
             local_update_types: Some(local_update_types),
