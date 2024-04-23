@@ -1,9 +1,6 @@
 use std::fs::File;
-use std::io;
-use std::io::Write;
 use gaugemc::{CudaBackend, CudaError, DualState, SiteIndex};
-use ndarray::{Array1, Array2, Array3, Array6, Axis, s};
-use num_traits::Zero;
+use ndarray::{Array1, Array2, Array6, Axis};
 use ndarray_npy::NpzWriter;
 use ndarray_rand::rand;
 use ndarray_rand::rand::prelude::SliceRandom;

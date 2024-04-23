@@ -86,8 +86,8 @@ impl RedirectArrays {
             .enumerate()
             .all(|(i, x)| inverse[*x as usize] == i as u32));
 
-        let redirect = Array1::from_vec(redirect.into_iter().map(|x| x).collect::<Vec<_>>());
-        let inverse = Array1::from_vec(inverse.into_iter().map(|x| x).collect::<Vec<_>>());
+        let redirect = Array1::from_vec(redirect.into_iter().collect::<Vec<_>>());
+        let inverse = Array1::from_vec(inverse.into_iter().collect::<Vec<_>>());
 
         Self::Redirect { redirect, inverse }
     }
