@@ -86,10 +86,11 @@ __device__ int get_edge_sum_from_plaquettes(int* plaquette_buffer, unsigned shor
     return sum;
 }
 
-__device__ int get_coords_from_index(int globalThreadNum, int* bounds, int* output_coords) {
+__device__ int get_coords_from_index(int index, int* bounds, int* output_coords) {
+    // TODO fix the bug here: index=216 bounds={3,3,6,6} returns 1 and outputs {0, 0, 0, 0};
     int threads_per_replica = bounds[0] * bounds[1] * bounds[2] * bounds[3];
-    int replica_index = globalThreadNum / threads_per_replica;
-    int remaining = globalThreadNum % threads_per_replica;
+    int replica_index = index / threads_per_replica;
+    int remaining = index % threads_per_replica;
 
     int threads_per_t = bounds[1] * bounds[2] * bounds[3];
     output_coords[0] = remaining / threads_per_t;
@@ -251,7 +252,7 @@ extern "C" __global__ void update_matter_loops(int* plaquette_buffer,
         return;
     }
 
-    unsigned short plaquette_type = (plaquette_type_and_offset >> 2) | 0b111;
+    unsigned short plaquette_type = (plaquette_type_and_offset >> 2) & 0b111;
     unsigned short offset = plaquette_type_and_offset & 0b11;
 
     // Plaquette types:
@@ -319,6 +320,7 @@ extern "C" __global__ void update_matter_loops(int* plaquette_buffer,
 
     int potential_index = potential_redirect[replica_index];
     int potential_offset = potential_index * potential_vector_size;
+
     float base_potential = potential_buffer[potential_offset + abs(np)]; // - np * chemical_potential_buffer[potential_index]
     float new_potential = potential_buffer[potential_offset + abs(np+plaquette_delta)];  // - (np+plaquette_delta) * chemical_potential_buffer[potential_index]
     float potential_diff = new_potential - base_potential - plaquette_delta * chemical_potential_buffer[potential_index];
@@ -332,6 +334,8 @@ extern "C" __global__ void update_matter_loops(int* plaquette_buffer,
     if (rng > stay_weight) {
         // Now check if we made any crossing matter lines.
         plaquette_buffer[6*coord_and_replica_index + plaquette_type] += plaquette_delta;
+
+        int np = plaquette_buffer[6*coord_and_replica_index + plaquette_type];
 
         // Now check if we made any crossing matter lines.
         unsigned short matter_flows[4] = {0,0,0,0};

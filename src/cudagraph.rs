@@ -3,7 +3,7 @@ use crate::{Dimension, NDDualGraph, SiteIndex};
 use cudarc::curand::result::CurandError;
 use cudarc::curand::CudaRng;
 use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConfig};
-use cudarc::nvrtc::{compile_ptx, CompileError};
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 #[cfg(feature = "hashbrown-hashing")]
 use hashbrown::HashMap;
 use ndarray::{Array1, Array2, Array5, Array6, ArrayView1, ArrayView6, Axis};
@@ -181,7 +181,18 @@ impl CudaBackend {
         device_id: Option<usize>,
         chemical_potential: Option<Array1<f32>>,
     ) -> Result<Self, CudaError> {
-        let local_updates_ptx = compile_ptx(include_str!("kernels/cuda_kernel.cu"));
+        let opts = CompileOptions {
+            ftz: None,
+            prec_sqrt: None,
+            prec_div: None,
+            fmad: None,
+            use_fast_math: None,
+            maxrregcount: None,
+            include_paths: vec![],
+            arch: None,
+        };
+
+        let local_updates_ptx = compile_ptx_with_opts(include_str!("kernels/cuda_kernel.cu"), opts);
         let local_updates_ptx = match local_updates_ptx {
             Ok(x) => x,
             Err(cerr) => {
