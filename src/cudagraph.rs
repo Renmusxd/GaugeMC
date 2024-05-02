@@ -216,7 +216,8 @@ impl CudaBackend {
                     "sum_winding",
                     "update_matter_loops",
                     "calculate_matter_flow_through_coords",
-                    "calculate_matter_corners_for_plaquettes"
+                    "calculate_matter_corners_for_plaquettes",
+                    "wilson_loop_probs"
                 ],
             )
             .map_err(CudaError::from)?;
