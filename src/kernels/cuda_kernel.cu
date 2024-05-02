@@ -245,6 +245,37 @@ extern "C" __global__ void calculate_matter_corners_for_plaquettes(int* plaquett
     }
 }
 
+extern "C" __global__ void initialize_wilson_loops_for_probs(int* plaquette_buffer,
+    int* aspect_ratios, unsigned short plaquette_type, int replicas, int t, int x, int y, int z)
+{
+    int replica_index = get_thread_number();
+    if (replica_index >= replicas) {
+        return;
+    }
+
+    unsigned short edge_a = 0;
+    unsigned short edge_b = 0;
+    edge_types_for_plaquette_type(plaquette_type, &edge_a, &edge_b);
+
+    const int coords_per_replica = t*x*y*z;
+    int coords_delta[4] = {x*y*z, y*z, z, 1};
+    int bounds[4] = {t, x, y, z};
+    const int replica_offset = coords_per_replica * replica_index;
+
+    int aspect_a = aspect_ratios[2*replica_index];
+    int aspect_b = aspect_ratios[2*replica_index + 1];
+    int delta_a = coords_delta[edge_a];
+    int delta_b = coords_delta[edge_b];
+
+    for (int a_index = 0; a_index < aspect_a; a_index ++) {
+        int a_offset = a_index * delta_a * 6;
+        for (int b_index = 0; b_index < aspect_b; b_index ++) {
+            int index = a_offset + (b_index * delta_b * 6) + plaquette_type;
+            plaquette_buffer[replica_offset + index] += 1;
+        }
+    }
+}
+
 extern "C" __global__ void wilson_loop_probs(int* plaquette_buffer,
     float* potential_buffer, float* chemical_potential_buffer,
     int* potential_redirect, int potential_vector_size,
@@ -285,19 +316,19 @@ extern "C" __global__ void wilson_loop_probs(int* plaquette_buffer,
         // We will not consider wrapping, since we are working with a square with a corner at (0,0) growing in the positive
         // directions. So our coord deltas do not need fancy stuff.
         int para_aspect = aspects[edge];
-        int para_delta = coords_delta[edges[edge]];
+        int para_delta = coords_delta[edges[edge]] * 6;
         int ortho_aspect = aspects[1-edge];
-        int ortho_delta = coords_delta[edges[1-edge]];
+        int ortho_delta = coords_delta[edges[1-edge]] * 6;
 
         for (int ortho_index = 0; ortho_index < ortho_aspect; ortho_index++) {
             // Calculate cost of extending loop in the para direction.
             int inc_index = (para_aspect + 1) * para_delta + ortho_index * ortho_delta + plaquette_type;
-            int np = plaquette_buffer[inc_index];
+            int np = plaquette_buffer[replica_offset + inc_index];
             inc_costs[edge] += potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)];
 
             // Calculate cost of shrinking loop downwards
             int dec_index = para_aspect * para_delta + ortho_index * ortho_delta + plaquette_type;
-            np = plaquette_buffer[dec_index];
+            np = plaquette_buffer[replica_offset + dec_index];
             dec_costs[edge] += potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)];
         }
         inc_costs[edge] -= ortho_aspect * chemical_potential_buffer[potential_index];
@@ -305,12 +336,12 @@ extern "C" __global__ void wilson_loop_probs(int* plaquette_buffer,
     }
     // Now calculate the inc corner for when both edges are pushed at once.
     int inc_index = (aspects[0] + 1) * coords_delta[edges[0]] + (aspects[1] + 1) * coords_delta[edges[1]] + plaquette_type;
-    int np = plaquette_buffer[inc_index];
+    int np = plaquette_buffer[replica_offset + inc_index];
     float corner_inc_cost = potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)] - chemical_potential_buffer[potential_index];
 
     // And calculate the dec corner which was double counted if each edge is pulled at once.
     int dec_index = aspects[0] * coords_delta[edges[0]] + aspects[1] * coords_delta[edges[1]] + plaquette_type;
-    np = plaquette_buffer[dec_index];
+    np = plaquette_buffer[replica_offset + dec_index];
     float corner_dec_cost = potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)] + chemical_potential_buffer[potential_index];
 
     // Now write the probabilities of various moves into the output buffer

@@ -30,6 +30,7 @@ pub struct CudaBackend {
     cuda_rng: CudaRng,
     local_update_types: Option<Vec<(u16, bool)>>,
     parallel_tempering_debug: Option<TemperingTracker>,
+    wilson_loop_probs: Option<(usize, CudaSlice<f32>)>,
 }
 
 enum RedirectArrays {
@@ -217,7 +218,8 @@ impl CudaBackend {
                     "update_matter_loops",
                     "calculate_matter_flow_through_coords",
                     "calculate_matter_corners_for_plaquettes",
-                    "wilson_loop_probs"
+                    "wilson_loop_probs",
+                    "initialize_wilson_loops_for_probs"
                 ],
             )
             .map_err(CudaError::from)?;
@@ -313,6 +315,7 @@ impl CudaBackend {
             cuda_rng,
             local_update_types: Some(local_update_types),
             parallel_tempering_debug: None,
+            wilson_loop_probs: None,
         })
     }
 
