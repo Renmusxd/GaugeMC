@@ -30,7 +30,14 @@ pub struct CudaBackend {
     cuda_rng: CudaRng,
     local_update_types: Option<Vec<(u16, bool)>>,
     parallel_tempering_debug: Option<TemperingTracker>,
-    wilson_loop_probs: Option<(usize, CudaSlice<f32>)>,
+    wilson_loop_probs: Option<WilsonLoopProbsData>,
+}
+
+struct WilsonLoopProbsData {
+    plaquette_type: u16,
+    times_run: usize,
+    aspect_ratios: CudaSlice<u32>,
+    probs_slice: CudaSlice<f32>,
 }
 
 enum RedirectArrays {
@@ -329,6 +336,107 @@ impl CudaBackend {
 
     pub fn get_parallel_tracking(&self) -> Option<&HashMap<(usize, usize), (usize, usize)>> {
         self.parallel_tempering_debug.as_ref().map(|x| x.get_map())
+    }
+
+    pub fn initialize_wilson_loops_per_replica(&mut self, aspect_ratios: Vec<(usize, usize)>, plaquette_type: u16) -> Result<(), CudaError> {
+        if aspect_ratios.len() != self.nreplicas {
+            return CudaError::value_error(format!("With {} replicas expected {} aspect ratios but found {}", self.nreplicas, self.nreplicas, aspect_ratios.len()));
+        }
+        let mut aspect_ratios_buffer = self.device
+            .alloc_zeros::<u32>(2 * self.nreplicas)
+            .map_err(CudaError::from)?;
+        let aspect_ratios = aspect_ratios.into_iter().flat_map(|(a, b)| [a as u32, b as u32]).collect::<Vec<_>>();
+        self.device
+            .htod_copy_into(aspect_ratios, &mut aspect_ratios_buffer)
+            .map_err(CudaError::from)?;
+
+        let cfg = LaunchConfig::for_num_elems(self.nreplicas as u32);
+        let global_update = self
+            .device
+            .get_func("gauge_kernel", "initialize_wilson_loops_for_probs")
+            .unwrap();
+        unsafe {
+            global_update
+                .launch(
+                    cfg,
+                    (
+                        &mut self.state,
+                        &aspect_ratios_buffer,
+                        plaquette_type,
+                        self.nreplicas,
+                        self.bounds.t,
+                        self.bounds.x,
+                        self.bounds.y,
+                        self.bounds.z,
+                    ),
+                )
+                .map_err(CudaError::from)?
+        };
+
+        let probs_slice = self.device
+            .alloc_zeros::<f32>(6 * self.nreplicas)
+            .map_err(CudaError::from)?;
+        self.wilson_loop_probs = Some(WilsonLoopProbsData {
+            plaquette_type,
+            times_run: 0,
+            aspect_ratios: aspect_ratios_buffer,
+            probs_slice,
+        });
+
+        Ok(())
+    }
+
+    pub fn calculate_wilson_loop_transition_probs(&mut self) -> Result<(), CudaError> {
+        if let Some(mut wilson_loop_probs) = self.wilson_loop_probs.take() {
+            let cfg = LaunchConfig::for_num_elems(self.nreplicas as u32);
+            let global_update = self
+                .device
+                .get_func("gauge_kernel", "wilson_loop_probs")
+                .unwrap();
+            unsafe {
+                global_update
+                    .launch(
+                        cfg,
+                        (
+                            &mut self.state,
+                            &self.potential_buffer,
+                            &self.winding_chemical_potential_buffer,
+                            &self.potential_redirect_buffer,
+                            self.potential_size,
+                            &wilson_loop_probs.aspect_ratios,
+                            &mut wilson_loop_probs.probs_slice,
+                            wilson_loop_probs.plaquette_type,
+                            self.nreplicas,
+                            (self.bounds.t << 16) | self.bounds.x,
+                            (self.bounds.y << 16) | self.bounds.z,
+                        ),
+                    )
+                    .map_err(CudaError::from)?
+            };
+            wilson_loop_probs.times_run += 1;
+
+            self.wilson_loop_probs = Some(wilson_loop_probs);
+            Ok(())
+        } else {
+            CudaError::value_error("Initialization has not been run.")
+        }
+    }
+
+    pub fn get_wilson_loop_transition_probs(&mut self) -> Result<Array2<f32>, CudaError> {
+        if let Some(wilson_loop_probs) = self.wilson_loop_probs.as_ref() {
+            let output = self
+                .device
+                .dtoh_sync_copy(&wilson_loop_probs.probs_slice)
+                .map_err(CudaError::from)?;
+            let mut results = Array2::from_shape_vec((self.nreplicas, 6), output).unwrap();
+            results.iter_mut().for_each(|x| {
+                *x /= wilson_loop_probs.times_run as f32;
+            });
+
+            Ok(results)
+        } else {
+            CudaError::value_error("Initialization has not been run.")
+        }
     }
 
     pub fn permute_states(&mut self, permutation: &[usize]) -> Result<(), CudaError> {
@@ -2076,6 +2184,59 @@ mod tests {
         assert_eq!(sum_coords[[0, 1, 0, 0, 0]], 2);
         assert_eq!(sum_coords[[0, 0, 1, 0, 0]], 2);
         assert_eq!(sum_coords[[0, 1, 1, 0, 0]], 1);
+        Ok(())
+    }
+
+
+    #[test]
+    fn initialize_wilson_loops() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (4, 8, 8, 8, 8);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_simple_potentials(r, 32),
+            None,
+            Some(31415),
+            None,
+            None,
+        )?;
+        let aspect_ratios = (0..r).map(|x| (x, x)).collect();
+        state.initialize_wilson_loops_per_replica(aspect_ratios, 0)?;
+        let plaquettes = state.get_plaquettes()?;
+
+        for rr in 0..r {
+            let ss = plaquettes.slice(s![rr, .., .., 0, 0, 0]);
+
+            assert_eq!(ss.sum() as usize, rr.pow(2));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_and_run_wilson_loops() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (16, 32, 32, 32, 32);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_simple_potentials(r, 32),
+            None,
+            Some(31415),
+            None,
+            None,
+        )?;
+        let aspect_ratios = (0..r).map(|x| (x, x)).collect();
+        state.initialize_wilson_loops_per_replica(aspect_ratios, 0)?;
+        let plaquettes = state.get_plaquettes()?;
+
+        for rr in 0..r {
+            let ss = plaquettes.slice(s![rr, .., .., 0, 0, 0]);
+            assert_eq!(ss.sum() as usize, rr.pow(2));
+        }
+
+        state.calculate_wilson_loop_transition_probs()?;
+        let result = state.get_wilson_loop_transition_probs()?;
+
+        println!("{:?}", result);
+
         Ok(())
     }
 }

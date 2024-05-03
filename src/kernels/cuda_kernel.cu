@@ -259,8 +259,7 @@ extern "C" __global__ void initialize_wilson_loops_for_probs(int* plaquette_buff
 
     const int coords_per_replica = t*x*y*z;
     int coords_delta[4] = {x*y*z, y*z, z, 1};
-    int bounds[4] = {t, x, y, z};
-    const int replica_offset = coords_per_replica * replica_index;
+    const int replica_offset = coords_per_replica * replica_index * 6;
 
     int aspect_a = aspect_ratios[2*replica_index];
     int aspect_b = aspect_ratios[2*replica_index + 1];
@@ -281,12 +280,16 @@ extern "C" __global__ void wilson_loop_probs(int* plaquette_buffer,
     int* potential_redirect, int potential_vector_size,
     int* aspect_ratios, float* probability_log,
     unsigned short plaquette_type,
-    int replicas, int t, int x, int y, int z)
+    int replicas, int tx, int yz)
 {
     int replica_index = get_thread_number();
     if (replica_index >= replicas) {
         return;
     }
+    int t = (tx >> 16) & 0xFFFF;
+    int x = tx & 0xFFFF;
+    int y = (yz >> 16) & 0xFFFF;
+    int z = yz & 0xFFFF;
 
     int aspect_a = aspect_ratios[2*replica_index];
     int aspect_b = aspect_ratios[2*replica_index + 1];
@@ -297,9 +300,8 @@ extern "C" __global__ void wilson_loop_probs(int* plaquette_buffer,
 
     const int coords_per_replica = t*x*y*z;
     int coords_delta[4] = {x*y*z, y*z, z, 1};
-    int bounds[4] = {t, x, y, z};
 
-    const int replica_offset = coords_per_replica * replica_index;
+    const int replica_offset = coords_per_replica * replica_index * 6;
 
     int potential_index = potential_redirect[replica_index];
     int potential_offset = potential_index * potential_vector_size;
@@ -322,42 +324,54 @@ extern "C" __global__ void wilson_loop_probs(int* plaquette_buffer,
 
         for (int ortho_index = 0; ortho_index < ortho_aspect; ortho_index++) {
             // Calculate cost of extending loop in the para direction.
-            int inc_index = (para_aspect + 1) * para_delta + ortho_index * ortho_delta + plaquette_type;
+            int inc_index = para_aspect * para_delta + ortho_index * ortho_delta + plaquette_type;
             int np = plaquette_buffer[replica_offset + inc_index];
             inc_costs[edge] += potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)];
 
             // Calculate cost of shrinking loop downwards
-            int dec_index = para_aspect * para_delta + ortho_index * ortho_delta + plaquette_type;
-            np = plaquette_buffer[replica_offset + dec_index];
-            dec_costs[edge] += potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)];
+            if (para_aspect > 0) {
+                int dec_index = (para_aspect - 1) * para_delta + ortho_index * ortho_delta + plaquette_type;
+                np = plaquette_buffer[replica_offset + dec_index];
+                dec_costs[edge] += potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)];
+            }
         }
         inc_costs[edge] -= ortho_aspect * chemical_potential_buffer[potential_index];
         dec_costs[edge] += ortho_aspect * chemical_potential_buffer[potential_index];
     }
+
+//     printf("[%d] %.3f\t%.3f\t%.3f\t%.3f\n", replica_index, aspects[0], aspects[1], dec_costs[0], dec_costs[1], inc_costs[0], inc_costs[1]);
+    printf("[%d] %.3f\t%.3f\t%.3f\t%.3f\n", replica_index, metropolis_prob(dec_costs[0]), metropolis_prob(dec_costs[1]), metropolis_prob(inc_costs[0]), metropolis_prob(inc_costs[1]));
+
+    // Now write the probabilities of various moves into the output buffer
+    // Decrease edge_a
+    if (aspects[0] > 0) {
+        probability_log[6*replica_index + 0] += metropolis_prob(dec_costs[0]);
+    }
+    // Decrease edge_b
+    if (aspects[1] > 0) {
+        probability_log[6*replica_index + 1] += metropolis_prob(dec_costs[1]);
+    }
+    // Decrease edge_a and edge_b (taking into account the double counted corner).
+    if (aspects[0] > 0 && aspects[1] > 0) {
+        // And calculate the dec corner which was double counted if each edge is pulled at once.
+        int dec_index = (aspects[0]-1) * coords_delta[edges[0]] + (aspects[1]-1) * coords_delta[edges[1]] + plaquette_type;
+        int np = plaquette_buffer[replica_offset + dec_index];
+        float corner_dec_cost = potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)] + chemical_potential_buffer[potential_index];
+
+        probability_log[6*replica_index + 2] += metropolis_prob(dec_costs[0] + dec_costs[1] - corner_dec_cost);
+    }
+
     // Now calculate the inc corner for when both edges are pushed at once.
-    int inc_index = (aspects[0] + 1) * coords_delta[edges[0]] + (aspects[1] + 1) * coords_delta[edges[1]] + plaquette_type;
+    int inc_index = aspects[0] * coords_delta[edges[0]] + aspects[1] * coords_delta[edges[1]] + plaquette_type;
     int np = plaquette_buffer[replica_offset + inc_index];
     float corner_inc_cost = potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)] - chemical_potential_buffer[potential_index];
 
-    // And calculate the dec corner which was double counted if each edge is pulled at once.
-    int dec_index = aspects[0] * coords_delta[edges[0]] + aspects[1] * coords_delta[edges[1]] + plaquette_type;
-    np = plaquette_buffer[replica_offset + dec_index];
-    float corner_dec_cost = potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)] + chemical_potential_buffer[potential_index];
-
-    // Now write the probabilities of various moves into the output buffer
-
-    // Decrease edge_a
-    probability_log[0] += metropolis_prob(dec_costs[0]);
-    // Decrease edge_b
-    probability_log[1] += metropolis_prob(dec_costs[1]);
-    // Decrease edge_a and edge_b (taking into account the double counted corner).
-    probability_log[2] += metropolis_prob(dec_costs[0] + dec_costs[1] - corner_dec_cost);
     // Increase edge_a
-    probability_log[3] += metropolis_prob(inc_costs[0]);
+    probability_log[6*replica_index + 3] += metropolis_prob(inc_costs[0]);
     // Increase edge_b
-    probability_log[4] += metropolis_prob(inc_costs[1]);
+    probability_log[6*replica_index + 4] += metropolis_prob(inc_costs[1]);
     // Increase edge_a and edge_b (taking into account the uncounted corner).
-    probability_log[5] += metropolis_prob(inc_costs[0] + inc_costs[1] + corner_inc_cost);
+    probability_log[6*replica_index + 5] += metropolis_prob(inc_costs[0] + inc_costs[1] + corner_inc_cost);
 }
 
 extern "C" __global__ void update_matter_loops(int* plaquette_buffer,
