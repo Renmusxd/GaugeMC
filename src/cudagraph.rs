@@ -30,14 +30,22 @@ pub struct CudaBackend {
     cuda_rng: CudaRng,
     local_update_types: Option<Vec<(u16, bool)>>,
     parallel_tempering_debug: Option<TemperingTracker>,
-    wilson_loop_probs: Option<WilsonLoopProbsData>,
+    wilson_loop_probs: Option<WilsonLoopData>,
 }
 
-struct WilsonLoopProbsData {
-    plaquette_type: u16,
-    times_run: usize,
-    aspect_ratios: CudaSlice<u32>,
-    probs_slice: CudaSlice<f32>,
+enum WilsonLoopData {
+    AspectRatios {
+        plaquette_type: u16,
+        times_run: usize,
+        aspect_ratios: CudaSlice<u32>,
+        probs_slice: CudaSlice<f32>,
+    },
+    IncrementOnSquares {
+        plaquette_type: u16,
+        times_run: usize,
+        increment_buffer: CudaSlice<u32>,
+        probs_slice: CudaSlice<f32>,
+    },
 }
 
 enum RedirectArrays {
@@ -226,7 +234,9 @@ impl CudaBackend {
                     "calculate_matter_flow_through_coords",
                     "calculate_matter_corners_for_plaquettes",
                     "wilson_loop_probs",
-                    "initialize_wilson_loops_for_probs"
+                    "wilson_loop_probs_incremental_square",
+                    "initialize_wilson_loops_for_probs",
+                    "initialize_wilson_loops_for_probs_incremental_square",
                 ],
             )
             .map_err(CudaError::from)?;
@@ -376,7 +386,7 @@ impl CudaBackend {
         let probs_slice = self.device
             .alloc_zeros::<f32>(6 * self.nreplicas)
             .map_err(CudaError::from)?;
-        self.wilson_loop_probs = Some(WilsonLoopProbsData {
+        self.wilson_loop_probs = Some(WilsonLoopData::AspectRatios {
             plaquette_type,
             times_run: 0,
             aspect_ratios: aspect_ratios_buffer,
@@ -386,56 +396,191 @@ impl CudaBackend {
         Ok(())
     }
 
-    pub fn calculate_wilson_loop_transition_probs(&mut self) -> Result<(), CudaError> {
-        if let Some(mut wilson_loop_probs) = self.wilson_loop_probs.take() {
-            let cfg = LaunchConfig::for_num_elems(self.nreplicas as u32);
-            let global_update = self
-                .device
-                .get_func("gauge_kernel", "wilson_loop_probs")
-                .unwrap();
-            unsafe {
-                global_update
-                    .launch(
-                        cfg,
-                        (
-                            &mut self.state,
-                            &self.potential_buffer,
-                            &self.winding_chemical_potential_buffer,
-                            &self.potential_redirect_buffer,
-                            self.potential_size,
-                            &wilson_loop_probs.aspect_ratios,
-                            &mut wilson_loop_probs.probs_slice,
-                            wilson_loop_probs.plaquette_type,
-                            self.nreplicas,
-                            (self.bounds.t << 16) | self.bounds.x,
-                            (self.bounds.y << 16) | self.bounds.z,
-                        ),
-                    )
-                    .map_err(CudaError::from)?
-            };
-            wilson_loop_probs.times_run += 1;
+    pub fn initialize_wilson_loops_for_probs_incremental_square(&mut self, increments: Vec<usize>, plaquette_type: u16) -> Result<(), CudaError> {
+        if increments.len() != self.nreplicas {
+            return CudaError::value_error(format!("With {} replicas expected {} aspect ratios but found {}", self.nreplicas, self.nreplicas, increments.len()));
+        }
+        let increments = increments.into_iter().map(|x| x as u32).collect();
+        let mut increment_buffer = self.device
+            .alloc_zeros::<u32>(self.nreplicas)
+            .map_err(CudaError::from)?;
+        self.device
+            .htod_copy_into(increments, &mut increment_buffer)
+            .map_err(CudaError::from)?;
 
-            self.wilson_loop_probs = Some(wilson_loop_probs);
-            Ok(())
-        } else {
-            CudaError::value_error("Initialization has not been run.")
+        let cfg = LaunchConfig::for_num_elems(self.nreplicas as u32);
+        let global_update = self
+            .device
+            .get_func("gauge_kernel", "initialize_wilson_loops_for_probs_incremental_square")
+            .unwrap();
+        unsafe {
+            global_update
+                .launch(
+                    cfg,
+                    (
+                        &mut self.state,
+                        &increment_buffer,
+                        plaquette_type,
+                        self.nreplicas,
+                        self.bounds.t,
+                        self.bounds.x,
+                        self.bounds.y,
+                        self.bounds.z,
+                    ),
+                )
+                .map_err(CudaError::from)?
+        };
+
+        let probs_slice = self.device
+            .alloc_zeros::<f32>(2 * self.nreplicas)
+            .map_err(CudaError::from)?;
+        self.wilson_loop_probs = Some(WilsonLoopData::IncrementOnSquares {
+            plaquette_type,
+            times_run: 0,
+            increment_buffer,
+            probs_slice,
+        });
+
+        Ok(())
+    }
+
+    pub fn calculate_wilson_loop_transition_probs(&mut self) -> Result<(), CudaError> {
+        match self.wilson_loop_probs.take() {
+            None => CudaError::value_error("Initialization has not been run."),
+            Some(WilsonLoopData::AspectRatios {
+                     plaquette_type,
+                     mut times_run,
+                     aspect_ratios,
+                     mut probs_slice,
+                 }) => {
+                let cfg = LaunchConfig::for_num_elems(self.nreplicas as u32);
+                let global_update = self
+                    .device
+                    .get_func("gauge_kernel", "wilson_loop_probs")
+                    .unwrap();
+                unsafe {
+                    global_update
+                        .launch(
+                            cfg,
+                            (
+                                &mut self.state,
+                                &self.potential_buffer,
+                                &self.winding_chemical_potential_buffer,
+                                &self.potential_redirect_buffer,
+                                self.potential_size,
+                                &aspect_ratios,
+                                &mut probs_slice,
+                                plaquette_type,
+                                self.nreplicas,
+                                (self.bounds.t << 16) | self.bounds.x,
+                                (self.bounds.y << 16) | self.bounds.z,
+                            ),
+                        )
+                        .map_err(CudaError::from)?
+                };
+                times_run += 1;
+
+                self.wilson_loop_probs = Some(WilsonLoopData::AspectRatios {
+                    plaquette_type,
+                    times_run,
+                    aspect_ratios,
+                    probs_slice,
+                });
+                Ok(())
+            }
+            Some(WilsonLoopData::IncrementOnSquares {
+                     plaquette_type,
+                     mut times_run,
+                     increment_buffer,
+                     mut probs_slice,
+                 }) => {
+                let cfg = LaunchConfig::for_num_elems(self.nreplicas as u32);
+                let global_update = self
+                    .device
+                    .get_func("gauge_kernel", "wilson_loop_probs_incremental_square")
+                    .unwrap();
+                unsafe {
+                    global_update
+                        .launch(
+                            cfg,
+                            (
+                                &mut self.state,
+                                &self.potential_buffer,
+                                &self.winding_chemical_potential_buffer,
+                                &self.potential_redirect_buffer,
+                                self.potential_size,
+                                &increment_buffer,
+                                &mut probs_slice,
+                                plaquette_type,
+                                self.nreplicas,
+                                (self.bounds.t << 16) | self.bounds.x,
+                                (self.bounds.y << 16) | self.bounds.z,
+                            ),
+                        )
+                        .map_err(CudaError::from)?
+                };
+                times_run += 1;
+
+                self.wilson_loop_probs = Some(WilsonLoopData::IncrementOnSquares {
+                    plaquette_type,
+                    times_run,
+                    increment_buffer,
+                    probs_slice,
+                });
+                Ok(())
+            }
         }
     }
 
     pub fn get_wilson_loop_transition_probs(&mut self) -> Result<Array2<f32>, CudaError> {
-        if let Some(wilson_loop_probs) = self.wilson_loop_probs.as_ref() {
-            let output = self
-                .device
-                .dtoh_sync_copy(&wilson_loop_probs.probs_slice)
-                .map_err(CudaError::from)?;
-            let mut results = Array2::from_shape_vec((self.nreplicas, 6), output).unwrap();
-            results.iter_mut().for_each(|x| {
-                *x /= wilson_loop_probs.times_run as f32;
-            });
+        match self.wilson_loop_probs.take() {
+            None => CudaError::value_error("Initialization has not been run."),
+            Some(WilsonLoopData::AspectRatios {
+                     plaquette_type,
+                     mut times_run,
+                     aspect_ratios,
+                     mut probs_slice,
+                 }) => {
+                let output = self
+                    .device
+                    .dtoh_sync_copy(&probs_slice)
+                    .map_err(CudaError::from)?;
+                let mut results = Array2::from_shape_vec((self.nreplicas, 6), output).unwrap();
+                results.iter_mut().for_each(|x| {
+                    *x /= times_run as f32;
+                });
 
-            Ok(results)
-        } else {
-            CudaError::value_error("Initialization has not been run.")
+                self.wilson_loop_probs = Some(WilsonLoopData::AspectRatios {
+                    plaquette_type,
+                    times_run,
+                    aspect_ratios,
+                    probs_slice,
+                });
+                Ok(results)
+            }
+            Some(WilsonLoopData::IncrementOnSquares {
+                     plaquette_type,
+                     times_run,
+                     increment_buffer,
+                     probs_slice,
+                 }) => {
+                let output = self
+                    .device
+                    .dtoh_sync_copy(&probs_slice)
+                    .map_err(CudaError::from)?;
+                let mut results = Array2::from_shape_vec((self.nreplicas, 2), output).unwrap();
+                results.iter_mut().for_each(|x| {
+                    *x /= times_run as f32;
+                });
+
+                self.wilson_loop_probs = Some(WilsonLoopData::IncrementOnSquares {
+                    plaquette_type,
+                    times_run,
+                    increment_buffer,
+                    probs_slice,
+                });
+                Ok(results)
+            }
         }
     }
 
@@ -2205,8 +2350,30 @@ mod tests {
 
         for rr in 0..r {
             let ss = plaquettes.slice(s![rr, .., .., 0, 0, 0]);
-
             assert_eq!(ss.sum() as usize, rr.pow(2));
+        }
+
+        Ok(())
+    }
+
+
+    #[test]
+    fn initialize_increment_squares_wilson_loops() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (17, 8, 8, 8, 8);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_simple_potentials(r, 32),
+            None,
+            Some(31415),
+            None,
+            None,
+        )?;
+        state.initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
+        let plaquettes = state.get_plaquettes()?;
+
+        for rr in 0..r {
+            let ss = plaquettes.slice(s![rr, .., .., 0, 0, 0]);
+            assert_eq!(ss.sum() as usize, rr);
         }
 
         Ok(())
@@ -2230,6 +2397,34 @@ mod tests {
         for rr in 0..r {
             let ss = plaquettes.slice(s![rr, .., .., 0, 0, 0]);
             assert_eq!(ss.sum() as usize, rr.pow(2));
+        }
+
+        state.calculate_wilson_loop_transition_probs()?;
+        let result = state.get_wilson_loop_transition_probs()?;
+
+        println!("{:?}", result);
+
+        Ok(())
+    }
+
+
+    #[test]
+    fn initialize_and_run_increment_squares_wilson_loops() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (17, 4, 4, 4, 4);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_simple_potentials(r, 32),
+            None,
+            Some(31415),
+            None,
+            None,
+        )?;
+        state.initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
+        let plaquettes = state.get_plaquettes()?;
+
+        for rr in 0..r {
+            let ss = plaquettes.slice(s![rr, .., .., 0, 0, 0]);
+            assert_eq!(ss.sum() as usize, rr);
         }
 
         state.calculate_wilson_loop_transition_probs()?;

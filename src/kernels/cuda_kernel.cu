@@ -245,6 +245,89 @@ extern "C" __global__ void calculate_matter_corners_for_plaquettes(int* plaquett
     }
 }
 
+__device__ void get_inc_and_dec_index(int inc_number, unsigned int* a, unsigned int* b) {
+    unsigned int square_num = 0;
+    for (unsigned int i = 0; i*i <= inc_number; i++) {
+        square_num = i;
+    }
+
+    int remaining = inc_number - square_num*square_num;
+    if (remaining < square_num) {
+        *a = remaining;
+        *b = square_num;
+    } else if (remaining < 2*square_num) {
+        *a = square_num;
+        *b = remaining - square_num;
+    } else {
+        *a = square_num;
+        *b = square_num;
+    }
+}
+
+extern "C" __global__ void initialize_wilson_loops_for_probs_incremental_square(int* plaquette_buffer,
+    unsigned int* increment_index, unsigned short plaquette_type, int replicas, int t, int x, int y, int z)
+{
+    int replica_index = get_thread_number();
+    if (replica_index >= replicas) {
+        return;
+    }
+
+    unsigned short edge_a = 0;
+    unsigned short edge_b = 0;
+    edge_types_for_plaquette_type(plaquette_type, &edge_a, &edge_b);
+
+    const int coords_per_replica = t*x*y*z;
+    int coords_delta[4] = {x*y*z, y*z, z, 1};
+    const int replica_offset = coords_per_replica * replica_index * 6;
+    unsigned int delta_a = coords_delta[edge_a];
+    unsigned int delta_b = coords_delta[edge_b];
+
+    unsigned int increment_number = increment_index[replica_index];
+
+// // Remaining code is equivalent to this but more efficient.
+//     for (int i = 0; i < increment_number; i++) {
+//         unsigned int a = 0;
+//         unsigned int b = 0;
+//         get_inc_and_dec_index(i, &a, &b);
+//
+//         int index = (a * delta_a * 6) + (b * delta_b * 6) + plaquette_type;
+//         plaquette_buffer[replica_offset + index] += 1;
+//     }
+
+    // First remove squares
+    unsigned int square_num = 0;
+    for (unsigned int i = 0; i*i <= increment_number; i++) {
+        square_num = i;
+    }
+    for (unsigned int a_index = 0; a_index < square_num; a_index ++) {
+        unsigned int a_offset = a_index * delta_a * 6;
+        for (unsigned int b_index = 0; b_index < square_num; b_index ++) {
+            unsigned int index = a_offset + (b_index * delta_b * 6) + plaquette_type;
+            plaquette_buffer[replica_offset + index] += 1;
+        }
+    }
+
+    // Now fill in the remaining.
+    unsigned int remaining_increment = increment_number - square_num*square_num;
+    for (unsigned int inc_index = 0; inc_index < min(remaining_increment, square_num); inc_index ++) {
+        unsigned int index = (inc_index * delta_a * 6) + (square_num * delta_b * 6) + plaquette_type;
+        plaquette_buffer[replica_offset + index] += 1;
+    }
+
+    remaining_increment -= min(remaining_increment, square_num);
+    for (unsigned int inc_index = 0; inc_index < min(remaining_increment, square_num); inc_index ++) {
+        unsigned int index = (square_num * delta_a * 6) + (inc_index * delta_b * 6) + plaquette_type;
+        plaquette_buffer[replica_offset + index] += 1;
+    }
+    remaining_increment -= min(remaining_increment, square_num);
+
+    if (remaining_increment > 0) {
+        int index = (square_num * delta_a * 6) + (square_num * delta_b * 6) + plaquette_type;
+        plaquette_buffer[replica_offset + index] += 1;
+    }
+}
+
+
 extern "C" __global__ void initialize_wilson_loops_for_probs(int* plaquette_buffer,
     int* aspect_ratios, unsigned short plaquette_type, int replicas, int t, int x, int y, int z)
 {
@@ -272,6 +355,65 @@ extern "C" __global__ void initialize_wilson_loops_for_probs(int* plaquette_buff
             int index = a_offset + (b_index * delta_b * 6) + plaquette_type;
             plaquette_buffer[replica_offset + index] += 1;
         }
+    }
+}
+
+extern "C" __global__ void wilson_loop_probs_incremental_square(int* plaquette_buffer,
+    float* potential_buffer, float* chemical_potential_buffer,
+    int* potential_redirect, int potential_vector_size,
+    int* increment_index, float* probability_log,
+    unsigned short plaquette_type,
+    int replicas, int tx, int yz)
+{
+    int replica_index = get_thread_number();
+    if (replica_index >= replicas) {
+        return;
+    }
+    int t = (tx >> 16) & 0xFFFF;
+    int x = tx & 0xFFFF;
+    int y = (yz >> 16) & 0xFFFF;
+    int z = yz & 0xFFFF;
+
+    unsigned int increment_number = increment_index[replica_index];
+
+    unsigned short edge_a = 0;
+    unsigned short edge_b = 0;
+    edge_types_for_plaquette_type(plaquette_type, &edge_a, &edge_b);
+
+    const int coords_per_replica = t*x*y*z;
+    int coords_delta[4] = {x*y*z, y*z, z, 1};
+
+    const int replica_offset = coords_per_replica * replica_index * 6;
+
+    int potential_index = potential_redirect[replica_index];
+    int potential_offset = potential_index * potential_vector_size;
+
+    int delta_a = coords_delta[edge_a] * 6;
+    int delta_b = coords_delta[edge_b] * 6;
+    if (increment_number > 0) {
+        unsigned int prev_a = 0;
+        unsigned int prev_b = 0;
+        get_inc_and_dec_index(increment_number - 1, &prev_a, &prev_b);
+
+        int dec_index = prev_a * delta_a + prev_b * delta_b + plaquette_type;
+        int np = plaquette_buffer[replica_offset + dec_index];
+
+        float dec_cost = potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)];
+        probability_log[2*replica_index + 0] += metropolis_prob(dec_cost);
+    }
+
+    int coords[4] = {t,x,y,z};
+    int area = coords[edge_a] * coords[edge_b];
+    if (increment_number < area) {
+        unsigned int a = 0;
+        unsigned int b = 0;
+        get_inc_and_dec_index(increment_number, &a, &b);
+
+        int inc_index = a * delta_a + b * delta_b + plaquette_type;
+        int np = plaquette_buffer[replica_offset + inc_index];
+
+        float inc_cost = potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)];
+        probability_log[2*replica_index + 1] += metropolis_prob(inc_cost);
     }
 }
 

@@ -16,7 +16,7 @@ fn main() -> Result<(), CudaError> {
         .enumerate()
         .for_each(|(i, mut v)| {
             v.iter_mut().enumerate().for_each(|(j, v)| {
-                *v = ((i + 1) * (j.pow(2))) as f32 / 0.75;
+                *v = ((i + 1) * (j.pow(2))) as f32 / 1.0;
             })
         });
 
