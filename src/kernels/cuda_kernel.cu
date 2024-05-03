@@ -339,9 +339,6 @@ extern "C" __global__ void wilson_loop_probs(int* plaquette_buffer,
         dec_costs[edge] += ortho_aspect * chemical_potential_buffer[potential_index];
     }
 
-//     printf("[%d] %.3f\t%.3f\t%.3f\t%.3f\n", replica_index, aspects[0], aspects[1], dec_costs[0], dec_costs[1], inc_costs[0], inc_costs[1]);
-    printf("[%d] %.3f\t%.3f\t%.3f\t%.3f\n", replica_index, metropolis_prob(dec_costs[0]), metropolis_prob(dec_costs[1]), metropolis_prob(inc_costs[0]), metropolis_prob(inc_costs[1]));
-
     // Now write the probabilities of various moves into the output buffer
     // Decrease edge_a
     if (aspects[0] > 0) {
