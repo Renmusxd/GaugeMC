@@ -398,7 +398,7 @@ extern "C" __global__ void wilson_loop_probs_incremental_square(int* plaquette_b
         int dec_index = prev_a * delta_a + prev_b * delta_b + plaquette_type;
         int np = plaquette_buffer[replica_offset + dec_index];
 
-        float dec_cost = potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)];
+        float dec_cost = potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)] + chemical_potential_buffer[potential_index];
         probability_log[2*replica_index + 0] += metropolis_prob(dec_cost);
     }
 
@@ -412,7 +412,7 @@ extern "C" __global__ void wilson_loop_probs_incremental_square(int* plaquette_b
         int inc_index = a * delta_a + b * delta_b + plaquette_type;
         int np = plaquette_buffer[replica_offset + inc_index];
 
-        float inc_cost = potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)];
+        float inc_cost = potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)] - chemical_potential_buffer[potential_index];
         probability_log[2*replica_index + 1] += metropolis_prob(inc_cost);
     }
 }
