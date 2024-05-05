@@ -444,6 +444,30 @@ impl CudaBackend {
         Ok(())
     }
 
+    pub fn reset_wilson_loop_transition_probs(&mut self) -> Result<(), CudaError> {
+        match self.wilson_loop_probs.as_mut() {
+            None => CudaError::value_error("Initialization has not been run."),
+            Some(WilsonLoopData::AspectRatios {
+                     times_run,
+                     probs_slice,
+                     ..
+                 }) => {
+                *times_run = 0;
+                self.device.memset_zeros(probs_slice)
+                    .map_err(CudaError::from)
+            }
+            Some(WilsonLoopData::IncrementOnSquares {
+                     times_run,
+                     probs_slice,
+                     ..
+                 }) => {
+                *times_run = 0;
+                self.device.memset_zeros(probs_slice)
+                    .map_err(CudaError::from)
+            }
+        }
+    }
+
     pub fn calculate_wilson_loop_transition_probs(&mut self) -> Result<(), CudaError> {
         match self.wilson_loop_probs.take() {
             None => CudaError::value_error("Initialization has not been run."),
@@ -533,6 +557,22 @@ impl CudaBackend {
     }
 
     pub fn get_wilson_loop_transition_probs(&mut self) -> Result<Array2<f32>, CudaError> {
+        match self.wilson_loop_probs.as_ref() {
+            None => CudaError::value_error("Initialization has not been run."),
+            Some(WilsonLoopData::AspectRatios { .. }) => {
+                let mut results = Array2::zeros((self.nreplicas, 6));
+                self.get_wilson_loop_transition_probs_into(results.as_slice_mut().unwrap())?;
+                Ok(results)
+            }
+            Some(WilsonLoopData::IncrementOnSquares { .. }) => {
+                let mut results = Array2::zeros((self.nreplicas, 2));
+                self.get_wilson_loop_transition_probs_into(results.as_slice_mut().unwrap())?;
+                Ok(results)
+            }
+        }
+    }
+
+    pub fn get_wilson_loop_transition_probs_into(&mut self, output: &mut [f32]) -> Result<(), CudaError> {
         match self.wilson_loop_probs.take() {
             None => CudaError::value_error("Initialization has not been run."),
             Some(WilsonLoopData::AspectRatios {
@@ -541,14 +581,15 @@ impl CudaBackend {
                      aspect_ratios,
                      mut probs_slice,
                  }) => {
-                let output = self
+                self
                     .device
-                    .dtoh_sync_copy(&probs_slice)
+                    .dtoh_sync_copy_into(&probs_slice, output)
                     .map_err(CudaError::from)?;
-                let mut results = Array2::from_shape_vec((self.nreplicas, 6), output).unwrap();
-                results.iter_mut().for_each(|x| {
-                    *x /= times_run as f32;
-                });
+                if times_run > 0 {
+                    output.iter_mut().for_each(|x| {
+                        *x /= times_run as f32;
+                    });
+                }
 
                 self.wilson_loop_probs = Some(WilsonLoopData::AspectRatios {
                     plaquette_type,
@@ -556,7 +597,7 @@ impl CudaBackend {
                     aspect_ratios,
                     probs_slice,
                 });
-                Ok(results)
+                Ok(())
             }
             Some(WilsonLoopData::IncrementOnSquares {
                      plaquette_type,
@@ -564,22 +605,22 @@ impl CudaBackend {
                      increment_buffer,
                      probs_slice,
                  }) => {
-                let output = self
+                self
                     .device
-                    .dtoh_sync_copy(&probs_slice)
+                    .dtoh_sync_copy_into(&probs_slice, output)
                     .map_err(CudaError::from)?;
-                let mut results = Array2::from_shape_vec((self.nreplicas, 2), output).unwrap();
-                results.iter_mut().for_each(|x| {
-                    *x /= times_run as f32;
-                });
-
+                if times_run > 0 {
+                    output.iter_mut().for_each(|x| {
+                        *x /= times_run as f32;
+                    });
+                }
                 self.wilson_loop_probs = Some(WilsonLoopData::IncrementOnSquares {
                     plaquette_type,
                     times_run,
                     increment_buffer,
                     probs_slice,
                 });
-                Ok(results)
+                Ok(())
             }
         }
     }
@@ -2431,6 +2472,38 @@ mod tests {
         let result = state.get_wilson_loop_transition_probs()?;
 
         println!("{:?}", result);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wilson_loop_repeated_zeros() -> Result<(), CudaError> {
+        let (r, t, x, y, z) = (17, 4, 4, 4, 4);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(t, x, y, z),
+            make_simple_potentials(r, 32),
+            None,
+            Some(31415),
+            None,
+            None,
+        )?;
+        state.initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
+        let plaquettes = state.get_plaquettes()?;
+
+        for rr in 0..r {
+            let ss = plaquettes.slice(s![rr, .., .., 0, 0, 0]);
+            assert_eq!(ss.sum() as usize, rr);
+        }
+
+        state.calculate_wilson_loop_transition_probs()?;
+        let result = state.get_wilson_loop_transition_probs()?;
+        state.reset_wilson_loop_transition_probs()?;
+        let zero_result = state.get_wilson_loop_transition_probs()?;
+        let sh = result.shape();
+        assert_eq!(zero_result, Array2::zeros((sh[0], sh[1])));
+        state.calculate_wilson_loop_transition_probs()?;
+        let new_result = state.get_wilson_loop_transition_probs()?;
+        assert_eq!(result, new_result);
 
         Ok(())
     }
