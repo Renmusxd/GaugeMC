@@ -128,9 +128,11 @@ struct LocalUpdatePipeline {
     index_buffer: wgpu::Buffer,
     update_pipeline: wgpu::ComputePipeline,
 }
+
 struct GlobalUpdatePipeline {
     update_pipeline: wgpu::ComputePipeline,
 }
+
 struct PCGRotatePipeline {
     update_pipeline: wgpu::ComputePipeline,
 }
@@ -139,9 +141,11 @@ struct SumEnergyPipeline {
     init_sum_pipeline: wgpu::ComputePipeline,
     inc_sum_pipeline: wgpu::ComputePipeline,
 }
+
 struct WindingPipeline {
     winding_sum_pipeline: wgpu::ComputePipeline,
 }
+
 struct CopyPipeline {
     copy_state_pipeline: wgpu::ComputePipeline,
 }
@@ -196,7 +200,7 @@ impl GPUBackend {
         // `request_adapter` instantiates the general connection to the GPU
         let adapter = if let Some(device_id) = device_id {
             let mut adapters = instance
-                .enumerate_adapters(wgpu::Backends::all())
+                .enumerate_adapters(wgpu::Backends::all()).into_iter()
                 .filter(|x| x.get_info().device_type != DeviceType::Cpu)
                 .filter(|x| x.get_info().device == device_id)
                 .collect::<Vec<_>>();
@@ -209,7 +213,7 @@ impl GPUBackend {
                 Ok(a)
             } else {
                 let adapters = instance
-                    .enumerate_adapters(wgpu::Backends::all())
+                    .enumerate_adapters(wgpu::Backends::all()).into_iter()
                     .map(|a| a.get_info())
                     .collect::<Vec<_>>();
                 warn!(
@@ -244,8 +248,8 @@ impl GPUBackend {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
-                    features: wgpu::Features::empty(),
-                    limits,
+                    required_features: wgpu::Features::empty(),
+                    required_limits: limits,
                 },
                 None,
             )
@@ -333,6 +337,7 @@ impl GPUBackend {
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
                 entry_point: "main_local",
+                compilation_options: Default::default(),
             });
         let globalupdate_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -340,6 +345,7 @@ impl GPUBackend {
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
                 entry_point: "main_global",
+                compilation_options: Default::default(),
             });
         let rotate_pcg_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -347,18 +353,21 @@ impl GPUBackend {
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
                 entry_point: "rotate_pcg",
+                compilation_options: Default::default(),
             });
         let init_sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("initial energy summation pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &compute_shader,
             entry_point: "initial_sum_energy",
+            compilation_options: Default::default(),
         });
         let inc_sum_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("incremental energy summation pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &compute_shader,
             entry_point: "incremental_sum_energy",
+            compilation_options: Default::default(),
         });
         let winding_sum_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -366,6 +375,7 @@ impl GPUBackend {
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
                 entry_point: "calculate_winding_numbers",
+                compilation_options: Default::default(),
             });
         let copy_state_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -373,6 +383,7 @@ impl GPUBackend {
                 layout: Some(&compute_pipeline_layout),
                 module: &compute_shader,
                 entry_point: "copy_replica",
+                compilation_options: Default::default(),
             });
 
         let initial_state = if let Some(initial_state) = initial_state {
@@ -641,8 +652,8 @@ impl GPUBackend {
     }
 
     pub fn swap_replica_potentials<It>(&mut self, start: usize, stop: usize, it: It)
-    where
-        It: IntoIterator<Item = bool>,
+        where
+            It: IntoIterator<Item=bool>,
     {
         let entries = &mut self.vn_index_to_replica_index[start..stop];
         let state = self
@@ -1053,8 +1064,8 @@ impl GPUBackend {
     }
 
     pub fn write_arguments<It>(&mut self, it: It, num_replicas_overwrite: Option<usize>)
-    where
-        It: IntoIterator<Item = u32>,
+        where
+            It: IntoIterator<Item=u32>,
     {
         let vals = [
             self.shape.t as u32,
@@ -1063,15 +1074,15 @@ impl GPUBackend {
             self.shape.z as u32,
             num_replicas_overwrite.unwrap_or(self.num_replicas) as u32,
         ]
-        .into_iter()
-        // Put in all the vn offsets.
-        .chain((0..self.num_replicas).map(|r| {
-            let r_rot = self.replica_index_to_vn_index[r];
-            (self.vn.shape()[1] * r_rot) as u32
-        }))
-        // Add the additional arguments
-        .chain(it)
-        .collect::<Vec<u32>>();
+            .into_iter()
+            // Put in all the vn offsets.
+            .chain((0..self.num_replicas).map(|r| {
+                let r_rot = self.replica_index_to_vn_index[r];
+                (self.vn.shape()[1] * r_rot) as u32
+            }))
+            // Add the additional arguments
+            .chain(it)
+            .collect::<Vec<u32>>();
         let nvals = vals.len();
 
         let optimize_args = self.optimize_writing_args.unwrap_or(true);
@@ -1121,7 +1132,7 @@ impl GPUBackend {
                     self.written_arguments
                         .as_ref()
                         .map(|x| x.len())
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
                 ))
             ),
             self.written_arguments
@@ -1224,7 +1235,7 @@ impl GPUBackend {
     ) -> Result<Array1<f32>, String> {
         let read_num_values = read_num_values.unwrap_or(self.num_replicas);
         let data_vec = self.read_sumbuffer_from_gpu(read_num_values);
-        let mut result = Array1::zeros((read_num_values,));
+        let mut result = Array1::zeros((read_num_values, ));
         result.iter_mut().enumerate().for_each(|(r, v)| {
             let r_rot = self.vn_index_to_replica_index[r];
             *v = data_vec[r_rot];
@@ -1377,8 +1388,8 @@ impl GPUBackend {
             shape.z,
             4,
         ])
-        .build_parallel_iterator()
-        .map(|[r, t, x, y, z, d]| (r, SiteIndex { t, x, y, z }, Dimension::from(d)));
+            .build_parallel_iterator()
+            .map(|[r, t, x, y, z, d]| (r, SiteIndex { t, x, y, z }, Dimension::from(d)));
 
         self.calculate_state(None)?;
         let state = self.get_precalculated_state().unwrap();
