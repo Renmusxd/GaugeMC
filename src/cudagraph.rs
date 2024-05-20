@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::default::Default;
 use std::fmt::{Debug, Display, Formatter};
+use std::ops::Not;
 use std::sync::Arc;
 
 pub struct CudaBackend {
@@ -237,6 +238,7 @@ impl CudaBackend {
                     "wilson_loop_probs_incremental_square",
                     "initialize_wilson_loops_for_probs",
                     "initialize_wilson_loops_for_probs_incremental_square",
+                    "plane_shift_update",
                 ],
             )
             .map_err(CudaError::from)?;
@@ -883,6 +885,65 @@ impl CudaBackend {
                         &self.potential_redirect_buffer,
                         self.potential_size,
                         &self.rng_buffer,
+                        self.nreplicas,
+                        self.bounds.t,
+                        self.bounds.x,
+                        self.bounds.y,
+                        self.bounds.z,
+                    ),
+                )
+                .map_err(CudaError::from)?
+        };
+
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.get_edge_violations(),
+            Ok(original_edge_violations)
+        );
+
+        Ok(())
+    }
+
+    pub fn run_plane_shift(&mut self, plaquette_type: u16) -> Result<(), CudaError> {
+        let b: bool = random();
+        self.run_plane_shift_with_offset(plaquette_type, b)?;
+        self.run_plane_shift_with_offset(plaquette_type, b.not())
+    }
+
+    pub fn run_plane_shift_with_offset(&mut self, plaquette_type: u16, offset: bool) -> Result<(), CudaError> {
+        #[cfg(debug_assertions)]
+            let original_edge_violations = self.get_edge_violations()?;
+
+        let (t, x, y, z) = (
+            self.bounds.t,
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.z);
+        let planes = [y * z, x * z, x * y, t * z, t * y, t * x];
+        let needed_threads = planes[plaquette_type as usize] / 2;
+
+        // Can we not subslice it?
+        self.cuda_rng
+            .fill_with_uniform(&mut self.rng_buffer)
+            .map_err(CudaError::from)?;
+
+        let cfg = LaunchConfig::for_num_elems(needed_threads as u32);
+        let global_update = self
+            .device
+            .get_func("gauge_kernel", "plane_shift_update")
+            .unwrap();
+        unsafe {
+            global_update
+                .launch(
+                    cfg,
+                    (
+                        &mut self.state,
+                        &self.potential_buffer,
+                        &self.potential_redirect_buffer,
+                        self.potential_size,
+                        &self.rng_buffer,
+                        plaquette_type,
+                        offset,
                         self.nreplicas,
                         self.bounds.t,
                         self.bounds.x,
@@ -2504,6 +2565,85 @@ mod tests {
         state.calculate_wilson_loop_transition_probs()?;
         let new_result = state.get_wilson_loop_transition_probs()?;
         assert_eq!(result, new_result);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_plane_shift() -> Result<(), CudaError> {
+        let (r, d) = (1, 8);
+
+        let mut state = Array6::zeros((r, d, d, d, d, 6));
+        state.slice_mut(s![0, .., .., 0, 0, 0]).iter_mut().for_each(|x| *x = 2);
+        let original_state = state.clone();
+
+        let state = DualState::new_plaquettes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 32),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+        let windings = state.get_winding_per_replica()?;
+        assert_eq!(
+            windings,
+            arr2(&[[2, 0, 0, 0, 0, 0]])
+        );
+
+        state.run_plane_shift_with_offset(0, false)?;
+
+        let windings = state.get_winding_per_replica()?;
+        assert_eq!(
+            windings,
+            arr2(&[[2, 0, 0, 0, 0, 0]])
+        );
+
+        let new_state = state.get_plaquettes()?;
+        assert_ne!(new_state, original_state);
+
+        assert_eq!(new_state.slice(s![0, .., .., 0, 0, 0]), new_state.slice(s![0, .., .., 0, 1, 0]));
+
+        Ok(())
+    }
+
+
+    #[test]
+    fn test_plane_shift_offset() -> Result<(), CudaError> {
+        let (r, d) = (1, 8);
+
+        let mut state = Array6::zeros((r, d, d, d, d, 6));
+        state.slice_mut(s![0, .., .., 0, 0, 0]).iter_mut().for_each(|x| *x = 2);
+        let original_state = state.clone();
+
+        let state = DualState::new_plaquettes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 32),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+        let windings = state.get_winding_per_replica()?;
+        assert_eq!(
+            windings,
+            arr2(&[[2, 0, 0, 0, 0, 0]])
+        );
+
+        state.run_plane_shift_with_offset(0, true)?;
+
+        let windings = state.get_winding_per_replica()?;
+        assert_eq!(
+            windings,
+            arr2(&[[2, 0, 0, 0, 0, 0]])
+        );
+
+        let new_state = state.get_plaquettes()?;
+        assert_ne!(new_state, original_state);
+
+        assert_eq!(new_state.slice(s![0, .., .., 0, 0, 0]), new_state.slice(s![0, .., .., 0, d-1, 0]));
 
         Ok(())
     }
