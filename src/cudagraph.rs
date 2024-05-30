@@ -2461,7 +2461,7 @@ mod tests {
 
     #[test]
     fn initialize_increment_squares_wilson_loops() -> Result<(), CudaError> {
-        let (r, t, x, y, z) = (17, 8, 8, 8, 8);
+        let (r, t, x, y, z) = (129, 8, 8, 8, 8);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_simple_potentials(r, 32),
@@ -2512,7 +2512,7 @@ mod tests {
 
     #[test]
     fn initialize_and_run_increment_squares_wilson_loops() -> Result<(), CudaError> {
-        let (r, t, x, y, z) = (17, 4, 4, 4, 4);
+        let (r, t, x, y, z) = (33, 4, 4, 4, 4);
         let mut state = CudaBackend::new(
             SiteIndex::new(t, x, y, z),
             make_simple_potentials(r, 32),

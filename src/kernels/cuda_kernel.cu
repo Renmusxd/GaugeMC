@@ -284,6 +284,21 @@ extern "C" __global__ void initialize_wilson_loops_for_probs_incremental_square(
 
     unsigned int increment_number = increment_index[replica_index];
 
+    // Zeroth-thing: Add global planes for each Area's worth of increment_number
+    int bounds[] = {t,x,y,z};
+    int area = bounds[edge_a] * bounds[edge_b];
+    unsigned int num_areas = increment_number / area;
+    if (num_areas > 0) {
+        for (unsigned int a_index = 0; a_index < bounds[edge_a]; a_index ++) {
+            unsigned int a_offset = a_index * delta_a * 6;
+            for (unsigned int b_index = 0; b_index < bounds[edge_b]; b_index ++) {
+                unsigned int index = a_offset + (b_index * delta_b * 6) + plaquette_type;
+                plaquette_buffer[replica_offset + index] += num_areas;
+            }
+        }
+    }
+    increment_number = increment_number % area;
+
 // // Remaining code is equivalent to this but more efficient.
 //     for (int i = 0; i < increment_number; i++) {
 //         unsigned int a = 0;
@@ -373,12 +388,14 @@ extern "C" __global__ void wilson_loop_probs_incremental_square(int* plaquette_b
     int x = tx & 0xFFFF;
     int y = (yz >> 16) & 0xFFFF;
     int z = yz & 0xFFFF;
-
-    unsigned int increment_number = increment_index[replica_index];
+    int bounds[4] = {t,x,y,z};
 
     unsigned short edge_a = 0;
     unsigned short edge_b = 0;
     edge_types_for_plaquette_type(plaquette_type, &edge_a, &edge_b);
+    int area = bounds[edge_a] * bounds[edge_b];
+
+    unsigned int increment_number = increment_index[replica_index] % area;
 
     const int coords_per_replica = t*x*y*z;
     int coords_delta[4] = {x*y*z, y*z, z, 1};
@@ -390,31 +407,30 @@ extern "C" __global__ void wilson_loop_probs_incremental_square(int* plaquette_b
 
     int delta_a = coords_delta[edge_a] * 6;
     int delta_b = coords_delta[edge_b] * 6;
-    if (increment_number > 0) {
-        unsigned int prev_a = 0;
-        unsigned int prev_b = 0;
+
+    unsigned int prev_a = 0;
+    unsigned int prev_b = 0;
+    if (increment_number == 0) {
+        prev_a = bounds[edge_a]-1;
+        prev_b = bounds[edge_b]-1;
+    } else {
         get_inc_and_dec_index(increment_number - 1, &prev_a, &prev_b);
-
-        int dec_index = prev_a * delta_a + prev_b * delta_b + plaquette_type;
-        int np = plaquette_buffer[replica_offset + dec_index];
-
-        float dec_cost = potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)] + chemical_potential_buffer[potential_index];
-        probability_log[2*replica_index + 0] += metropolis_prob(dec_cost);
     }
+    int dec_index = prev_a * delta_a + prev_b * delta_b + plaquette_type;
+    int np = plaquette_buffer[replica_offset + dec_index];
 
-    int coords[4] = {t,x,y,z};
-    int area = coords[edge_a] * coords[edge_b];
-    if (increment_number < area) {
-        unsigned int a = 0;
-        unsigned int b = 0;
-        get_inc_and_dec_index(increment_number, &a, &b);
+    float dec_cost = potential_buffer[potential_offset + abs(np-1)] - potential_buffer[potential_offset + abs(np)] + chemical_potential_buffer[potential_index];
+    probability_log[2*replica_index + 0] += metropolis_prob(dec_cost);
 
-        int inc_index = a * delta_a + b * delta_b + plaquette_type;
-        int np = plaquette_buffer[replica_offset + inc_index];
+    unsigned int a = 0;
+    unsigned int b = 0;
+    get_inc_and_dec_index(increment_number, &a, &b);
 
-        float inc_cost = potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)] - chemical_potential_buffer[potential_index];
-        probability_log[2*replica_index + 1] += metropolis_prob(inc_cost);
-    }
+    int inc_index = a * delta_a + b * delta_b + plaquette_type;
+    np = plaquette_buffer[replica_offset + inc_index];
+
+    float inc_cost = potential_buffer[potential_offset + abs(np+1)] - potential_buffer[potential_offset + abs(np)] - chemical_potential_buffer[potential_index];
+    probability_log[2*replica_index + 1] += metropolis_prob(inc_cost);
 }
 
 extern "C" __global__ void wilson_loop_probs(int* plaquette_buffer,
