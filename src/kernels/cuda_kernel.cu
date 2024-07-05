@@ -1048,7 +1048,7 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
     int bounds[4] = {t, x, y, z};
 
     // This starts as potentials, but changes to weights later
-    const unsigned int MAX_DELTA = 16;
+    const int MAX_DELTA = 16;
     float boltzman_weights[2*MAX_DELTA + 1];
     for (int i = 0; i < 2*MAX_DELTA + 1; i++) {
         boltzman_weights[i] = 0.0;
