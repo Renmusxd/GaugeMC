@@ -1048,7 +1048,11 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
     int bounds[4] = {t, x, y, z};
 
     // This starts as potentials, but changes to weights later
-    float boltzman_weights[3] = {0.0,0.0,0.0};
+    const unsigned int MAX_DELTA = 16;
+    float boltzman_weights[2*MAX_DELTA + 1];
+    for (int i = 0; i < 2*MAX_DELTA + 1; i++) {
+        boltzman_weights[i] = 0.0;
+    }
 
     // Calculate potentials into boltzman_weights
     int potential_index = potential_redirect[replica_index];
@@ -1059,18 +1063,22 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
         int coord_up_index = calculate_index_up_difference(bounds[normal_dim], coords[normal_dim], coords_delta[normal_dim]) + coord_index;
         int np = plaquette_buffer[replica_offset + coord_index*6 + plaquette_type];
         int np_up = plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type];
-        for (int delta = -1; delta <= 1; delta++) {
+        for (int delta = -MAX_DELTA; delta <= MAX_DELTA; delta++) {
             int new_np = np + delta * sign_convention[cube_type][plaquette_type];
             int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
-            boltzman_weights[delta+1] += potential_buffer[potential_offset + abs(new_np)];
-            boltzman_weights[delta+1] += potential_buffer[potential_offset + abs(new_np_up)];
+            boltzman_weights[delta+MAX_DELTA] += potential_buffer[potential_offset + abs(new_np)];
+            boltzman_weights[delta+MAX_DELTA] += potential_buffer[potential_offset + abs(new_np_up)];
             // We dont need chemical potential since we always add as many even as odd increments.
         }
     }
 
-    float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
+    float min_potential = boltzman_weights[0];
+    for (int i = 1; i <2*MAX_DELTA+1; i++) {
+        min_potential = min(min_potential, boltzman_weights[i]);
+    }
+
     float total_weight = 0.0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2*MAX_DELTA+1; i++) {
         boltzman_weights[i] = exp(-boltzman_weights[i] + min_potential);
         total_weight += boltzman_weights[i];
     }
@@ -1079,14 +1087,14 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
 
     float rng = rng_buffer[globalThreadNum] * total_weight;
     int j;
-    for (j = 0; j < 3; j++) {
+    for (j = 0; j < 2*MAX_DELTA+1; j++) {
         rng -= boltzman_weights[j];
         if (rng <= 0.0) {
             break;
         }
     }
 
-    int delta = j-1;
+    int delta = j-MAX_DELTA;
 
     for (int i = 0; i<3; i++) {
         int plaquette_type = planes_for_cube[cube_type][i];
