@@ -9,8 +9,8 @@ use gaugemc::NDDualGraph;
 fn make_cosine_potentials(npots: usize, k: f64) -> Vec<f64> {
     let f = |n: usize| {
         let k = Complex::from(k);
-        let t = scilib::math::bessel::i_nu(n as f64, 1. / k);
-        let b = scilib::math::bessel::i_nu(0., 1. / k);
+        let t = scilib::math::bessel::i_nu(n as f64, k);
+        let b = scilib::math::bessel::i_nu(0., k);
         assert!(t.im < f64::EPSILON);
         assert!(b.im < f64::EPSILON);
         let res = -(t.re / b.re).ln();
