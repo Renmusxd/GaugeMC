@@ -76,8 +76,8 @@ impl RedirectArrays {
     }
 
     fn new<Arr>(redirect: Arr) -> Self
-        where
-            Arr: Into<Array1<u32>>,
+    where
+        Arr: Into<Array1<u32>>,
     {
         let redirect = redirect.into();
         let mut inverse = redirect.clone();
@@ -89,9 +89,9 @@ impl RedirectArrays {
     }
 
     fn new_both<Arr1, Arr2>(redirect: Arr1, inverse: Arr2) -> Self
-        where
-            Arr1: Into<Array1<u32>>,
-            Arr2: Into<Array1<u32>>,
+    where
+        Arr1: Into<Array1<u32>>,
+        Arr2: Into<Array1<u32>>,
     {
         let redirect = redirect.into();
         let inverse = inverse.into();
@@ -336,6 +336,13 @@ impl CudaBackend {
             parallel_tempering_debug: None,
             wilson_loop_probs: None,
         })
+    }
+
+    pub fn set_vns(&mut self, vn: Array2<f32>) -> Result<(), CudaError> {
+        let vn = vn.iter().copied().collect::<Vec<_>>();
+        self.device
+            .htod_copy_into(vn, &mut self.potential_buffer)
+            .map_err(CudaError::from)
     }
 
     pub fn set_parallel_tracking(&mut self, on: bool) {
@@ -860,7 +867,7 @@ impl CudaBackend {
 
     pub fn run_global_update_sweep(&mut self) -> Result<(), CudaError> {
         #[cfg(debug_assertions)]
-            let original_edge_violations = self.get_edge_violations()?;
+        let original_edge_violations = self.get_edge_violations()?;
 
         let update_planes = self.global_updates_planes();
 
@@ -912,7 +919,7 @@ impl CudaBackend {
 
     pub fn run_plane_shift_with_offset(&mut self, plaquette_type: u16, offset: bool) -> Result<(), CudaError> {
         #[cfg(debug_assertions)]
-            let original_edge_violations = self.get_edge_violations()?;
+        let original_edge_violations = self.get_edge_violations()?;
 
         let (t, x, y, z) = (
             self.bounds.t,
@@ -1088,7 +1095,7 @@ impl CudaBackend {
 
     pub fn run_local_update_sweep(&mut self) -> Result<(), CudaError> {
         #[cfg(debug_assertions)]
-            let original_edge_violations = self.get_edge_violations()?;
+        let original_edge_violations = self.get_edge_violations()?;
 
         let mut rng = thread_rng();
         let mut local_update_types = self.local_update_types.take().unwrap();
@@ -1114,7 +1121,7 @@ impl CudaBackend {
         offset: bool,
     ) -> Result<(), CudaError> {
         #[cfg(debug_assertions)]
-            let original_edge_violations = self.get_edge_violations()?;
+        let original_edge_violations = self.get_edge_violations()?;
 
         // Get some rng
         self.cuda_rng
@@ -1427,8 +1434,8 @@ mod tests {
     }
 
     fn make_custom_simple_potentials<F>(nreplicas: usize, npots: usize, f: F) -> Array2<f32>
-        where
-            F: Fn(usize, usize) -> f32,
+    where
+        F: Fn(usize, usize) -> f32,
     {
         let mut pots = Array2::zeros((nreplicas, npots));
         ndarray::Zip::indexed(&mut pots).for_each(|(r, np), x| *x = f(r, np));
