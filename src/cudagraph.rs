@@ -6,7 +6,7 @@ use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConf
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 #[cfg(feature = "hashbrown-hashing")]
 use hashbrown::HashMap;
-use ndarray::{Array1, Array2, Array5, Array6, ArrayView1, ArrayView6, Axis};
+use ndarray::{Array1, Array2, Array5, Array6, ArrayView1, ArrayView2, ArrayView6, Axis};
 use ndarray_rand::rand::prelude::SliceRandom;
 use ndarray_rand::rand::{random, thread_rng, Rng};
 use rayon::prelude::*;
@@ -338,7 +338,7 @@ impl CudaBackend {
         })
     }
 
-    pub fn set_vns(&mut self, vn: Array2<f32>) -> Result<(), CudaError> {
+    pub fn set_vns(&mut self, vn: ArrayView2<f32>) -> Result<(), CudaError> {
         let vn = vn.iter().copied().collect::<Vec<_>>();
         self.device
             .htod_copy_into(vn, &mut self.potential_buffer)
