@@ -734,8 +734,8 @@ extern "C" __global__ void plane_shift_update(int* plaquette_buffer,
             int np = plaquette_buffer[replica_offset + plane_index_offset + offset + plaquette_type];
             int np_inc = plaquette_buffer[replica_offset + plane_index_offset_inc + offset + plaquette_type];
             for (int k = 0; k < 3; k++) {
-                boltzman_weights[k] += potential_buffer[potential_offset + abs(np + (k-1))];
-                boltzman_weights[k] += potential_buffer[potential_offset + abs(np_inc - (k-1))];
+                boltzman_weights[k] += (abs(np + (k-1))) < potential_vector_size ? potential_buffer[potential_offset + abs(np + (k-1))] : 1000.0;
+                boltzman_weights[k] += (np_inc - (k-1)) < potential_vector_size ? potential_buffer[potential_offset + abs(np_inc - (k-1))] : 1000.0;
             }
         }
     }
@@ -743,7 +743,8 @@ extern "C" __global__ void plane_shift_update(int* plaquette_buffer,
     float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
     float total_weight = 0.0;
     for (int i = 0; i < 3; i++) {
-        boltzman_weights[i] = exp(-boltzman_weights[i] + min_potential);
+        float pot = boltzman_weights[i] - min_potential;
+        boltzman_weights[i] = (pot < 100.0) ? exp(-pot) : 0.0;
         total_weight += boltzman_weights[i];
     }
 
@@ -831,7 +832,7 @@ extern "C" __global__ void global_update_sweep(int* plaquette_buffer,
             int offset = i*strides[plane_one] + j*strides[plane_two];
             int np = plaquette_buffer[replica_offset + plane_index_offset + offset + p];
             for (int k = 0; k < 3; k++) {
-                boltzman_weights[k] += potential_buffer[potential_offset + abs(np+k-1)];
+                boltzman_weights[k] += (abs(np+k-1) < potential_vector_size) ? potential_buffer[potential_offset + abs(np+k-1)] : 1000.0;
             }
         }
     }
@@ -843,7 +844,8 @@ extern "C" __global__ void global_update_sweep(int* plaquette_buffer,
     float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
     float total_weight = 0.0;
     for (int i = 0; i < 3; i++) {
-        boltzman_weights[i] = exp(-boltzman_weights[i] + min_potential);
+        float pot = boltzman_weights[i] - min_potential;
+        boltzman_weights[i] = (pot < 100.0) ? exp(-pot) : 0.0;
         total_weight += boltzman_weights[i];
     }
 
@@ -1107,8 +1109,8 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
         for (int delta = -MAX_DELTA; delta <= MAX_DELTA; delta++) {
             int new_np = np + delta * sign_convention[cube_type][plaquette_type];
             int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
-            boltzman_weights[delta+MAX_DELTA] += potential_buffer[potential_offset + abs(new_np)];
-            boltzman_weights[delta+MAX_DELTA] += potential_buffer[potential_offset + abs(new_np_up)];
+            boltzman_weights[delta+MAX_DELTA] += (abs(new_np) < potential_vector_size) ? potential_buffer[potential_offset + abs(new_np)] : 1000.0;
+            boltzman_weights[delta+MAX_DELTA] += (abs(new_np_up) < potential_vector_size) ? potential_buffer[potential_offset + abs(new_np_up)] : 1000.0;
             // We dont need chemical potential since we always add as many even as odd increments.
         }
     }
@@ -1120,7 +1122,8 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
 
     float total_weight = 0.0;
     for (int i = 0; i < 2*MAX_DELTA+1; i++) {
-        boltzman_weights[i] = exp(-boltzman_weights[i] + min_potential);
+        float pot = boltzman_weights[i] - min_potential;
+        boltzman_weights[i] = pot < 100.0 ? exp(-pot) : 0.0;
         total_weight += boltzman_weights[i];
     }
 
