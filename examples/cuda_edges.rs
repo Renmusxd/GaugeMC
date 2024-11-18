@@ -1,8 +1,8 @@
-use std::fs::File;
 use gaugemc::{CudaBackend, CudaError, DualState, SiteIndex};
-use ndarray::{Array2, Array3, Array6, Axis, s};
-use num_traits::Zero;
+use ndarray::{s, Array2, Array3, Array6, Axis};
 use ndarray_npy::NpzWriter;
+use num_traits::Zero;
+use std::fs::File;
 
 fn main() -> Result<(), CudaError> {
     env_logger::init();
@@ -45,23 +45,27 @@ fn main() -> Result<(), CudaError> {
     let n = 100;
     let nn = 10;
     let mut output = Array3::zeros((n, t, x));
-    output.axis_iter_mut(Axis(0)).try_for_each(|mut arr| -> Result<(), CudaError>{
-        for _ in 0..nn {
-            for offset in 0..4 {
-                state.run_single_matter_update_single(p as u16, offset)?;
+    output
+        .axis_iter_mut(Axis(0))
+        .try_for_each(|mut arr| -> Result<(), CudaError> {
+            for _ in 0..nn {
+                for offset in 0..4 {
+                    state.run_single_matter_update_single(p as u16, offset)?;
+                }
             }
-        }
-        let slice = state.get_plaquettes()?;
-        let subslice = slice.slice(s![0, .., .., 0, 0, 0]);
-        arr.iter_mut().zip(subslice.iter()).for_each(|(a, b)| {
-            *a = *b;
-        });
-        Ok(())
-    })?;
+            let slice = state.get_plaquettes()?;
+            let subslice = slice.slice(s![0, .., .., 0, 0, 0]);
+            arr.iter_mut().zip(subslice.iter()).for_each(|(a, b)| {
+                *a = *b;
+            });
+            Ok(())
+        })?;
 
-    let mut npz = NpzWriter::new(File::create("output_slices.npz").expect("Could not create file."));
+    let mut npz =
+        NpzWriter::new(File::create("output_slices.npz").expect("Could not create file."));
 
-    npz.add_array("slices", &output).expect("Could not add array to file.");
+    npz.add_array("slices", &output)
+        .expect("Could not add array to file.");
     npz.finish().expect("Could not write to file.");
 
     Ok(())

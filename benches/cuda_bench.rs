@@ -161,4 +161,78 @@ mod tests {
         });
         Ok(())
     }
+
+
+    #[bench]
+    fn bench_get_action_call(b: &mut Bencher) -> Result<(), CudaError> {
+        let r = 128;
+        let d = 16;
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 32),
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        // Set up nontrivial configuration.
+        for _ in 0..128 {
+            state.run_local_update_sweep()?;
+        }
+
+        b.iter(|| {
+            let action = state.get_action_per_replica().unwrap();
+        });
+        Ok(())
+    }
+
+    #[bench]
+    fn bench_count_plaquettes_call(b: &mut Bencher) -> Result<(), CudaError> {
+        let r = 128;
+        let d = 16;
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 32),
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        // Set up nontrivial configuration.
+        for _ in 0..128 {
+            state.run_local_update_sweep()?;
+        }
+
+        b.iter(|| {
+            let counts = state.get_plaquette_counts().unwrap();
+        });
+        Ok(())
+    }
+
+
+    #[bench]
+    fn bench_count_plaquettes_full_graph(b: &mut Bencher) -> Result<(), CudaError> {
+        let r = 128;
+        let d = 16;
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 32),
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        // Set up nontrivial configuration.
+        for _ in 0..128 {
+            state.run_local_update_sweep()?;
+        }
+
+        b.iter(|| {
+            let graph = state.get_plaquettes().unwrap();
+        });
+        Ok(())
+    }
 }

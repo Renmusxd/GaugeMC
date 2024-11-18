@@ -200,7 +200,8 @@ impl GPUBackend {
         // `request_adapter` instantiates the general connection to the GPU
         let adapter = if let Some(device_id) = device_id {
             let mut adapters = instance
-                .enumerate_adapters(wgpu::Backends::all()).into_iter()
+                .enumerate_adapters(wgpu::Backends::all())
+                .into_iter()
                 .filter(|x| x.get_info().device_type != DeviceType::Cpu)
                 .filter(|x| x.get_info().device == device_id)
                 .collect::<Vec<_>>();
@@ -213,7 +214,8 @@ impl GPUBackend {
                 Ok(a)
             } else {
                 let adapters = instance
-                    .enumerate_adapters(wgpu::Backends::all()).into_iter()
+                    .enumerate_adapters(wgpu::Backends::all())
+                    .into_iter()
                     .map(|a| a.get_info())
                     .collect::<Vec<_>>();
                 warn!(
@@ -652,8 +654,8 @@ impl GPUBackend {
     }
 
     pub fn swap_replica_potentials<It>(&mut self, start: usize, stop: usize, it: It)
-        where
-            It: IntoIterator<Item=bool>,
+    where
+        It: IntoIterator<Item = bool>,
     {
         let entries = &mut self.vn_index_to_replica_index[start..stop];
         let state = self
@@ -1064,8 +1066,8 @@ impl GPUBackend {
     }
 
     pub fn write_arguments<It>(&mut self, it: It, num_replicas_overwrite: Option<usize>)
-        where
-            It: IntoIterator<Item=u32>,
+    where
+        It: IntoIterator<Item = u32>,
     {
         let vals = [
             self.shape.t as u32,
@@ -1074,15 +1076,15 @@ impl GPUBackend {
             self.shape.z as u32,
             num_replicas_overwrite.unwrap_or(self.num_replicas) as u32,
         ]
-            .into_iter()
-            // Put in all the vn offsets.
-            .chain((0..self.num_replicas).map(|r| {
-                let r_rot = self.replica_index_to_vn_index[r];
-                (self.vn.shape()[1] * r_rot) as u32
-            }))
-            // Add the additional arguments
-            .chain(it)
-            .collect::<Vec<u32>>();
+        .into_iter()
+        // Put in all the vn offsets.
+        .chain((0..self.num_replicas).map(|r| {
+            let r_rot = self.replica_index_to_vn_index[r];
+            (self.vn.shape()[1] * r_rot) as u32
+        }))
+        // Add the additional arguments
+        .chain(it)
+        .collect::<Vec<u32>>();
         let nvals = vals.len();
 
         let optimize_args = self.optimize_writing_args.unwrap_or(true);
@@ -1235,7 +1237,7 @@ impl GPUBackend {
     ) -> Result<Array1<f32>, String> {
         let read_num_values = read_num_values.unwrap_or(self.num_replicas);
         let data_vec = self.read_sumbuffer_from_gpu(read_num_values);
-        let mut result = Array1::zeros((read_num_values, ));
+        let mut result = Array1::zeros((read_num_values,));
         result.iter_mut().enumerate().for_each(|(r, v)| {
             let r_rot = self.vn_index_to_replica_index[r];
             *v = data_vec[r_rot];
@@ -1388,8 +1390,8 @@ impl GPUBackend {
             shape.z,
             4,
         ])
-            .build_parallel_iterator()
-            .map(|[r, t, x, y, z, d]| (r, SiteIndex { t, x, y, z }, Dimension::from(d)));
+        .build_parallel_iterator()
+        .map(|[r, t, x, y, z, d]| (r, SiteIndex { t, x, y, z }, Dimension::from(d)));
 
         self.calculate_state(None)?;
         let state = self.get_precalculated_state().unwrap();
@@ -1425,16 +1427,15 @@ mod gpu_tests {
     fn test_run_global_except_last() -> Result<(), String> {
         let (r, t, x, y, z) = (6, 4, 4, 4, 4);
         let mut vn = Array2::zeros((r, 3));
-        vn.axis_iter_mut(Axis(0))
-            .for_each(|mut ax| {
-                ax.iter_mut().enumerate().for_each(|(i, v)| {
-                    if i == 0 {
-                        *v = 0.0;
-                    } else {
-                        *v = 10.0;
-                    }
-                })
-            });
+        vn.axis_iter_mut(Axis(0)).for_each(|mut ax| {
+            ax.iter_mut().enumerate().for_each(|(i, v)| {
+                if i == 0 {
+                    *v = 0.0;
+                } else {
+                    *v = 10.0;
+                }
+            })
+        });
         let mut graph = pollster::block_on(GPUBackend::new_async(
             SiteIndex::new(t, x, y, z),
             vn,

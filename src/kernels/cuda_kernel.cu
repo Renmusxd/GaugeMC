@@ -656,6 +656,18 @@ extern "C" __global__ void sum_buffer(float* buffer, int num_threads, int num_st
     }
 }
 
+extern "C" __global__ void sum_int_buffer(unsigned int* buffer, int num_threads, int num_steps)
+{
+    int globalThreadNum = get_thread_number();
+    if (globalThreadNum >= num_threads) {
+        return;
+    }
+    for (int i = 1; i < num_steps; i++) {
+        buffer[globalThreadNum] += buffer[globalThreadNum + (i * num_threads)];
+        buffer[globalThreadNum + (i * num_threads)] = 0;
+    }
+}
+
 
 extern "C" __global__ void plane_shift_update(int* plaquette_buffer,
         float* potential_buffer, int* potential_redirect, int potential_vector_size,
@@ -952,6 +964,35 @@ extern "C" __global__ void partial_sum_energies(int* plaquette_buffer, float* su
     }
     sum_buffer[globalThreadNum] = pot;
 }
+
+
+extern "C" __global__ void partial_count_plaquettes(int* plaquette_buffer, unsigned int* sum_buffer,
+          int potential_vector_size, int replicas, int t, int x, int y, int z)
+{
+    // Go through each of the 6 plaquette types for each site
+    // iterate over z and p, thread for each r, t, x, y
+    int num_threads = replicas * t * x;
+
+    int globalThreadNum = get_thread_number();
+    if (globalThreadNum >= num_threads) {
+        return;
+    }
+    // We work in reverse for this.
+    // Interleave the replicas (0, 1, 2, 0, 1, 2, ...)
+    int replica_index = globalThreadNum % replicas;
+    int in_replica_index = globalThreadNum / replicas;
+    int replica_offset = replica_index * (t * x * y * z * 6);
+    int max_negative_plaquette_value = potential_vector_size - 1;
+    int hist_buff_size = 2*potential_vector_size - 1;
+
+    int buff_offset = globalThreadNum * hist_buff_size;
+
+    for (int i = 0; i < y * z * 6; i++) {
+        int np = plaquette_buffer[replica_offset + (in_replica_index * y * z * 6) + i];
+        sum_buffer[buff_offset + np + max_negative_plaquette_value] += 1;
+    }
+}
+
 
 extern "C" __global__ void calculate_edge_sums(int* plaquette_buffer, int* edge_sums_buffer,
           int replicas, int t, int x, int y, int z)

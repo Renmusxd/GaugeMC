@@ -1,10 +1,10 @@
-use std::fs::File;
+use gaugemc::NDDualGraph;
 use log::info;
 use ndarray::{Array, Array0, Array1};
 use ndarray_npy::NpzWriter;
 use ndarray_rand::rand::thread_rng;
 use num_complex::Complex;
-use gaugemc::NDDualGraph;
+use std::fs::File;
 
 fn make_cosine_potentials(npots: usize, k: f64) -> Vec<f64> {
     let f = |n: usize| {
@@ -18,13 +18,10 @@ fn make_cosine_potentials(npots: usize, k: f64) -> Vec<f64> {
     };
 
     let mut pots = vec![0.0; npots];
-    pots.iter_mut()
-        .enumerate()
-        .for_each(|(p, x)| *x = f(p));
+    pots.iter_mut().enumerate().for_each(|(p, x)| *x = f(p));
 
     pots
 }
-
 
 fn main() {
     env_logger::init();
@@ -37,7 +34,8 @@ fn main() {
     for k in Array::linspace(1.01, 1.02, 10) {
         let mut result = Array1::zeros((nsamples,));
 
-        let mut state = NDDualGraph::new(d, d, d, d, make_cosine_potentials(32, k)).expect("Could not create graph");
+        let mut state = NDDualGraph::new(d, d, d, d, make_cosine_potentials(32, k))
+            .expect("Could not create graph");
         let mut rng = thread_rng();
 
         for i in 0..warmup {
@@ -54,12 +52,12 @@ fn main() {
             *x = state.get_energy();
         });
 
-        let mut npz = NpzWriter::new(File::create(format!("energies-{:.5}.npz", k)).expect("Could not create file."));
-        npz.add_array("energy", &result).expect("Could not add array to file.");
-        npz.add_array(
-            "k",
-            &Array0::from_elem((), k),
+        let mut npz = NpzWriter::new(
+            File::create(format!("energies-{:.5}.npz", k)).expect("Could not create file."),
         );
+        npz.add_array("energy", &result)
+            .expect("Could not add array to file.");
+        npz.add_array("k", &Array0::from_elem((), k));
         npz.finish().expect("Could not write to file.");
     }
 }

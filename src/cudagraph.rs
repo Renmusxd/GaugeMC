@@ -239,6 +239,8 @@ impl CudaBackend {
                     "initialize_wilson_loops_for_probs",
                     "initialize_wilson_loops_for_probs_incremental_square",
                     "plane_shift_update",
+                    "sum_int_buffer",
+                    "partial_count_plaquettes",
                 ],
             )
             .map_err(CudaError::from)?;
@@ -357,14 +359,27 @@ impl CudaBackend {
         self.parallel_tempering_debug.as_ref().map(|x| x.get_map())
     }
 
-    pub fn initialize_wilson_loops_per_replica(&mut self, aspect_ratios: Vec<(usize, usize)>, plaquette_type: u16) -> Result<(), CudaError> {
+    pub fn initialize_wilson_loops_per_replica(
+        &mut self,
+        aspect_ratios: Vec<(usize, usize)>,
+        plaquette_type: u16,
+    ) -> Result<(), CudaError> {
         if aspect_ratios.len() != self.nreplicas {
-            return CudaError::value_error(format!("With {} replicas expected {} aspect ratios but found {}", self.nreplicas, self.nreplicas, aspect_ratios.len()));
+            return CudaError::value_error(format!(
+                "With {} replicas expected {} aspect ratios but found {}",
+                self.nreplicas,
+                self.nreplicas,
+                aspect_ratios.len()
+            ));
         }
-        let mut aspect_ratios_buffer = self.device
+        let mut aspect_ratios_buffer = self
+            .device
             .alloc_zeros::<u32>(2 * self.nreplicas)
             .map_err(CudaError::from)?;
-        let aspect_ratios = aspect_ratios.into_iter().flat_map(|(a, b)| [a as u32, b as u32]).collect::<Vec<_>>();
+        let aspect_ratios = aspect_ratios
+            .into_iter()
+            .flat_map(|(a, b)| [a as u32, b as u32])
+            .collect::<Vec<_>>();
         self.device
             .htod_copy_into(aspect_ratios, &mut aspect_ratios_buffer)
             .map_err(CudaError::from)?;
@@ -392,7 +407,8 @@ impl CudaBackend {
                 .map_err(CudaError::from)?
         };
 
-        let probs_slice = self.device
+        let probs_slice = self
+            .device
             .alloc_zeros::<f32>(6 * self.nreplicas)
             .map_err(CudaError::from)?;
         self.wilson_loop_probs = Some(WilsonLoopData::AspectRatios {
@@ -405,12 +421,22 @@ impl CudaBackend {
         Ok(())
     }
 
-    pub fn initialize_wilson_loops_for_probs_incremental_square(&mut self, increments: Vec<usize>, plaquette_type: u16) -> Result<(), CudaError> {
+    pub fn initialize_wilson_loops_for_probs_incremental_square(
+        &mut self,
+        increments: Vec<usize>,
+        plaquette_type: u16,
+    ) -> Result<(), CudaError> {
         if increments.len() != self.nreplicas {
-            return CudaError::value_error(format!("With {} replicas expected {} aspect ratios but found {}", self.nreplicas, self.nreplicas, increments.len()));
+            return CudaError::value_error(format!(
+                "With {} replicas expected {} aspect ratios but found {}",
+                self.nreplicas,
+                self.nreplicas,
+                increments.len()
+            ));
         }
         let increments = increments.into_iter().map(|x| x as u32).collect();
-        let mut increment_buffer = self.device
+        let mut increment_buffer = self
+            .device
             .alloc_zeros::<u32>(self.nreplicas)
             .map_err(CudaError::from)?;
         self.device
@@ -420,7 +446,10 @@ impl CudaBackend {
         let cfg = LaunchConfig::for_num_elems(self.nreplicas as u32);
         let global_update = self
             .device
-            .get_func("gauge_kernel", "initialize_wilson_loops_for_probs_incremental_square")
+            .get_func(
+                "gauge_kernel",
+                "initialize_wilson_loops_for_probs_incremental_square",
+            )
             .unwrap();
         unsafe {
             global_update
@@ -440,7 +469,8 @@ impl CudaBackend {
                 .map_err(CudaError::from)?
         };
 
-        let probs_slice = self.device
+        let probs_slice = self
+            .device
             .alloc_zeros::<f32>(2 * self.nreplicas)
             .map_err(CudaError::from)?;
         self.wilson_loop_probs = Some(WilsonLoopData::IncrementOnSquares {
@@ -462,7 +492,8 @@ impl CudaBackend {
                      ..
                  }) => {
                 *times_run = 0;
-                self.device.memset_zeros(probs_slice)
+                self.device
+                    .memset_zeros(probs_slice)
                     .map_err(CudaError::from)
             }
             Some(WilsonLoopData::IncrementOnSquares {
@@ -471,7 +502,8 @@ impl CudaBackend {
                      ..
                  }) => {
                 *times_run = 0;
-                self.device.memset_zeros(probs_slice)
+                self.device
+                    .memset_zeros(probs_slice)
                     .map_err(CudaError::from)
             }
         }
@@ -581,7 +613,10 @@ impl CudaBackend {
         }
     }
 
-    pub fn get_wilson_loop_transition_probs_into(&mut self, output: &mut [f32]) -> Result<(), CudaError> {
+    pub fn get_wilson_loop_transition_probs_into(
+        &mut self,
+        output: &mut [f32],
+    ) -> Result<(), CudaError> {
         match self.wilson_loop_probs.take() {
             None => CudaError::value_error("Initialization has not been run."),
             Some(WilsonLoopData::AspectRatios {
@@ -590,8 +625,7 @@ impl CudaBackend {
                      aspect_ratios,
                      mut probs_slice,
                  }) => {
-                self
-                    .device
+                self.device
                     .dtoh_sync_copy_into(&probs_slice, output)
                     .map_err(CudaError::from)?;
                 if times_run > 0 {
@@ -614,8 +648,7 @@ impl CudaBackend {
                      increment_buffer,
                      probs_slice,
                  }) => {
-                self
-                    .device
+                self.device
                     .dtoh_sync_copy_into(&probs_slice, output)
                     .map_err(CudaError::from)?;
                 if times_run > 0 {
@@ -822,7 +855,10 @@ impl CudaBackend {
         Ok(coords)
     }
 
-    pub fn get_matter_corner_per_plaquette(&mut self, plaquette_type: u16) -> Result<Array6<i32>, CudaError> {
+    pub fn get_matter_corner_per_plaquette(
+        &mut self,
+        plaquette_type: u16,
+    ) -> Result<Array6<i32>, CudaError> {
         let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
 
         let num_corners = self.nreplicas * t * x * y * z * 4;
@@ -844,7 +880,8 @@ impl CudaBackend {
             .dtoh_sync_copy(&output_buffer)
             .map_err(CudaError::from)?;
 
-        let mut corners_for_plaquettes = Array6::from_shape_vec((self.nreplicas, t, x, y, z, 4), output).unwrap();
+        let mut corners_for_plaquettes =
+            Array6::from_shape_vec((self.nreplicas, t, x, y, z, 4), output).unwrap();
 
         if let Some(redirect) = self.potential_redirect_array.get_redirect() {
             let edges_clone = corners_for_plaquettes.clone();
@@ -903,10 +940,7 @@ impl CudaBackend {
         };
 
         #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.get_edge_violations(),
-            Ok(original_edge_violations)
-        );
+        debug_assert_eq!(self.get_edge_violations(), Ok(original_edge_violations));
 
         Ok(())
     }
@@ -917,15 +951,15 @@ impl CudaBackend {
         self.run_plane_shift_with_offset(plaquette_type, b.not())
     }
 
-    pub fn run_plane_shift_with_offset(&mut self, plaquette_type: u16, offset: bool) -> Result<(), CudaError> {
+    pub fn run_plane_shift_with_offset(
+        &mut self,
+        plaquette_type: u16,
+        offset: bool,
+    ) -> Result<(), CudaError> {
         #[cfg(debug_assertions)]
         let original_edge_violations = self.get_edge_violations()?;
 
-        let (t, x, y, z) = (
-            self.bounds.t,
-            self.bounds.x,
-            self.bounds.y,
-            self.bounds.z);
+        let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let planes = [y * z, x * z, x * y, t * z, t * y, t * x];
         let needed_threads = planes[plaquette_type as usize] / 2;
 
@@ -962,10 +996,7 @@ impl CudaBackend {
         };
 
         #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.get_edge_violations(),
-            Ok(original_edge_violations)
-        );
+        debug_assert_eq!(self.get_edge_violations(), Ok(original_edge_violations));
 
         Ok(())
     }
@@ -1019,6 +1050,61 @@ impl CudaBackend {
         } else {
             Ok(windings)
         }
+    }
+
+    pub fn get_plaquette_counts(&mut self) -> Result<Array2<u32>, CudaError> {
+        let (t, x, y, _z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let mut threads_to_sum = self.nreplicas * t * x; // each thread starts with y*z*6
+
+        let mut sum_buffer = self
+            .device
+            .alloc_zeros::<u32>(threads_to_sum * (2 * self.potential_size - 1))
+            .map_err(CudaError::from)?;
+        // Initial copying
+        let cfg = LaunchConfig::for_num_elems(threads_to_sum as u32);
+        let partial_count = self
+            .device
+            .get_func("gauge_kernel", "partial_count_plaquettes")
+            .unwrap();
+
+        unsafe {
+            partial_count
+                .launch(
+                    cfg,
+                    (
+                        &self.state,
+                        &mut sum_buffer,
+                        self.potential_size,
+                        self.nreplicas,
+                        self.bounds.t,
+                        self.bounds.x,
+                        self.bounds.y,
+                        self.bounds.z,
+                    ),
+                )
+                .map_err(CudaError::from)?
+        };
+        
+        // So now we have a chunk of memory made of r * t * x batches of size (2M-1) with M the
+        // maximal value of a plaquette.
+        // At the end we want r batches of size (2M-1), so we need to fold in the t*x.
+        let threads_to_sum = self.nreplicas * (2 * self.potential_size - 1);
+        let num_steps = t * x;
+        let cfg = LaunchConfig::for_num_elems(threads_to_sum as u32);
+        let partial_sum_energies = self
+            .device
+            .get_func("gauge_kernel", "sum_int_buffer")
+            .unwrap();
+        unsafe {
+            partial_sum_energies
+                .launch(cfg, (&mut sum_buffer, threads_to_sum, num_steps))
+                .map_err(CudaError::from)?
+        };
+
+        let subslice = sum_buffer.slice(0..threads_to_sum);
+        self.device.dtoh_sync_copy(&subslice).map(|v| {
+            Array2::from_shape_vec((self.nreplicas, 2 * self.potential_size - 1), v).unwrap()
+        }).map_err(CudaError::from)
     }
 
     pub fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
@@ -1107,10 +1193,7 @@ impl CudaBackend {
         self.local_update_types = Some(local_update_types);
 
         #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.get_edge_violations(),
-            Ok(original_edge_violations)
-        );
+        debug_assert_eq!(self.get_edge_violations(), Ok(original_edge_violations));
 
         res
     }
@@ -1158,10 +1241,7 @@ impl CudaBackend {
         };
 
         #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.get_edge_violations(),
-            Ok(original_edge_violations)
-        );
+        debug_assert_eq!(self.get_edge_violations(), Ok(original_edge_violations));
 
         Ok(())
     }
@@ -1284,7 +1364,19 @@ impl CudaBackend {
         let cfg = LaunchConfig::for_num_elems(num_sites as u32);
         unsafe {
             calculate_edge_sums
-                .launch(cfg, (plaquette_buffer, plaquette_corners_buffer, plaquette_type, nreplicas, t, x, y, z))
+                .launch(
+                    cfg,
+                    (
+                        plaquette_buffer,
+                        plaquette_corners_buffer,
+                        plaquette_type,
+                        nreplicas,
+                        t,
+                        x,
+                        y,
+                        z,
+                    ),
+                )
                 .map_err(CudaError::from)
         }
     }
@@ -2432,15 +2524,12 @@ mod tests {
         let coords = state.get_matter_corner_per_plaquette(0)?;
         let sum_coords = coords.sum_axis(Axis(5));
 
-        println!("{:?}", sum_coords.slice(s![0,..,..,0,0]));
-
         assert_eq!(sum_coords[[0, 0, 0, 0, 0]], 4);
         assert_eq!(sum_coords[[0, 1, 0, 0, 0]], 2);
         assert_eq!(sum_coords[[0, 0, 1, 0, 0]], 2);
         assert_eq!(sum_coords[[0, 1, 1, 0, 0]], 1);
         Ok(())
     }
-
 
     #[test]
     fn initialize_wilson_loops() -> Result<(), CudaError> {
@@ -2465,7 +2554,6 @@ mod tests {
         Ok(())
     }
 
-
     #[test]
     fn initialize_increment_squares_wilson_loops() -> Result<(), CudaError> {
         let (r, t, x, y, z) = (129, 8, 8, 8, 8);
@@ -2477,7 +2565,8 @@ mod tests {
             None,
             None,
         )?;
-        state.initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
+        state
+            .initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
         let plaquettes = state.get_plaquettes()?;
 
         for rr in 0..r {
@@ -2511,11 +2600,8 @@ mod tests {
         state.calculate_wilson_loop_transition_probs()?;
         let result = state.get_wilson_loop_transition_probs()?;
 
-        println!("{:?}", result);
-
         Ok(())
     }
-
 
     #[test]
     fn initialize_and_run_increment_squares_wilson_loops() -> Result<(), CudaError> {
@@ -2528,7 +2614,8 @@ mod tests {
             None,
             None,
         )?;
-        state.initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
+        state
+            .initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
         let plaquettes = state.get_plaquettes()?;
 
         for rr in 0..r {
@@ -2538,8 +2625,6 @@ mod tests {
 
         state.calculate_wilson_loop_transition_probs()?;
         let result = state.get_wilson_loop_transition_probs()?;
-
-        println!("{:?}", result);
 
         Ok(())
     }
@@ -2555,7 +2640,8 @@ mod tests {
             None,
             None,
         )?;
-        state.initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
+        state
+            .initialize_wilson_loops_for_probs_incremental_square((0..r).map(|x| x).collect(), 0)?;
         let plaquettes = state.get_plaquettes()?;
 
         for rr in 0..r {
@@ -2581,7 +2667,10 @@ mod tests {
         let (r, d) = (1, 8);
 
         let mut state = Array6::zeros((r, d, d, d, d, 6));
-        state.slice_mut(s![0, .., .., 0, 0, 0]).iter_mut().for_each(|x| *x = 2);
+        state
+            .slice_mut(s![0, .., .., 0, 0, 0])
+            .iter_mut()
+            .for_each(|x| *x = 2);
         let original_state = state.clone();
 
         let state = DualState::new_plaquettes(state);
@@ -2594,34 +2683,33 @@ mod tests {
             None,
         )?;
         let windings = state.get_winding_per_replica()?;
-        assert_eq!(
-            windings,
-            arr2(&[[2, 0, 0, 0, 0, 0]])
-        );
+        assert_eq!(windings, arr2(&[[2, 0, 0, 0, 0, 0]]));
 
         state.run_plane_shift_with_offset(0, false)?;
 
         let windings = state.get_winding_per_replica()?;
-        assert_eq!(
-            windings,
-            arr2(&[[2, 0, 0, 0, 0, 0]])
-        );
+        assert_eq!(windings, arr2(&[[2, 0, 0, 0, 0, 0]]));
 
         let new_state = state.get_plaquettes()?;
         assert_ne!(new_state, original_state);
 
-        assert_eq!(new_state.slice(s![0, .., .., 0, 0, 0]), new_state.slice(s![0, .., .., 0, 1, 0]));
+        assert_eq!(
+            new_state.slice(s![0, .., .., 0, 0, 0]),
+            new_state.slice(s![0, .., .., 0, 1, 0])
+        );
 
         Ok(())
     }
-
 
     #[test]
     fn test_plane_shift_offset() -> Result<(), CudaError> {
         let (r, d) = (1, 8);
 
         let mut state = Array6::zeros((r, d, d, d, d, 6));
-        state.slice_mut(s![0, .., .., 0, 0, 0]).iter_mut().for_each(|x| *x = 2);
+        state
+            .slice_mut(s![0, .., .., 0, 0, 0])
+            .iter_mut()
+            .for_each(|x| *x = 2);
         let original_state = state.clone();
 
         let state = DualState::new_plaquettes(state);
@@ -2634,24 +2722,115 @@ mod tests {
             None,
         )?;
         let windings = state.get_winding_per_replica()?;
-        assert_eq!(
-            windings,
-            arr2(&[[2, 0, 0, 0, 0, 0]])
-        );
+        assert_eq!(windings, arr2(&[[2, 0, 0, 0, 0, 0]]));
 
         state.run_plane_shift_with_offset(0, true)?;
 
         let windings = state.get_winding_per_replica()?;
-        assert_eq!(
-            windings,
-            arr2(&[[2, 0, 0, 0, 0, 0]])
-        );
+        assert_eq!(windings, arr2(&[[2, 0, 0, 0, 0, 0]]));
 
         let new_state = state.get_plaquettes()?;
         assert_ne!(new_state, original_state);
 
-        assert_eq!(new_state.slice(s![0, .., .., 0, 0, 0]), new_state.slice(s![0, .., .., 0, d-1, 0]));
+        assert_eq!(
+            new_state.slice(s![0, .., .., 0, 0, 0]),
+            new_state.slice(s![0, .., .., 0, d - 1, 0])
+        );
 
+        Ok(())
+    }
+
+
+    #[test]
+    fn test_simple_plaquette_counts() -> Result<(), CudaError> {
+        let (r, d) = (2, 6);
+        let mut state = Array::zeros((r, d, d, d, d, 4));
+        state[[0, 0, 0, 0, 0, 0]] = 1;
+        let state = DualState::new_volumes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 3),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+        let plaquette_counts = state.get_plaquette_counts()?;
+
+        assert_eq!(
+            plaquette_counts,
+            arr2(&[[0, 3, 6 * (d * d * d * d) as u32 - 6, 3, 0], [0, 0, 6 * (d * d * d * d) as u32, 0, 0]])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_plaquette_counts() -> Result<(), CudaError> {
+        let (r, d) = (3, 8);
+
+        let mut state = Array6::zeros((r, d, d, d, d, 6));
+        state
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(rr, mut x)| {
+                for i in 0..rr {
+                    x.slice_mut(s![.., .., i, i, 0])
+                        .iter_mut()
+                        .for_each(|x| *x = 1);
+                }
+            });
+        let state = DualState::new_plaquettes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 3),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+        let plaquette_counts = state.get_plaquette_counts()?;
+
+        assert_eq!(
+            plaquette_counts.slice(s![..,3]),
+            arr1(&[0, (d * d) as u32, (2 * d * d) as u32])
+        );
+        Ok(())
+    }
+
+
+    #[test]
+    fn test_plaquette_counts_change_np() -> Result<(), CudaError> {
+        let (r, d) = (3, 8);
+
+        let mut state = Array6::zeros((r, d, d, d, d, 6));
+        state
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(rr, mut x)| {
+                x.slice_mut(s![.., .., 0, 0, 0])
+                    .iter_mut()
+                    .for_each(|x| *x = rr as i32);
+            });
+        let state = DualState::new_plaquettes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 3),
+            Some(state),
+            Some(31415),
+            None,
+            None,
+        )?;
+        let plaquette_counts = state.get_plaquette_counts()?;
+
+        for i in 0..r {
+            let mut arr = Array1::zeros(5);
+            arr[0 + 2] = (6 * d * d * d * d - d * d) as u32;
+            arr[i + 2] += (d * d) as u32;
+            assert_eq!(
+                plaquette_counts.slice(s![i,..]),
+                arr
+            );
+        }
         Ok(())
     }
 }

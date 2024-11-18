@@ -1,9 +1,9 @@
-use std::fs::File;
-use log::info;
 use gaugemc::{CudaBackend, CudaError, DualState, SiteIndex};
-use ndarray::{Array1, Array2, Array3, Array6, Axis, s};
-use num_traits::Zero;
+use log::info;
+use ndarray::{s, Array1, Array2, Array3, Array6, Axis};
 use ndarray_npy::NpzWriter;
+use num_traits::Zero;
+use std::fs::File;
 
 fn main() -> Result<(), CudaError> {
     env_logger::init();
@@ -20,16 +20,12 @@ fn main() -> Result<(), CudaError> {
                 *v = k * (j.pow(2) as f32);
             })
         });
-    let mut state = CudaBackend::new(
-        SiteIndex::new(t, x, y, z),
-        vns,
-        None,
-        None,
-        None,
-        None,
-    )?;
+    let mut state = CudaBackend::new(SiteIndex::new(t, x, y, z), vns, None, None, None, None)?;
 
-    state.initialize_wilson_loops_for_probs_incremental_square((0..num_replicas).map(|x| x).collect(), 0)?;
+    state.initialize_wilson_loops_for_probs_incremental_square(
+        (0..num_replicas).map(|x| x).collect(),
+        0,
+    )?;
 
     let num_counts = 1024;
     let num_steps = 32;
@@ -44,8 +40,8 @@ fn main() -> Result<(), CudaError> {
     }
     let transition_probs = state.get_wilson_loop_transition_probs()?;
 
-    let mut distribution = Array1::zeros((num_replicas, ));
-    let mut free_energies = Array1::zeros((num_replicas, ));
+    let mut distribution = Array1::zeros((num_replicas,));
+    let mut free_energies = Array1::zeros((num_replicas,));
     let mut acc = 1.0;
     free_energies[0] = 0.0;
     distribution[0] = 1.0;
@@ -58,10 +54,14 @@ fn main() -> Result<(), CudaError> {
     }
     distribution.iter_mut().for_each(|x| *x /= acc);
 
-    let mut npz = NpzWriter::new(File::create("output_distribution.npz").expect("Could not create file."));
-    npz.add_array("transition_probs", &transition_probs).expect("Could not add array to file.");
-    npz.add_array("free_energies", &free_energies).expect("Could not add array to file.");
-    npz.add_array("sample_probs", &distribution).expect("Could not add array to file.");
+    let mut npz =
+        NpzWriter::new(File::create("output_distribution.npz").expect("Could not create file."));
+    npz.add_array("transition_probs", &transition_probs)
+        .expect("Could not add array to file.");
+    npz.add_array("free_energies", &free_energies)
+        .expect("Could not add array to file.");
+    npz.add_array("sample_probs", &distribution)
+        .expect("Could not add array to file.");
     npz.finish().expect("Could not write to file.");
 
     Ok(())

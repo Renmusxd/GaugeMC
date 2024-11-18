@@ -1,9 +1,9 @@
-use std::fs::File;
-use log::info;
 use gaugemc::{CudaBackend, CudaError, DualState, SiteIndex};
-use ndarray::{Array1, Array2, Array3, Array6, Axis, s};
-use num_traits::Zero;
+use log::info;
+use ndarray::{s, Array1, Array2, Array3, Array6, Axis};
 use ndarray_npy::NpzWriter;
+use num_traits::Zero;
+use std::fs::File;
 
 fn main() -> Result<(), CudaError> {
     env_logger::init();
@@ -22,9 +22,12 @@ fn main() -> Result<(), CudaError> {
             })
         });
     let mut plaquettes = Array6::zeros((num_replicas, t, x, y, z, 6));
-    plaquettes.slice_mut(s![..,0,2..d-2,2..d-2,d/2,3]).iter_mut().for_each(|x| {
-        *x = 1;
-    });
+    plaquettes
+        .slice_mut(s![.., 0, 2..d - 2, 2..d - 2, d / 2, 3])
+        .iter_mut()
+        .for_each(|x| {
+            *x = 1;
+        });
     let plaquettes = Some(plaquettes);
 
     let mut state = CudaBackend::new(
@@ -48,8 +51,10 @@ fn main() -> Result<(), CudaError> {
     let edges = state.get_edge_violations()?;
 
     let mut npz = NpzWriter::new(File::create("foam.npz").expect("Could not create file."));
-    npz.add_array("plaquettes", &foam).expect("Could not add array to file.");
-    npz.add_array("edges", &edges).expect("Could not add array to file.");
+    npz.add_array("plaquettes", &foam)
+        .expect("Could not add array to file.");
+    npz.add_array("edges", &edges)
+        .expect("Could not add array to file.");
     npz.finish().expect("Could not write to file.");
 
     Ok(())

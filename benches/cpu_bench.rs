@@ -4,8 +4,8 @@ extern crate test;
 
 #[cfg(test)]
 mod tests {
-    use gaugemc::{NDDualGraph};
-    
+    use gaugemc::NDDualGraph;
+
     use ndarray_rand::rand::thread_rng;
     use test::Bencher;
 

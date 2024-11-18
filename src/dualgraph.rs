@@ -177,7 +177,7 @@ pub struct NDDualGraph {
 impl NDDualGraph {
     pub fn new<V>(t: usize, x: usize, y: usize, z: usize, vnp: V) -> Result<Self, String>
     where
-        V: IntoIterator<Item=f64>,
+        V: IntoIterator<Item = f64>,
     {
         for d in [t, x, y, z] {
             if d % 2 == 1 {
@@ -269,8 +269,8 @@ impl NDDualGraph {
             self.bounds.z,
             4,
         ])
-            .build_parallel_iterator()
-            .map(|[t, x, y, z, d]| (SiteIndex { t, x, y, z }, Dimension::from(d)));
+        .build_parallel_iterator()
+        .map(|[t, x, y, z, d]| (SiteIndex { t, x, y, z }, Dimension::from(d)));
 
         edge_iterator
             .filter(|(s, d)| {
@@ -613,7 +613,7 @@ impl NDDualGraph {
         debug_assert_eq!(self.get_edges_with_violations(), vec![]);
     }
 
-    pub fn get_cube_dim_iterator() -> impl Iterator<Item=[Dimension; 3]> {
+    pub fn get_cube_dim_iterator() -> impl Iterator<Item = [Dimension; 3]> {
         (0..4usize)
             .flat_map(move |mu| {
                 (1 + mu..4usize)
@@ -635,7 +635,7 @@ impl NDDualGraph {
             .unwrap()
     }
 
-    pub fn get_cube_dim_and_offset_iterator() -> impl Iterator<Item=([Dimension; 3], bool)> {
+    pub fn get_cube_dim_and_offset_iterator() -> impl Iterator<Item = ([Dimension; 3], bool)> {
         Self::get_cube_dim_iterator().flat_map(|d| [(d, false), (d, true)])
     }
 
@@ -830,9 +830,7 @@ impl NDDualGraph {
     }
 
     pub fn get_energy(&self) -> f64 {
-        self.np.par_iter().map(|n| {
-            self.vn[n.abs() as usize]
-        }).sum()
+        self.np.par_iter().map(|n| self.vn[n.abs() as usize]).sum()
     }
 }
 
