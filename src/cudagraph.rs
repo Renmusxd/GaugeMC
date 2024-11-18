@@ -1084,7 +1084,7 @@ impl CudaBackend {
                 )
                 .map_err(CudaError::from)?
         };
-        
+
         // So now we have a chunk of memory made of r * t * x batches of size (2M-1) with M the
         // maximal value of a plaquette.
         // At the end we want r batches of size (2M-1), so we need to fold in the t*x.
@@ -2755,8 +2755,16 @@ mod tests {
             None,
             None,
         )?;
-        let plaquette_counts = state.get_plaquette_counts()?;
 
+        // Check first run.
+        let plaquette_counts = state.get_plaquette_counts()?;
+        assert_eq!(
+            plaquette_counts,
+            arr2(&[[0, 3, 6 * (d * d * d * d) as u32 - 6, 3, 0], [0, 0, 6 * (d * d * d * d) as u32, 0, 0]])
+        );
+
+        // Check it works twice.
+        let plaquette_counts = state.get_plaquette_counts()?;
         assert_eq!(
             plaquette_counts,
             arr2(&[[0, 3, 6 * (d * d * d * d) as u32 - 6, 3, 0], [0, 0, 6 * (d * d * d * d) as u32, 0, 0]])

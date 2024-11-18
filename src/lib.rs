@@ -1,4 +1,7 @@
 extern crate core;
+
+pub use ndarray;
+
 #[cfg(feature = "gpu-cuda")]
 pub mod cudagraph;
 pub mod dualgraph;
