@@ -1093,9 +1093,24 @@ impl CudaBackend {
         };
 
         let subslice = sum_buffer.slice(0..threads_to_sum);
-        self.device.dtoh_sync_copy(&subslice).map(|v| {
+        let plaquettes = self.device.dtoh_sync_copy(&subslice).map(|v| {
             Array2::from_shape_vec((self.nreplicas, 2 * self.potential_size - 1), v).unwrap()
-        }).map_err(CudaError::from)
+        }).map_err(CudaError::from)?;
+
+        debug_assert_eq!(Ok(plaquettes.clone()), {
+            self.get_plaquettes().map(|graph| {
+                let mut arr = Array2::zeros((self.nreplicas, 2 * self.potential_size - 1));
+                arr.axis_iter_mut(Axis(0)).zip(graph.axis_iter(Axis(0))).for_each(|(mut arr, rep)| {
+                    for n in rep {
+                        let offset = n + self.potential_size as i32 - 1;
+                        arr[offset as usize] += 1;
+                    }
+                });
+                arr
+            })
+        });
+
+        Ok(plaquettes)
     }
 
     pub fn get_action_per_replica(&mut self) -> Result<Array1<f32>, CudaError> {
