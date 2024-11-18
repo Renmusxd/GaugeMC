@@ -12,23 +12,23 @@ hashbrown-hashing = ["hashbrown"]
 [dependencies]
 rayon = "1.10"
 num-traits = "0.2"
-ndarray-rand = "0.14"
+ndarray-rand = "0.15"
 wgpu = { version = "0.20", optional = true }
 bytemuck = { version = "1.14", features = ["derive"], optional = true }
 pollster = { version = "0.3", optional = true }
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", optional = true }
-cudarc = { version = "0.11", optional = true, features = ["cuda-version-from-build-system"] }
-hashbrown = { version = "0.14", optional = true }
+cudarc = { version = "0.12", optional = true, features = ["cuda-version-from-build-system"] }
+hashbrown = { version = "0.15", optional = true }
 
 [dependencies.ndarray]
-version = "0.15"
+version = "0.16"
 features = ["rayon"]
 
 [dev-dependencies]
 env_logger = "0.11"
-pollster = "0.3"
-ndarray-npy = "0.8"
+pollster = "0.4"
+ndarray-npy = "0.9"
 log = "0.4"
 scilib = "1.0"
 num-complex = "0.4"

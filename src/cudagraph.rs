@@ -196,16 +196,7 @@ impl CudaBackend {
         device_id: Option<usize>,
         chemical_potential: Option<Array1<f32>>,
     ) -> Result<Self, CudaError> {
-        let opts = CompileOptions {
-            ftz: None,
-            prec_sqrt: None,
-            prec_div: None,
-            fmad: None,
-            use_fast_math: None,
-            maxrregcount: None,
-            include_paths: vec![],
-            arch: None,
-        };
+        let opts = CompileOptions::default();
 
         let local_updates_ptx = compile_ptx_with_opts(include_str!("kernels/cuda_kernel.cu"), opts);
         let local_updates_ptx = match local_updates_ptx {
