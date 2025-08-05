@@ -2,7 +2,9 @@ use crate::util::MeshIterator;
 use crate::{Dimension, NDDualGraph, SiteIndex};
 use cudarc::curand::result::CurandError;
 use cudarc::curand::CudaRng;
-use cudarc::driver::{CudaDevice, CudaSlice, DriverError, LaunchAsync, LaunchConfig};
+use cudarc::driver::{
+    CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 #[cfg(feature = "hashbrown-hashing")]
 use hashbrown::HashMap;
@@ -22,7 +24,7 @@ pub struct CudaBackend {
     nreplicas: usize,
     bounds: SiteIndex,
     potential_size: usize,
-    device: Arc<CudaDevice>,
+    stream: Arc<CudaStream>,
     state: CudaSlice<i32>,
     potential_redirect_buffer: CudaSlice<u32>,
     potential_redirect_array: RedirectArrays,
@@ -33,6 +35,7 @@ pub struct CudaBackend {
     local_update_types: Option<Vec<(u16, bool)>>,
     parallel_tempering_debug: Option<TemperingTracker>,
     wilson_loop_probs: Option<WilsonLoopData>,
+    function_lookup: HashMap<String, CudaFunction>,
 }
 
 enum WilsonLoopData {
@@ -211,31 +214,40 @@ impl CudaBackend {
             }
         };
 
-        let device = CudaDevice::new(device_id.unwrap_or(0)).map_err(CudaError::from)?;
-        device
-            .load_ptx(
-                local_updates_ptx,
-                "gauge_kernel",
-                &[
-                    "single_local_update_plaquettes",
-                    "calculate_edge_sums",
-                    "partial_sum_energies",
-                    "sum_buffer",
-                    "global_update_sweep",
-                    "sum_winding",
-                    "update_matter_loops",
-                    "calculate_matter_flow_through_coords",
-                    "calculate_matter_corners_for_plaquettes",
-                    "wilson_loop_probs",
-                    "wilson_loop_probs_incremental_square",
-                    "initialize_wilson_loops_for_probs",
-                    "initialize_wilson_loops_for_probs_incremental_square",
-                    "plane_shift_update",
-                    "sum_int_buffer",
-                    "partial_count_plaquettes",
-                ],
-            )
+        let ctx =
+            cudarc::driver::CudaContext::new(device_id.unwrap_or(0)).map_err(CudaError::from)?;
+        let stream = ctx.default_stream();
+
+        let module = ctx
+            .load_module(local_updates_ptx)
             .map_err(CudaError::from)?;
+        let functions = [
+            "single_local_update_plaquettes",
+            "calculate_edge_sums",
+            "partial_sum_energies",
+            "sum_buffer",
+            "global_update_sweep",
+            "sum_winding",
+            "update_matter_loops",
+            "calculate_matter_flow_through_coords",
+            "calculate_matter_corners_for_plaquettes",
+            "wilson_loop_probs",
+            "wilson_loop_probs_incremental_square",
+            "initialize_wilson_loops_for_probs",
+            "initialize_wilson_loops_for_probs_incremental_square",
+            "plane_shift_update",
+            "sum_int_buffer",
+            "partial_count_plaquettes",
+        ];
+        let function_lookup: HashMap<_, _> = functions
+            .into_iter()
+            .map(|func_name| {
+                (
+                    func_name.to_string(),
+                    module.load_function(func_name).unwrap(),
+                )
+            })
+            .collect();
 
         let (t, x, y, z) = (bounds.t, bounds.x, bounds.y, bounds.z);
         for d in [t, x, y, z] {
@@ -255,43 +267,43 @@ impl CudaBackend {
 
         let num_plaquettes = nreplicas * t * x * y * z * 6;
 
-        let mut plaquette_buffer = device
+        let mut plaquette_buffer = stream
             .alloc_zeros::<i32>(num_plaquettes)
             .map_err(CudaError::from)?;
 
         if let Some(DualState { plaquettes }) = dual_initial_state {
-            let plaquettes = plaquettes.into_iter().collect::<Vec<_>>();
-            device
-                .htod_copy_into(plaquettes, &mut plaquette_buffer)
+            stream
+                .memcpy_htod(plaquettes.as_slice().unwrap(), &mut plaquette_buffer)
                 .map_err(CudaError::from)?;
         }
 
         // Set up the potentials
-        let vn = vn.iter().copied().collect::<Vec<_>>();
-        let mut potential_buffer = device
+        let mut potential_buffer = stream
             .alloc_zeros::<f32>(vn.len())
             .map_err(CudaError::from)?;
-        device
-            .htod_copy_into(vn, &mut potential_buffer)
+        stream
+            .memcpy_htod(vn.as_slice().unwrap(), &mut potential_buffer)
             .map_err(CudaError::from)?;
 
-        let mut winding_chemical_potential_buffer = device
+        let mut winding_chemical_potential_buffer = stream
             .alloc_zeros::<f32>(nreplicas)
             .map_err(CudaError::from)?;
         if let Some(chemical_potential_arr) = chemical_potential {
-            let chemical_potential = chemical_potential_arr.iter().copied().collect::<Vec<_>>();
-            device
-                .htod_copy_into(chemical_potential, &mut winding_chemical_potential_buffer)
+            stream
+                .memcpy_htod(
+                    chemical_potential_arr.as_slice().unwrap(),
+                    &mut winding_chemical_potential_buffer,
+                )
                 .map_err(CudaError::from)?;
         }
 
         // Set up the potentials redirect
         let vn_redirect = (0..nreplicas as u32).collect::<Vec<_>>();
-        let mut potential_redirect_buffer = device
+        let mut potential_redirect_buffer = stream
             .alloc_zeros::<u32>(vn_redirect.len())
             .map_err(CudaError::from)?;
-        device
-            .htod_copy_into(vn_redirect, &mut potential_redirect_buffer)
+        stream
+            .memcpy_htod(&vn_redirect, &mut potential_redirect_buffer)
             .map_err(CudaError::from)?;
 
         // Set up the rng
@@ -300,15 +312,15 @@ impl CudaBackend {
         let num_rng_consumers = local_updates.max(num_spanning_planes);
 
         let rng_slice = vec![0.0; num_rng_consumers];
-        let mut rng_buffer = device
+        let mut rng_buffer = stream
             .alloc_zeros::<f32>(rng_slice.len())
             .map_err(CudaError::from)?;
-        device
-            .htod_copy_into(rng_slice, &mut rng_buffer)
+        stream
+            .memcpy_htod(&rng_slice, &mut rng_buffer)
             .map_err(CudaError::from)?;
 
         let cuda_rng =
-            CudaRng::new(seed.unwrap_or(random()), device.clone()).map_err(CudaError::from)?;
+            CudaRng::new(seed.unwrap_or(random()), stream.clone()).map_err(CudaError::from)?;
 
         let local_update_types = (0..4)
             .flat_map(|volume_type| [false, true].map(|offset| (volume_type, offset)))
@@ -318,7 +330,7 @@ impl CudaBackend {
             nreplicas,
             bounds,
             potential_size,
-            device,
+            stream,
             state: plaquette_buffer,
             potential_redirect_buffer,
             potential_redirect_array: RedirectArrays::None,
@@ -329,6 +341,7 @@ impl CudaBackend {
             local_update_types: Some(local_update_types),
             parallel_tempering_debug: None,
             wilson_loop_probs: None,
+            function_lookup,
         })
     }
 
@@ -350,9 +363,8 @@ impl CudaBackend {
     }
 
     pub fn set_vns(&mut self, vn: ArrayView2<f32>) -> Result<(), CudaError> {
-        let vn = vn.iter().copied().collect::<Vec<_>>();
-        self.device
-            .htod_copy_into(vn, &mut self.potential_buffer)
+        self.stream
+            .memcpy_htod(vn.as_slice().unwrap(), &mut self.potential_buffer)
             .map_err(CudaError::from)
     }
 
@@ -382,42 +394,39 @@ impl CudaBackend {
             ));
         }
         let mut aspect_ratios_buffer = self
-            .device
+            .stream
             .alloc_zeros::<u32>(2 * self.nreplicas)
             .map_err(CudaError::from)?;
         let aspect_ratios = aspect_ratios
             .into_iter()
             .flat_map(|(a, b)| [a as u32, b as u32])
             .collect::<Vec<_>>();
-        self.device
-            .htod_copy_into(aspect_ratios, &mut aspect_ratios_buffer)
+        self.stream
+            .memcpy_htod(&aspect_ratios, &mut aspect_ratios_buffer)
             .map_err(CudaError::from)?;
 
-        let cfg = Self::get_launch_config(self.nreplicas as u32);
         let global_update = self
-            .device
-            .get_func("gauge_kernel", "initialize_wilson_loops_for_probs")
+            .function_lookup
+            .get("initialize_wilson_loops_for_probs")
             .unwrap();
+        let mut builder = self.stream.launch_builder(global_update);
+        builder.arg(&mut self.state);
+        builder.arg(&aspect_ratios_buffer);
+        builder.arg(&plaquette_type);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
+
         unsafe {
-            global_update
-                .launch(
-                    cfg,
-                    (
-                        &mut self.state,
-                        &aspect_ratios_buffer,
-                        plaquette_type,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(self.nreplicas as u32))
+                .map_err(CudaError::from)
+        }?;
 
         let probs_slice = self
-            .device
+            .stream
             .alloc_zeros::<f32>(6 * self.nreplicas)
             .map_err(CudaError::from)?;
         self.wilson_loop_probs = Some(WilsonLoopData::AspectRatios {
@@ -443,43 +452,37 @@ impl CudaBackend {
                 increments.len()
             ));
         }
-        let increments = increments.into_iter().map(|x| x as u32).collect();
+        let increments = increments.into_iter().map(|x| x as u32).collect::<Vec<_>>();
         let mut increment_buffer = self
-            .device
+            .stream
             .alloc_zeros::<u32>(self.nreplicas)
             .map_err(CudaError::from)?;
-        self.device
-            .htod_copy_into(increments, &mut increment_buffer)
+        self.stream
+            .memcpy_htod(&increments, &mut increment_buffer)
             .map_err(CudaError::from)?;
 
-        let cfg = Self::get_launch_config(self.nreplicas as u32);
-        let global_update = self
-            .device
-            .get_func(
-                "gauge_kernel",
-                "initialize_wilson_loops_for_probs_incremental_square",
-            )
-            .unwrap();
+        let mut builder = self.stream.launch_builder(
+            self.function_lookup
+                .get("initialize_wilson_loops_for_probs_incremental_square")
+                .unwrap(),
+        );
+        builder.arg(&mut self.state);
+        builder.arg(&increment_buffer);
+        builder.arg(&plaquette_type);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
+
         unsafe {
-            global_update
-                .launch(
-                    cfg,
-                    (
-                        &mut self.state,
-                        &increment_buffer,
-                        plaquette_type,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(self.nreplicas as u32))
+                .map_err(CudaError::from)
+        }?;
 
         let probs_slice = self
-            .device
+            .stream
             .alloc_zeros::<f32>(2 * self.nreplicas)
             .map_err(CudaError::from)?;
         self.wilson_loop_probs = Some(WilsonLoopData::IncrementOnSquares {
@@ -501,7 +504,7 @@ impl CudaBackend {
                 ..
             }) => {
                 *times_run = 0;
-                self.device
+                self.stream
                     .memset_zeros(probs_slice)
                     .map_err(CudaError::from)
             }
@@ -511,7 +514,7 @@ impl CudaBackend {
                 ..
             }) => {
                 *times_run = 0;
-                self.device
+                self.stream
                     .memset_zeros(probs_slice)
                     .map_err(CudaError::from)
             }
@@ -527,31 +530,28 @@ impl CudaBackend {
                 aspect_ratios,
                 mut probs_slice,
             }) => {
-                let cfg = Self::get_launch_config(self.nreplicas as u32);
-                let global_update = self
-                    .device
-                    .get_func("gauge_kernel", "wilson_loop_probs")
-                    .unwrap();
+                let mut builder = self
+                    .stream
+                    .launch_builder(self.function_lookup.get("wilson_loop_probs").unwrap());
+                builder.arg(&mut self.state);
+                builder.arg(&self.potential_buffer);
+                builder.arg(&self.winding_chemical_potential_buffer);
+                builder.arg(&self.potential_redirect_buffer);
+                builder.arg(&self.potential_size);
+                builder.arg(&aspect_ratios);
+                builder.arg(&mut probs_slice);
+                builder.arg(&plaquette_type);
+                builder.arg(&self.nreplicas);
+                let tx = (self.bounds.t << 16) | self.bounds.x;
+                let yz = (self.bounds.y << 16) | self.bounds.z;
+                builder.arg(&tx);
+                builder.arg(&yz);
                 unsafe {
-                    global_update
-                        .launch(
-                            cfg,
-                            (
-                                &mut self.state,
-                                &self.potential_buffer,
-                                &self.winding_chemical_potential_buffer,
-                                &self.potential_redirect_buffer,
-                                self.potential_size,
-                                &aspect_ratios,
-                                &mut probs_slice,
-                                plaquette_type,
-                                self.nreplicas,
-                                (self.bounds.t << 16) | self.bounds.x,
-                                (self.bounds.y << 16) | self.bounds.z,
-                            ),
-                        )
-                        .map_err(CudaError::from)?
-                };
+                    builder
+                        .launch(LaunchConfig::for_num_elems(self.nreplicas as u32))
+                        .map_err(CudaError::from)
+                }?;
+
                 times_run += 1;
 
                 self.wilson_loop_probs = Some(WilsonLoopData::AspectRatios {
@@ -568,31 +568,30 @@ impl CudaBackend {
                 increment_buffer,
                 mut probs_slice,
             }) => {
-                let cfg = Self::get_launch_config(self.nreplicas as u32);
-                let global_update = self
-                    .device
-                    .get_func("gauge_kernel", "wilson_loop_probs_incremental_square")
-                    .unwrap();
+                let mut builder = self.stream.launch_builder(
+                    self.function_lookup
+                        .get("wilson_loop_probs_incremental_square")
+                        .unwrap(),
+                );
+                builder.arg(&mut self.state);
+                builder.arg(&self.potential_buffer);
+                builder.arg(&self.winding_chemical_potential_buffer);
+                builder.arg(&self.potential_redirect_buffer);
+                builder.arg(&self.potential_size);
+                builder.arg(&increment_buffer);
+                builder.arg(&mut probs_slice);
+                builder.arg(&plaquette_type);
+                builder.arg(&self.nreplicas);
+                let tx = (self.bounds.t << 16) | self.bounds.x;
+                let yz = (self.bounds.y << 16) | self.bounds.z;
+                builder.arg(&tx);
+                builder.arg(&yz);
                 unsafe {
-                    global_update
-                        .launch(
-                            cfg,
-                            (
-                                &mut self.state,
-                                &self.potential_buffer,
-                                &self.winding_chemical_potential_buffer,
-                                &self.potential_redirect_buffer,
-                                self.potential_size,
-                                &increment_buffer,
-                                &mut probs_slice,
-                                plaquette_type,
-                                self.nreplicas,
-                                (self.bounds.t << 16) | self.bounds.x,
-                                (self.bounds.y << 16) | self.bounds.z,
-                            ),
-                        )
-                        .map_err(CudaError::from)?
-                };
+                    builder
+                        .launch(LaunchConfig::for_num_elems(self.nreplicas as u32))
+                        .map_err(CudaError::from)
+                }?;
+
                 times_run += 1;
 
                 self.wilson_loop_probs = Some(WilsonLoopData::IncrementOnSquares {
@@ -634,8 +633,8 @@ impl CudaBackend {
                 aspect_ratios,
                 mut probs_slice,
             }) => {
-                self.device
-                    .dtoh_sync_copy_into(&probs_slice, output)
+                self.stream
+                    .memcpy_dtoh(&probs_slice, output)
                     .map_err(CudaError::from)?;
                 if times_run > 0 {
                     output.iter_mut().for_each(|x| {
@@ -657,8 +656,8 @@ impl CudaBackend {
                 increment_buffer,
                 probs_slice,
             }) => {
-                self.device
-                    .dtoh_sync_copy_into(&probs_slice, output)
+                self.stream
+                    .memcpy_dtoh(&probs_slice, output)
                     .map_err(CudaError::from)?;
                 if times_run > 0 {
                     output.iter_mut().for_each(|x| {
@@ -688,8 +687,8 @@ impl CudaBackend {
             new_redirect[state_i as usize] = plaquette_to_potential[state_j as usize];
         }
 
-        self.device
-            .htod_copy_into(new_redirect.clone(), &mut self.potential_redirect_buffer)?;
+        self.stream
+            .memcpy_htod(&new_redirect, &mut self.potential_redirect_buffer)?;
         let new_redirect = Array1::from_vec(new_redirect);
         if new_redirect == in_order {
             self.potential_redirect_array = RedirectArrays::None;
@@ -750,14 +749,14 @@ impl CudaBackend {
     }
 
     pub fn wait_for_gpu(&mut self) -> Result<(), CudaError> {
-        self.device.synchronize().map_err(CudaError::from)
+        self.stream.synchronize().map_err(CudaError::from)
     }
 
     pub fn get_plaquettes(&mut self) -> Result<Array6<i32>, CudaError> {
         let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let output = self
-            .device
-            .dtoh_sync_copy(&self.state)
+            .stream
+            .memcpy_dtov(&self.state)
             .map_err(CudaError::from)?;
         let mut plaquettes =
             Array6::from_shape_vec((self.nreplicas, t, x, y, z, 6), output).unwrap();
@@ -785,11 +784,12 @@ impl CudaBackend {
 
         let num_edges = self.nreplicas * t * x * y * z * 4;
         let mut edge_buffer = self
-            .device
+            .stream
             .alloc_zeros::<i32>(num_edges)
             .map_err(CudaError::from)?;
         Self::calculate_edge_violations_static(
-            self.device.clone(),
+            self.stream.clone(),
+            self.function_lookup.get("calculate_edge_sums").unwrap(),
             &mut edge_buffer,
             &self.state,
             self.bounds.clone(),
@@ -797,8 +797,8 @@ impl CudaBackend {
         )?;
 
         let output = self
-            .device
-            .dtoh_sync_copy(&edge_buffer)
+            .stream
+            .memcpy_dtov(&edge_buffer)
             .map_err(CudaError::from)?;
 
         let mut edges = Array6::from_shape_vec((self.nreplicas, t, x, y, z, 4), output).unwrap();
@@ -827,11 +827,14 @@ impl CudaBackend {
 
         let num_sites = self.nreplicas * t * x * y * z;
         let mut coord_buffer = self
-            .device
+            .stream
             .alloc_zeros::<i32>(num_sites)
             .map_err(CudaError::from)?;
         Self::calculate_matter_flow_static(
-            self.device.clone(),
+            self.stream.clone(),
+            self.function_lookup
+                .get("calculate_matter_flow_through_coords")
+                .unwrap(),
             &mut coord_buffer,
             &self.state,
             self.bounds.clone(),
@@ -839,8 +842,8 @@ impl CudaBackend {
         )?;
 
         let output = self
-            .device
-            .dtoh_sync_copy(&coord_buffer)
+            .stream
+            .memcpy_dtov(&coord_buffer)
             .map_err(CudaError::from)?;
 
         let mut coords = Array5::from_shape_vec((self.nreplicas, t, x, y, z), output).unwrap();
@@ -872,11 +875,14 @@ impl CudaBackend {
 
         let num_corners = self.nreplicas * t * x * y * z * 4;
         let mut output_buffer = self
-            .device
+            .stream
             .alloc_zeros::<i32>(num_corners)
             .map_err(CudaError::from)?;
         Self::calculate_matter_corners_static(
-            self.device.clone(),
+            self.stream.clone(),
+            self.function_lookup
+                .get("calculate_matter_corners_for_plaquettes")
+                .unwrap(),
             &mut output_buffer,
             &self.state,
             self.bounds.clone(),
@@ -885,8 +891,8 @@ impl CudaBackend {
         )?;
 
         let output = self
-            .device
-            .dtoh_sync_copy(&output_buffer)
+            .stream
+            .memcpy_dtov(&output_buffer)
             .map_err(CudaError::from)?;
 
         let mut corners_for_plaquettes =
@@ -922,31 +928,26 @@ impl CudaBackend {
             .fill_with_uniform(&mut self.rng_buffer)
             .map_err(CudaError::from)?;
 
-        let cfg = Self::get_launch_config(update_planes as u32);
-        let global_update = self
-            .device
-            .get_func("gauge_kernel", "global_update_sweep")
-            .unwrap();
+        let mut builder = self
+            .stream
+            .launch_builder(self.function_lookup.get("global_update_sweep").unwrap());
+        builder.arg(&mut self.state);
+        builder.arg(&self.potential_buffer);
+        builder.arg(&self.winding_chemical_potential_buffer);
+        builder.arg(&self.potential_redirect_buffer);
+        builder.arg(&self.potential_size);
+        builder.arg(&self.rng_buffer);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
+
         unsafe {
-            global_update
-                .launch(
-                    cfg,
-                    (
-                        &mut self.state,
-                        &self.potential_buffer,
-                        &self.winding_chemical_potential_buffer,
-                        &self.potential_redirect_buffer,
-                        self.potential_size,
-                        &self.rng_buffer,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(update_planes as u32))
+                .map_err(CudaError::from)
+        }?;
 
         #[cfg(debug_assertions)]
         debug_assert_eq!(self.get_edge_violations(), Ok(original_edge_violations));
@@ -977,32 +978,27 @@ impl CudaBackend {
             .fill_with_uniform(&mut self.rng_buffer)
             .map_err(CudaError::from)?;
 
-        let cfg = Self::get_launch_config(needed_threads as u32);
-        let global_update = self
-            .device
-            .get_func("gauge_kernel", "plane_shift_update")
-            .unwrap();
+        let mut builder = self
+            .stream
+            .launch_builder(self.function_lookup.get("plane_shift_update").unwrap());
+        builder.arg(&mut self.state);
+        builder.arg(&self.potential_buffer);
+        builder.arg(&self.potential_redirect_buffer);
+        builder.arg(&self.potential_size);
+        builder.arg(&self.rng_buffer);
+        builder.arg(&plaquette_type);
+        builder.arg(&offset);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
+
         unsafe {
-            global_update
-                .launch(
-                    cfg,
-                    (
-                        &mut self.state,
-                        &self.potential_buffer,
-                        &self.potential_redirect_buffer,
-                        self.potential_size,
-                        &self.rng_buffer,
-                        plaquette_type,
-                        offset,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(needed_threads as u32))
+                .map_err(CudaError::from)
+        }?;
 
         #[cfg(debug_assertions)]
         debug_assert_eq!(self.get_edge_violations(), Ok(original_edge_violations));
@@ -1013,32 +1009,29 @@ impl CudaBackend {
     pub fn get_winding_per_replica(&mut self) -> Result<Array2<i32>, CudaError> {
         let threads_to_sum = self.nreplicas * 6;
         let mut sum_buffer = self
-            .device
+            .stream
             .alloc_zeros::<i32>(threads_to_sum)
             .map_err(CudaError::from)?;
 
-        let cfg = Self::get_launch_config(threads_to_sum as u32);
-        let partial_sum_energies = self.device.get_func("gauge_kernel", "sum_winding").unwrap();
-
+        let mut builder = self
+            .stream
+            .launch_builder(self.function_lookup.get("sum_winding").unwrap());
+        builder.arg(&mut self.state);
+        builder.arg(&mut sum_buffer);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
         unsafe {
-            partial_sum_energies
-                .launch(
-                    cfg,
-                    (
-                        &self.state,
-                        &mut sum_buffer,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                .map_err(CudaError::from)
+        }?;
+
         let windings = self
-            .device
-            .dtoh_sync_copy(&sum_buffer)
+            .stream
+            .memcpy_dtov(&sum_buffer)
             .map(|x| Array2::from_shape_vec((self.nreplicas, 6), x).unwrap())
             .map_err(CudaError::from)?;
 
@@ -1062,58 +1055,54 @@ impl CudaBackend {
     }
 
     pub fn get_plaquette_counts(&mut self) -> Result<Array2<u32>, CudaError> {
-        let (t, x, y, _z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
+        let (t, x, _y, _z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let mut threads_to_sum = self.nreplicas * t * x; // each thread starts with y*z*6
 
         let mut sum_buffer = self
-            .device
+            .stream
             .alloc_zeros::<u32>(threads_to_sum * (2 * self.potential_size - 1))
             .map_err(CudaError::from)?;
         // Initial copying
-        let cfg = Self::get_launch_config(threads_to_sum as u32);
-        let partial_count = self
-            .device
-            .get_func("gauge_kernel", "partial_count_plaquettes")
-            .unwrap();
-
+        let mut builder = self.stream.launch_builder(
+            self.function_lookup
+                .get("partial_count_plaquettes")
+                .unwrap(),
+        );
+        builder.arg(&mut self.state);
+        builder.arg(&mut sum_buffer);
+        builder.arg(&self.potential_size);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
         unsafe {
-            partial_count
-                .launch(
-                    cfg,
-                    (
-                        &self.state,
-                        &mut sum_buffer,
-                        self.potential_size,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                .map_err(CudaError::from)
+        }?;
 
         // So now we have a chunk of memory made of r * t * x batches of size (2M-1) with M the
         // maximal value of a plaquette.
         // At the end we want r batches of size (2M-1), so we need to fold in the t*x.
         let threads_to_sum = self.nreplicas * (2 * self.potential_size - 1);
         let num_steps = t * x;
-        let cfg = Self::get_launch_config(threads_to_sum as u32);
-        let partial_sum_energies = self
-            .device
-            .get_func("gauge_kernel", "sum_int_buffer")
-            .unwrap();
+        let mut builder = self
+            .stream
+            .launch_builder(self.function_lookup.get("sum_int_buffer").unwrap());
+        builder.arg(&mut sum_buffer);
+        builder.arg(&threads_to_sum);
+        builder.arg(&num_steps);
         unsafe {
-            partial_sum_energies
-                .launch(cfg, (&mut sum_buffer, threads_to_sum, num_steps))
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                .map_err(CudaError::from)
+        }?;
 
         let subslice = sum_buffer.slice(0..threads_to_sum);
         let plaquettes = self
-            .device
-            .dtoh_sync_copy(&subslice)
+            .stream
+            .memcpy_dtov(&subslice)
             .map(|v| {
                 Array2::from_shape_vec((self.nreplicas, 2 * self.potential_size - 1), v).unwrap()
             })
@@ -1142,56 +1131,52 @@ impl CudaBackend {
         let mut threads_to_sum = self.nreplicas * t * x * y; // each thread starts with z*6
 
         let mut sum_buffer = self
-            .device
+            .stream
             .alloc_zeros::<f32>(threads_to_sum)
             .map_err(CudaError::from)?;
 
         // Initial copying
-        let cfg = Self::get_launch_config(threads_to_sum as u32);
-        let partial_sum_energies = self
-            .device
-            .get_func("gauge_kernel", "partial_sum_energies")
-            .unwrap();
-
+        let mut builder = self
+            .stream
+            .launch_builder(self.function_lookup.get("partial_sum_energies").unwrap());
+        builder.arg(&self.state);
+        builder.arg(&mut sum_buffer);
+        builder.arg(&self.potential_buffer);
+        builder.arg(&self.winding_chemical_potential_buffer);
+        builder.arg(&self.potential_redirect_buffer);
+        builder.arg(&self.potential_size);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
         unsafe {
-            partial_sum_energies
-                .launch(
-                    cfg,
-                    (
-                        &self.state,
-                        &mut sum_buffer,
-                        &self.potential_buffer,
-                        &self.winding_chemical_potential_buffer,
-                        &self.potential_redirect_buffer,
-                        self.potential_size,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                .map_err(CudaError::from)
+        }?;
 
         // Now for each of y, x, t, and r: sum the potentials
         for n in [y, x, t] {
             threads_to_sum /= n;
-
-            let cfg = Self::get_launch_config(threads_to_sum as u32);
-            let partial_sum_energies = self.device.get_func("gauge_kernel", "sum_buffer").unwrap();
+            let mut builder = self
+                .stream
+                .launch_builder(self.function_lookup.get("sum_buffer").unwrap());
+            builder.arg(&mut sum_buffer);
+            builder.arg(&threads_to_sum);
+            builder.arg(&n);
             unsafe {
-                partial_sum_energies
-                    .launch(cfg, (&mut sum_buffer, threads_to_sum, n))
-                    .map_err(CudaError::from)?
-            };
+                builder
+                    .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                    .map_err(CudaError::from)
+            }?;
         }
 
         // Copy out the subslice.
         let subslice = sum_buffer.slice(0..self.nreplicas);
         let energies = self
-            .device
-            .dtoh_sync_copy(&subslice)
+            .stream
+            .memcpy_dtov(&subslice)
             .map(Array1::from_vec)
             .map_err(CudaError::from)?;
 
@@ -1235,40 +1220,34 @@ impl CudaBackend {
     ) -> Result<(), CudaError> {
         #[cfg(debug_assertions)]
         let original_edge_violations = self.get_edge_violations()?;
-
         // Get some rng
         self.cuda_rng
             .fill_with_uniform(&mut self.rng_buffer)
             .map_err(CudaError::from)?;
 
         let n = self.simultaneous_local_updates();
-        let cfg = Self::get_launch_config(n as u32);
-
-        let single_local_update = self
-            .device
-            .get_func("gauge_kernel", "single_local_update_plaquettes")
-            .unwrap();
+        let mut builder = self.stream.launch_builder(
+            self.function_lookup
+                .get("single_local_update_plaquettes")
+                .unwrap(),
+        );
+        builder.arg(&self.state);
+        builder.arg(&self.potential_buffer);
+        builder.arg(&self.potential_redirect_buffer);
+        builder.arg(&self.potential_size);
+        builder.arg(&self.rng_buffer);
+        builder.arg(&volume_type);
+        builder.arg(&offset);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
         unsafe {
-            single_local_update
-                .launch(
-                    cfg,
-                    (
-                        &mut self.state,
-                        &self.potential_buffer,
-                        &self.potential_redirect_buffer,
-                        self.potential_size,
-                        &self.rng_buffer,
-                        volume_type,
-                        offset,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(n as u32))
+                .map_err(CudaError::from)
+        }?;
 
         #[cfg(debug_assertions)]
         debug_assert_eq!(self.get_edge_violations(), Ok(original_edge_violations));
@@ -1287,41 +1266,28 @@ impl CudaBackend {
             .map_err(CudaError::from)?;
 
         let n = self.nreplicas * self.bounds.volume() / 4;
-        let cfg = Self::get_launch_config(n as u32);
-        // let cfg = LaunchConfig {
-        //     grid_dim: ((n as u32 + 512 - 1) / 512, 1, 1),
-        //     block_dim: (512, 1, 1),
-        //     shared_mem_bytes: 0,
-        // };
-
-        let update_matter_loops = self
-            .device
-            .get_func("gauge_kernel", "update_matter_loops")
-            .unwrap();
         let plaquette_type_and_offset = (plaquette_type << 2) | offset;
+
+        let mut builder = self
+            .stream
+            .launch_builder(self.function_lookup.get("update_matter_loops").unwrap());
+        builder.arg(&self.state);
+        builder.arg(&self.potential_buffer);
+        builder.arg(&self.winding_chemical_potential_buffer);
+        builder.arg(&self.potential_redirect_buffer);
+        builder.arg(&self.potential_size);
+        builder.arg(&self.rng_buffer);
+        builder.arg(&plaquette_type_and_offset);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
         unsafe {
-            update_matter_loops
-                .launch(
-                    cfg,
-                    (
-                        &mut self.state,
-                        &self.potential_buffer,
-                        &self.winding_chemical_potential_buffer,
-                        &self.potential_redirect_buffer,
-                        self.potential_size,
-                        &self.rng_buffer,
-                        // plaquette_type,
-                        // offset,
-                        plaquette_type_and_offset,
-                        self.nreplicas,
-                        self.bounds.t,
-                        self.bounds.x,
-                        self.bounds.y,
-                        self.bounds.z,
-                    ),
-                )
-                .map_err(CudaError::from)?
-        };
+            builder
+                .launch(LaunchConfig::for_num_elems(n as u32))
+                .map_err(CudaError::from)
+        }?;
 
         Ok(())
     }
@@ -1355,7 +1321,8 @@ impl CudaBackend {
     }
 
     fn calculate_matter_flow_static(
-        device: Arc<CudaDevice>,
+        stream: Arc<CudaStream>,
+        calculate_matter_flow_through_coords: &CudaFunction,
         coord_buffer: &mut CudaSlice<i32>,
         plaquette_buffer: &CudaSlice<i32>,
         bounds: SiteIndex,
@@ -1364,20 +1331,26 @@ impl CudaBackend {
         let (t, x, y, z) = (bounds.t, bounds.x, bounds.y, bounds.z);
         let num_edges = nreplicas * t * x * y * z;
 
-        let calculate_edge_sums = device
-            .get_func("gauge_kernel", "calculate_matter_flow_through_coords")
-            .unwrap();
+        let mut builder = stream.launch_builder(calculate_matter_flow_through_coords);
+        builder.arg(plaquette_buffer);
+        builder.arg(coord_buffer);
+        builder.arg(&nreplicas);
+        builder.arg(&t);
+        builder.arg(&x);
+        builder.arg(&y);
+        builder.arg(&z);
 
-        let cfg = Self::get_launch_config(num_edges as u32);
         unsafe {
-            calculate_edge_sums
-                .launch(cfg, (plaquette_buffer, coord_buffer, nreplicas, t, x, y, z))
+            builder
+                .launch(LaunchConfig::for_num_elems(num_edges as u32))
                 .map_err(CudaError::from)
         }
+        .map(|_| ())
     }
 
     fn calculate_matter_corners_static(
-        device: Arc<CudaDevice>,
+        stream: Arc<CudaStream>,
+        calculate_matter_corners_for_plaquettes: &CudaFunction,
         plaquette_corners_buffer: &mut CudaSlice<i32>,
         plaquette_buffer: &CudaSlice<i32>,
         bounds: SiteIndex,
@@ -1387,32 +1360,27 @@ impl CudaBackend {
         let (t, x, y, z) = (bounds.t, bounds.x, bounds.y, bounds.z);
         let num_sites = nreplicas * t * x * y * z;
 
-        let calculate_edge_sums = device
-            .get_func("gauge_kernel", "calculate_matter_corners_for_plaquettes")
-            .unwrap();
+        let mut builder = stream.launch_builder(calculate_matter_corners_for_plaquettes);
+        builder.arg(plaquette_buffer);
+        builder.arg(plaquette_corners_buffer);
+        builder.arg(&plaquette_type);
+        builder.arg(&nreplicas);
+        builder.arg(&t);
+        builder.arg(&x);
+        builder.arg(&y);
+        builder.arg(&z);
 
-        let cfg = Self::get_launch_config(num_sites as u32);
         unsafe {
-            calculate_edge_sums
-                .launch(
-                    cfg,
-                    (
-                        plaquette_buffer,
-                        plaquette_corners_buffer,
-                        plaquette_type,
-                        nreplicas,
-                        t,
-                        x,
-                        y,
-                        z,
-                    ),
-                )
+            builder
+                .launch(LaunchConfig::for_num_elems(num_sites as u32))
                 .map_err(CudaError::from)
         }
+        .map(|_| ())
     }
 
     fn calculate_edge_violations_static(
-        device: Arc<CudaDevice>,
+        stream: Arc<CudaStream>,
+        calculate_edge_sums: &CudaFunction,
         edge_buffer: &mut CudaSlice<i32>,
         plaquette_buffer: &CudaSlice<i32>,
         bounds: SiteIndex,
@@ -1421,16 +1389,21 @@ impl CudaBackend {
         let (t, x, y, z) = (bounds.t, bounds.x, bounds.y, bounds.z);
         let num_edges = nreplicas * t * x * y * z * 4;
 
-        let calculate_edge_sums = device
-            .get_func("gauge_kernel", "calculate_edge_sums")
-            .unwrap();
+        let mut builder = stream.launch_builder(calculate_edge_sums);
+        builder.arg(plaquette_buffer);
+        builder.arg(edge_buffer);
+        builder.arg(&nreplicas);
+        builder.arg(&t);
+        builder.arg(&x);
+        builder.arg(&y);
+        builder.arg(&z);
 
-        let cfg = Self::get_launch_config(num_edges as u32);
         unsafe {
-            calculate_edge_sums
-                .launch(cfg, (plaquette_buffer, edge_buffer, nreplicas, t, x, y, z))
+            builder
+                .launch(LaunchConfig::for_num_elems(num_edges as u32))
                 .map_err(CudaError::from)
         }
+        .map(|_| ())
     }
 
     pub fn calculate_edge_violations(
@@ -1439,7 +1412,8 @@ impl CudaBackend {
         plaquette_buffer: &CudaSlice<i32>,
     ) -> Result<(), CudaError> {
         Self::calculate_edge_violations_static(
-            self.device.clone(),
+            self.stream.clone(),
+            self.function_lookup.get("calculate_edge_sums").unwrap(),
             edge_buffer,
             plaquette_buffer,
             self.bounds.clone(),
