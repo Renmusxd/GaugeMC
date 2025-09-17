@@ -1000,18 +1000,20 @@ extern "C" __global__ void count_plaquette_pairs_with_increasing_z(int* plaquett
     int max_distance_from_root, int max_abs_integer_considered, int plaquette_type,
     int replicas, int t, int x, int y, int z)
 {
-    // Each thread is responsible for (6 * max_distance * (2*max_int - 1)^2) slots in memory.
-    int num_threads = replicas;
+    // Each thread is responsible for (2*max_int - 1)^2 slots in memory.
+    int num_threads = replicas * max_distance_from_root * 6;
 
     int globalThreadNum = get_thread_number();
     if (globalThreadNum >= num_threads) {
         return;
     }
 
-    int replica_index = globalThreadNum;
+    int index = globalThreadNum;
+    int p_type = index % 6; index /= 6;
+    int z_offset_from_root = index % max_distance_from_root; index /= max_distance_from_root;
+    int replica_index = index;
 
     int replica_offset = replica_index * (t * x * y * z * 6);
-
 
     int num_integers_considered = (2*max_abs_integer_considered + 1);
     int num_pairs_considered = num_integers_considered * num_integers_considered;
@@ -1028,21 +1030,16 @@ extern "C" __global__ void count_plaquette_pairs_with_increasing_z(int* plaquett
         }
         int np_index = np + max_abs_integer_considered;
 
-        // Now lets increase distances and iterate over plaquette types.
-        for (int z_offset_from_root = 0; z_offset_from_root < max_distance_from_root; z_offset_from_root++) {
-            for (int p_type = 0; p_type < 6; p_type++) {
-                int nq = plaquette_buffer[replica_offset + memory_offset_of_starting_position + z_offset_from_root*6 + p_type];
-                if (abs(nq) > max_abs_integer_considered) {
-                    continue;
-                }
-                int nq_index = nq + max_abs_integer_considered;
-
-                int pair_index = np_index * num_integers_considered + nq_index;
-
-                int count_mem_loc = globalThreadNum*(max_distance_from_root*6*num_pairs_considered) + z_offset_from_root*(6*num_pairs_considered) + p_type*(num_pairs_considered) + pair_index;
-                plaquette_pair_counts[count_mem_loc] += 1;
-            }
+        int nq = plaquette_buffer[replica_offset + memory_offset_of_starting_position + z_offset_from_root*6 + p_type];
+        if (abs(nq) > max_abs_integer_considered) {
+            continue;
         }
+        int nq_index = nq + max_abs_integer_considered;
+
+        int pair_index = np_index * num_integers_considered + nq_index;
+
+        int count_mem_loc = globalThreadNum*num_pairs_considered + pair_index;
+        plaquette_pair_counts[count_mem_loc] += 1;
     }
 }
 

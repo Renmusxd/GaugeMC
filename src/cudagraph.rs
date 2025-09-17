@@ -1071,14 +1071,15 @@ impl CudaBackend {
         max_distance_from_root: u32,
         plaquette_type: u32,
     ) -> Result<(), CudaError> {
-        let r = self.nreplicas;
         let num_pairs = (2 * max_absolute_integer + 1).pow(2);
-        let memory_per_thread = max_distance_from_root * num_pairs * 6;
+
+        let num_threads = self.nreplicas * (max_distance_from_root as usize) * 6;
+        let memory_per_thread = num_pairs as usize;
 
         if self.plaquette_pair_accumulator.is_none() {
             let buffer = self
                 .stream
-                .alloc_zeros::<u32>(r * memory_per_thread as usize)
+                .alloc_zeros::<u32>(num_threads * memory_per_thread)
                 .map_err(CudaError::from)?;
             self.plaquette_pair_accumulator = Some(PlaquettePairData {
                 max_abs_value: max_absolute_integer,
@@ -1120,7 +1121,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(r as u32))
+                .launch(LaunchConfig::for_num_elems(num_threads as u32))
                 .map_err(CudaError::from)
         }?;
         Ok(())
