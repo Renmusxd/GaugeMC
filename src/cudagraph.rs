@@ -247,7 +247,7 @@ impl CudaBackend {
             "plane_shift_update",
             "sum_int_buffer",
             "partial_count_plaquettes",
-            "count_plaquette_pairs",
+            "count_plaquette_pairs_with_increasing_z",
         ];
         let function_lookup: HashMap<_, _> = functions
             .into_iter()
@@ -1070,7 +1070,6 @@ impl CudaBackend {
         max_absolute_integer: u32,
         max_distance_from_root: u32,
         plaquette_type: u32,
-        along_dimension: u32,
     ) -> Result<(), CudaError> {
         let r = self.nreplicas;
         let num_pairs = (2 * max_absolute_integer + 1).pow(2);
@@ -1086,18 +1085,33 @@ impl CudaBackend {
                 max_distance: max_distance_from_root,
                 buffer,
             });
+        } else {
+            let plaquette_pair_accumulator = self.plaquette_pair_accumulator.as_ref().unwrap();
+            if plaquette_pair_accumulator.max_distance != max_distance_from_root {
+                return CudaError::value_error(format!(
+                    "Existing buffer used max_distance_from_root {} but was asked for {}",
+                    plaquette_pair_accumulator.max_distance, max_distance_from_root
+                ));
+            }
+            if plaquette_pair_accumulator.max_abs_value != max_absolute_integer {
+                return CudaError::value_error(format!(
+                    "Existing buffer used max_absolute_integer {} but was asked for {}",
+                    plaquette_pair_accumulator.max_abs_value, max_absolute_integer
+                ));
+            }
         }
 
         let buffer = &mut self.plaquette_pair_accumulator.as_mut().unwrap().buffer;
-        let mut builder = self
-            .stream
-            .launch_builder(self.function_lookup.get("count_plaquette_pairs").unwrap());
+        let mut builder = self.stream.launch_builder(
+            self.function_lookup
+                .get("count_plaquette_pairs_with_increasing_z")
+                .unwrap(),
+        );
         builder.arg(&mut self.state);
         builder.arg(buffer);
         builder.arg(&max_distance_from_root);
         builder.arg(&max_absolute_integer);
         builder.arg(&plaquette_type);
-        builder.arg(&along_dimension);
         builder.arg(&self.nreplicas);
         builder.arg(&self.bounds.t);
         builder.arg(&self.bounds.x);
@@ -1135,6 +1149,10 @@ impl CudaBackend {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn clear_plaquette_pair_counts(&mut self) {
+        self.plaquette_pair_accumulator = None;
     }
 
     pub fn get_plaquette_counts(&mut self) -> Result<Array2<u32>, CudaError> {
@@ -2951,7 +2969,7 @@ mod tests {
             None,
             None,
         )?;
-        state.accumulate_plaquette_pair_counts(1, d as u32, 0, 0)?;
+        state.accumulate_plaquette_pair_counts(1, d as u32, 0)?;
         let plaquette_counts = state
             .get_plaquette_pair_counts()?
             .expect("Should be some value.");
