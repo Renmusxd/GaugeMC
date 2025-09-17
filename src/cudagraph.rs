@@ -8,7 +8,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 #[cfg(feature = "hashbrown-hashing")]
 use hashbrown::HashMap;
-use ndarray::{Array1, Array2, Array5, Array6, ArrayView1, ArrayView2, ArrayView6, Axis};
+use ndarray::{Array1, Array2, Array4, Array5, Array6, ArrayView1, ArrayView2, ArrayView6, Axis};
 use ndarray_rand::rand::prelude::SliceRandom;
 use ndarray_rand::rand::{random, thread_rng, Rng};
 use rayon::prelude::*;
@@ -36,6 +36,14 @@ pub struct CudaBackend {
     parallel_tempering_debug: Option<TemperingTracker>,
     wilson_loop_probs: Option<WilsonLoopData>,
     function_lookup: HashMap<String, CudaFunction>,
+    // None until function is first called
+    plaquette_pair_accumulator: Option<PlaquettePairData>,
+}
+
+struct PlaquettePairData {
+    max_abs_value: u32,
+    max_distance: u32,
+    buffer: CudaSlice<u32>,
 }
 
 enum WilsonLoopData {
@@ -131,7 +139,7 @@ pub struct DualState {
 }
 
 impl DualState {
-    pub fn get_plaquettes(&self) -> ArrayView6<i32> {
+    pub fn get_plaquettes(&self) -> ArrayView6<'_, i32> {
         self.plaquettes.view()
     }
 
@@ -202,7 +210,8 @@ impl CudaBackend {
     ) -> Result<Self, CudaError> {
         let opts = CompileOptions::default();
 
-        let local_updates_ptx = compile_ptx_with_opts(include_str!("kernels/cuda_kernel.cu"), opts);
+        let s = include_str!("kernels/cuda_kernel.cu");
+        let local_updates_ptx = compile_ptx_with_opts(s, opts);
         let local_updates_ptx = match local_updates_ptx {
             Ok(x) => x,
             Err(cerr) => {
@@ -238,6 +247,7 @@ impl CudaBackend {
             "plane_shift_update",
             "sum_int_buffer",
             "partial_count_plaquettes",
+            "count_plaquette_pairs",
         ];
         let function_lookup: HashMap<_, _> = functions
             .into_iter()
@@ -342,6 +352,7 @@ impl CudaBackend {
             parallel_tempering_debug: None,
             wilson_loop_probs: None,
             function_lookup,
+            plaquette_pair_accumulator: None,
         })
     }
 
@@ -1051,6 +1062,78 @@ impl CudaBackend {
             Ok(result)
         } else {
             Ok(windings)
+        }
+    }
+
+    pub fn accumulate_plaquette_pair_counts(
+        &mut self,
+        max_absolute_integer: u32,
+        max_distance_from_root: u32,
+        plaquette_type: u32,
+        along_dimension: u32,
+    ) -> Result<(), CudaError> {
+        let r = self.nreplicas;
+        let num_pairs = (2 * max_absolute_integer + 1).pow(2);
+        let memory_per_thread = max_distance_from_root * num_pairs * 6;
+
+        if self.plaquette_pair_accumulator.is_none() {
+            let buffer = self
+                .stream
+                .alloc_zeros::<u32>(r * memory_per_thread as usize)
+                .map_err(CudaError::from)?;
+            self.plaquette_pair_accumulator = Some(PlaquettePairData {
+                max_abs_value: max_absolute_integer,
+                max_distance: max_distance_from_root,
+                buffer,
+            });
+        }
+
+        let buffer = &mut self.plaquette_pair_accumulator.as_mut().unwrap().buffer;
+        let mut builder = self
+            .stream
+            .launch_builder(self.function_lookup.get("count_plaquette_pairs").unwrap());
+        builder.arg(&mut self.state);
+        builder.arg(buffer);
+        builder.arg(&max_distance_from_root);
+        builder.arg(&max_absolute_integer);
+        builder.arg(&plaquette_type);
+        builder.arg(&along_dimension);
+        builder.arg(&self.nreplicas);
+        builder.arg(&self.bounds.t);
+        builder.arg(&self.bounds.x);
+        builder.arg(&self.bounds.y);
+        builder.arg(&self.bounds.z);
+
+        unsafe {
+            builder
+                .launch(LaunchConfig::for_num_elems(r as u32))
+                .map_err(CudaError::from)
+        }?;
+        Ok(())
+    }
+
+    pub fn get_plaquette_pair_counts(&mut self) -> Result<Option<Array5<u32>>, CudaError> {
+        let counts_data_struct = self.plaquette_pair_accumulator.as_mut();
+        if let Some(counts_data_struct) = counts_data_struct {
+            self.stream
+                .memcpy_dtov(&mut counts_data_struct.buffer)
+                .map(|v| -> Option<Array5<u32>> {
+                    let num_ints = 2 * counts_data_struct.max_abs_value as usize + 1;
+                    Array5::from_shape_vec(
+                        (
+                            self.nreplicas,
+                            counts_data_struct.max_distance as usize,
+                            6,
+                            num_ints,
+                            num_ints,
+                        ),
+                        v,
+                    )
+                    .ok()
+                })
+                .map_err(CudaError::from)
+        } else {
+            Ok(None)
         }
     }
 
@@ -2844,6 +2927,37 @@ mod tests {
             arr[i + 2] += (d * d) as u32;
             assert_eq!(plaquette_counts.slice(s![i, ..]), arr);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_plaquette_pair_counts() -> Result<(), CudaError> {
+        let (r, d) = (1, 4);
+
+        let mut state = Array6::zeros((r, d, d, d, d, 6));
+        state
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(rr, mut x)| {
+                x[(0, 0, 0, 0, 0)] = 0;
+                x[(0, 0, 0, 1, 0)] = 1;
+            });
+        let state = DualState::new_plaquettes(state);
+        let mut state = CudaBackend::new(
+            SiteIndex::new(d, d, d, d),
+            make_simple_potentials(r, 3),
+            Some(state),
+            None,
+            None,
+            None,
+        )?;
+        state.accumulate_plaquette_pair_counts(1, d as u32, 0, 0)?;
+        let plaquette_counts = state
+            .get_plaquette_pair_counts()?
+            .expect("Should be some value.");
+
+        println!("{:?}", plaquette_counts);
+
         Ok(())
     }
 }
