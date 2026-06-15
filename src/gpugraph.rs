@@ -422,7 +422,7 @@ impl GPUBackend {
         let mut rng = if let Some(seed) = seed {
             SmallRng::seed_from_u64(seed)
         } else {
-            SmallRng::from_entropy()
+            SmallRng::from_os_rng()
         };
 
         let contents = (0..num_pcgs).map(|_| rng.gen()).collect::<Vec<u32>>();

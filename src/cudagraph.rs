@@ -10,7 +10,7 @@ use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 use hashbrown::HashMap;
 use ndarray::{Array1, Array2, Array5, Array6, ArrayView1, ArrayView2, ArrayView6, Axis};
 use ndarray_rand::rand::prelude::SliceRandom;
-use ndarray_rand::rand::{random, thread_rng, Rng};
+use ndarray_rand::rand::{random, Rng};
 use rayon::prelude::*;
 #[cfg(not(feature = "hashbrown-hashing"))]
 use std::collections::HashMap;
@@ -711,8 +711,10 @@ impl CudaBackend {
     }
 
     pub fn parallel_tempering_step(&mut self, swaps: &[(usize, usize)]) -> Result<(), CudaError> {
-        let mut rng = thread_rng();
-        let rand_values = (0..self.nreplicas).map(|_| rng.gen()).collect::<Vec<f32>>();
+        let mut rng = ndarray_rand::rand::rng();
+        let rand_values = (0..self.nreplicas)
+            .map(|_| rng.random())
+            .collect::<Vec<f32>>();
         self.parallel_tempering_step_with_rand(swaps, &rand_values)
     }
 
@@ -767,7 +769,7 @@ impl CudaBackend {
         let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let output = self
             .stream
-            .memcpy_dtov(&self.state)
+            .clone_dtoh(&self.state)
             .map_err(CudaError::from)?;
         let mut plaquettes =
             Array6::from_shape_vec((self.nreplicas, t, x, y, z, 6), output).unwrap();
@@ -809,7 +811,7 @@ impl CudaBackend {
 
         let output = self
             .stream
-            .memcpy_dtov(&edge_buffer)
+            .clone_dtoh(&edge_buffer)
             .map_err(CudaError::from)?;
 
         let mut edges = Array6::from_shape_vec((self.nreplicas, t, x, y, z, 4), output).unwrap();
@@ -854,7 +856,7 @@ impl CudaBackend {
 
         let output = self
             .stream
-            .memcpy_dtov(&coord_buffer)
+            .clone_dtoh(&coord_buffer)
             .map_err(CudaError::from)?;
 
         let mut coords = Array5::from_shape_vec((self.nreplicas, t, x, y, z), output).unwrap();
@@ -903,7 +905,7 @@ impl CudaBackend {
 
         let output = self
             .stream
-            .memcpy_dtov(&output_buffer)
+            .clone_dtoh(&output_buffer)
             .map_err(CudaError::from)?;
 
         let mut corners_for_plaquettes =
@@ -1043,7 +1045,7 @@ impl CudaBackend {
 
         let windings = self
             .stream
-            .memcpy_dtov(&sum_buffer)
+            .clone_dtoh(&sum_buffer)
             .map(|x| Array2::from_shape_vec((self.nreplicas, 6), x).unwrap())
             .map_err(CudaError::from)?;
 
@@ -1132,7 +1134,7 @@ impl CudaBackend {
         let counts_data_struct = self.plaquette_pair_accumulator.as_mut();
         if let Some(counts_data_struct) = counts_data_struct {
             self.stream
-                .memcpy_dtov(&mut counts_data_struct.buffer)
+                .clone_dtoh(&mut counts_data_struct.buffer)
                 .map(|v| -> Option<Array5<u32>> {
                     let num_ints = 2 * counts_data_struct.max_abs_value as usize + 1;
                     Array5::from_shape_vec(
@@ -1205,7 +1207,7 @@ impl CudaBackend {
         let subslice = sum_buffer.slice(0..threads_to_sum);
         let plaquettes = self
             .stream
-            .memcpy_dtov(&subslice)
+            .clone_dtoh(&subslice)
             .map(|v| {
                 Array2::from_shape_vec((self.nreplicas, 2 * self.potential_size - 1), v).unwrap()
             })
@@ -1279,7 +1281,7 @@ impl CudaBackend {
         let subslice = sum_buffer.slice(0..self.nreplicas);
         let energies = self
             .stream
-            .memcpy_dtov(&subslice)
+            .clone_dtoh(&subslice)
             .map(Array1::from_vec)
             .map_err(CudaError::from)?;
 
@@ -1301,7 +1303,7 @@ impl CudaBackend {
         #[cfg(debug_assertions)]
         let original_edge_violations = self.get_edge_violations()?;
 
-        let mut rng = thread_rng();
+        let mut rng = ndarray_rand::rand::rng();
         let mut local_update_types = self.local_update_types.take().unwrap();
         local_update_types.shuffle(&mut rng);
         let res = local_update_types
@@ -1777,7 +1779,7 @@ mod tests {
     fn test_get_plaquettes_single_inc_random_fill() -> Result<(), CudaError> {
         let (r, t, x, y, z) = (16, 6, 6, 6, 6);
         for _ in 0..10 {
-            let state = Array6::random((r, t, x, y, z, 4), Uniform::new(-32, 32));
+            let state = Array6::random((r, t, x, y, z, 4), Uniform::new(-32, 32).unwrap());
             let state = DualState::new_volumes(state);
             let mut state = CudaBackend::new(
                 SiteIndex::new(t, x, y, z),
@@ -2705,7 +2707,7 @@ mod tests {
         }
 
         state.calculate_wilson_loop_transition_probs()?;
-        let result = state.get_wilson_loop_transition_probs()?;
+        let _result = state.get_wilson_loop_transition_probs()?;
 
         Ok(())
     }
@@ -2731,7 +2733,7 @@ mod tests {
         }
 
         state.calculate_wilson_loop_transition_probs()?;
-        let result = state.get_wilson_loop_transition_probs()?;
+        let _result = state.get_wilson_loop_transition_probs()?;
 
         Ok(())
     }
@@ -2958,7 +2960,7 @@ mod tests {
         state
             .axis_iter_mut(Axis(0))
             .enumerate()
-            .for_each(|(rr, mut x)| {
+            .for_each(|(_rr, mut x)| {
                 x[(0, 0, 0, 0, 0)] = 0;
                 x[(0, 0, 0, 1, 0)] = 1;
             });

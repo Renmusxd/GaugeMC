@@ -162,7 +162,6 @@ mod tests {
         Ok(())
     }
 
-
     #[bench]
     fn bench_get_action_call(b: &mut Bencher) -> Result<(), CudaError> {
         let r = 128;
@@ -206,11 +205,10 @@ mod tests {
         }
 
         b.iter(|| {
-            let counts = state.get_plaquette_counts().unwrap();
+            let _counts = state.get_plaquette_counts().unwrap();
         });
         Ok(())
     }
-
 
     #[bench]
     fn bench_count_plaquettes_full_graph(b: &mut Bencher) -> Result<(), CudaError> {
@@ -231,7 +229,7 @@ mod tests {
         }
 
         b.iter(|| {
-            let graph = state.get_plaquettes().unwrap();
+            let _graph = state.get_plaquettes().unwrap();
         });
         Ok(())
     }

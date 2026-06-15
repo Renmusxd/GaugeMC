@@ -50,7 +50,7 @@ fn main() -> Result<(), CudaError> {
     let mn = 32;
     let ln = 0;
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut updates = (0..mn + ln).map(|i| i < mn).collect::<Vec<_>>();
 
     let mut output = Array2::zeros((n, num_replicas));

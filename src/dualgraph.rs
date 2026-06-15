@@ -568,7 +568,7 @@ impl NDDualGraph {
         };
         // Pick all cube deltas, either using a single rng or a thread specific one
         if let Some(rng) = rng {
-            let rands = Array4::random_using(shape, Uniform::new(0.0, 1.0), rng);
+            let rands = Array4::random_using(shape, Uniform::new(0.0, 1.0).unwrap(), rng);
             ndarray::Zip::indexed(&mut cube_choices)
                 .into_par_iter()
                 .for_each(|((rho, mu, nu, sigma), c)| {
@@ -585,7 +585,7 @@ impl NDDualGraph {
             ndarray::Zip::indexed(&mut cube_choices)
                 .into_par_iter()
                 .for_each(|((rho, mu, nu, sigma), c)| {
-                    let rand_num = rand::thread_rng().gen();
+                    let rand_num = rand::rng().random();
                     let cube_choice =
                         self.get_cube_choice([rho, mu, nu, sigma], dims, leftover, off, rand_num);
                     if let Some(delta) = cube_choice {
@@ -779,7 +779,7 @@ impl NDDualGraph {
 
         let (rands, use_rands) = if let Some(rng) = rng {
             (
-                (0..num_planes).map(|_| rng.gen()).collect::<Vec<f64>>(),
+                (0..num_planes).map(|_| rng.random()).collect::<Vec<f64>>(),
                 true,
             )
         } else {
@@ -792,7 +792,7 @@ impl NDDualGraph {
                 let rand_num = if use_rands {
                     rands[plane]
                 } else {
-                    rand::thread_rng().gen()
+                    rand::rng().random()
                 };
                 // Iterate over plaquettes in plane (mu, nu, [p])
                 // sum up energy costs for +1 and -1, then decide fate.
@@ -1156,7 +1156,7 @@ mod tests {
             bounds.z,
             (0..10).map(|i| (i as f64).powi(2) / 2.0),
         )?;
-        let mut rng = SmallRng::from_entropy();
+        let mut rng = SmallRng::from_os_rng();
         graph.local_update_sweep(Some(&mut rng));
         Ok(())
     }

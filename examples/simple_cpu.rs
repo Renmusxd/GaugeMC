@@ -2,7 +2,6 @@ use gaugemc::NDDualGraph;
 use log::info;
 use ndarray::{Array, Array0, Array1};
 use ndarray_npy::NpzWriter;
-use ndarray_rand::rand::thread_rng;
 use num_complex::Complex;
 use std::fs::File;
 
@@ -36,7 +35,7 @@ fn main() {
 
         let mut state = NDDualGraph::new(d, d, d, d, make_cosine_potentials(32, k))
             .expect("Could not create graph");
-        let mut rng = thread_rng();
+        let mut rng = ndarray_rand::rand::rng();
 
         for i in 0..warmup {
             info!("Warmup {}/{}", i, warmup);
@@ -57,7 +56,8 @@ fn main() {
         );
         npz.add_array("energy", &result)
             .expect("Could not add array to file.");
-        npz.add_array("k", &Array0::from_elem((), k));
+        npz.add_array("k", &Array0::from_elem((), k))
+            .expect("Could not add array to file.");
         npz.finish().expect("Could not write to file.");
     }
 }

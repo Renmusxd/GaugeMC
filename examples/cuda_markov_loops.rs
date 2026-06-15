@@ -1,8 +1,7 @@
-use gaugemc::{CudaBackend, CudaError, DualState, SiteIndex};
+use gaugemc::{CudaBackend, CudaError, SiteIndex};
 use log::info;
-use ndarray::{s, Array1, Array2, Array3, Array6, Axis};
+use ndarray::{Array1, Array2, Axis};
 use ndarray_npy::NpzWriter;
-use num_traits::Zero;
 use std::fs::File;
 
 fn main() -> Result<(), CudaError> {
@@ -15,7 +14,7 @@ fn main() -> Result<(), CudaError> {
     let k = 0.6;
     vns.axis_iter_mut(Axis(0))
         .enumerate()
-        .for_each(|(i, mut v)| {
+        .for_each(|(_i, mut v)| {
             v.iter_mut().enumerate().for_each(|(j, v)| {
                 *v = k * (j.pow(2) as f32);
             })

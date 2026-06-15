@@ -6,7 +6,7 @@ extern crate test;
 mod tests {
     use gaugemc::NDDualGraph;
 
-    use ndarray_rand::rand::thread_rng;
+    use ndarray_rand::rand::rng;
     use test::Bencher;
 
     fn make_simple_potentials(npots: usize) -> Vec<f64> {
@@ -23,7 +23,7 @@ mod tests {
         let d = 16;
         let mut state = NDDualGraph::new(d, d, d, d, make_simple_potentials(32))?;
 
-        let mut rng = thread_rng();
+        let mut rng = rng();
         b.iter(|| state.local_update_sweep(Some(&mut rng)));
         Ok(())
     }
@@ -33,7 +33,7 @@ mod tests {
         let d = 16;
         let mut state = NDDualGraph::new(d, d, d, d, make_simple_potentials(32))?;
 
-        let mut rng = thread_rng();
+        let mut rng = rng();
         b.iter(|| state.global_update_sweep(Some(&mut rng)));
         Ok(())
     }
