@@ -8,7 +8,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
 #[cfg(feature = "hashbrown-hashing")]
 use hashbrown::HashMap;
-use ndarray::{Array1, Array2, Array4, Array5, Array6, ArrayView1, ArrayView2, ArrayView6, Axis};
+use ndarray::{Array1, Array2, Array5, Array6, ArrayView1, ArrayView2, ArrayView6, Axis};
 use ndarray_rand::rand::prelude::SliceRandom;
 use ndarray_rand::rand::{random, thread_rng, Rng};
 use rayon::prelude::*;
@@ -70,7 +70,7 @@ enum RedirectArrays {
 }
 
 impl RedirectArrays {
-    fn unwrap(&mut self, n: usize) -> (ArrayView1<u32>, ArrayView1<u32>) {
+    fn unwrap(&mut self, n: usize) -> (ArrayView1<'_, u32>, ArrayView1<'_, u32>) {
         match self {
             RedirectArrays::None => {
                 *self = Self::new((0..n as u32).collect::<Vec<_>>());
@@ -360,7 +360,7 @@ impl CudaBackend {
         static LAUNCH_CONFIG_SIZE: LazyLock<Option<u32>> = LazyLock::new(|| {
             env::var("GAUGEMC_BLOCK_SIZE").ok().map(|s| {
                 s.parse()
-                    .expect("Could not parse LAUNCH_CONFIG_SIZE as positive integer.")
+                    .expect("Could not parse GAUGEMC_BLOCK_SIZE as positive integer.")
             })
         });
         match &*LAUNCH_CONFIG_SIZE {
@@ -640,9 +640,9 @@ impl CudaBackend {
             None => CudaError::value_error("Initialization has not been run."),
             Some(WilsonLoopData::AspectRatios {
                 plaquette_type,
-                mut times_run,
+                times_run,
                 aspect_ratios,
-                mut probs_slice,
+                probs_slice,
             }) => {
                 self.stream
                     .memcpy_dtoh(&probs_slice, output)
@@ -939,6 +939,7 @@ impl CudaBackend {
             .fill_with_uniform(&mut self.rng_buffer)
             .map_err(CudaError::from)?;
 
+        // global_update_sweep(&mut self.state, &self.potential_buffer, ...)
         let mut builder = self
             .stream
             .launch_builder(self.function_lookup.get("global_update_sweep").unwrap());
@@ -1158,7 +1159,7 @@ impl CudaBackend {
 
     pub fn get_plaquette_counts(&mut self) -> Result<Array2<u32>, CudaError> {
         let (t, x, _y, _z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
-        let mut threads_to_sum = self.nreplicas * t * x; // each thread starts with y*z*6
+        let threads_to_sum = self.nreplicas * t * x; // each thread starts with y*z*6
 
         let mut sum_buffer = self
             .stream

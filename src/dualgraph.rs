@@ -562,7 +562,7 @@ impl NDDualGraph {
         let leftover = Self::get_leftover_dim(dims);
         let shape = Self::get_cube_update_shape(&self.bounds, dims, leftover);
         let mut cube_choices = if let Some(cube_choices) = self.cube_choices.take() {
-            cube_choices.into_shape(shape).unwrap()
+            cube_choices.to_shape(shape).unwrap().to_owned()
         } else {
             Array4::<i32>::zeros(shape)
         };
