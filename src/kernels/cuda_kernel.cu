@@ -726,44 +726,47 @@ extern "C" __global__ void plane_shift_update(int* plaquette_buffer,
     int plane_index_offset = a_index * strides[indexed_dim_one] + b_index * strides[indexed_dim_two];
     int plane_index_offset_inc = a_index * strides[indexed_dim_one] + b_index_inc * strides[indexed_dim_two];
 
-    float boltzman_weights[3] = {0.0,0.0,0.0};
+    // Choose metropolis proposal.
+    float rng = 2 * rng_buffer[globalThreadNum];
+    int delta = 0;
+    if ( rng <= 1.0 ) {
+        delta = 1;
+    } else {
+        delta = -1;
+        rng = rng - 1.0;
+    }
+
+    float energy_of_delta = 0.0;
     for (int i = 0; i < bounds[plane_one]; i++) {
         for (int j = 0; j < bounds[plane_two]; j++) {
             // Iterate over plane
             int offset = i*strides[plane_one] + j*strides[plane_two];
             int np = plaquette_buffer[replica_offset + plane_index_offset + offset + plaquette_type];
             int np_inc = plaquette_buffer[replica_offset + plane_index_offset_inc + offset + plaquette_type];
-            for (int k = 0; k < 3; k++) {
-                boltzman_weights[k] += (abs(np + (k-1))) < potential_vector_size ? potential_buffer[potential_offset + abs(np + (k-1))] : 1000.0;
-                boltzman_weights[k] += (np_inc - (k-1)) < potential_vector_size ? potential_buffer[potential_offset + abs(np_inc - (k-1))] : 1000.0;
+            energy_of_delta += (abs(np + delta)) < potential_vector_size ? potential_buffer[potential_offset + abs(np + delta)] : 1000.0;
+            energy_of_delta -= potential_buffer[potential_offset + abs(np)];
+            energy_of_delta += (abs(np_inc - delta)) < potential_vector_size ? potential_buffer[potential_offset + abs(np_inc - delta)] : 1000.0;
+            energy_of_delta -= potential_buffer[potential_offset + abs(np_inc)];
+        }
+    }
+
+    // metropolis accept
+    bool accept_move = false;
+    if (energy_of_delta < 0.0) {
+        accept_move = true;
+    } else {
+        float boltzman_weight = energy_of_delta < 100.0 ? exp(-energy_of_delta) : 0.0;
+        accept_move = (rng < boltzman_weight);
+    }
+
+    if (accept_move) {
+        for (int i = 0; i < bounds[plane_one]; i++) {
+            for (int j = 0; j < bounds[plane_two]; j++) {
+                // Iterate over plane
+                int offset = i*strides[plane_one] + j*strides[plane_two];
+                plaquette_buffer[replica_offset + plane_index_offset + offset + plaquette_type] += delta;
+                plaquette_buffer[replica_offset + plane_index_offset_inc + offset + plaquette_type] -= delta;
             }
-        }
-    }
-
-    float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
-    float total_weight = 0.0;
-    for (int i = 0; i < 3; i++) {
-        float pot = boltzman_weights[i] - min_potential;
-        boltzman_weights[i] = (pot < 100.0) ? exp(-pot) : 0.0;
-        total_weight += boltzman_weights[i];
-    }
-
-    float rng = rng_buffer[globalThreadNum] * total_weight;
-    int j;
-    for (j = 0; j < 3; j++) {
-        rng -= boltzman_weights[j];
-        if (rng <= 0.0) {
-            break;
-        }
-    }
-
-    int delta = j-1;
-    for (int i = 0; i < bounds[plane_one]; i++) {
-        for (int j = 0; j < bounds[plane_two]; j++) {
-            // Iterate over plane
-            int offset = i*strides[plane_one] + j*strides[plane_two];
-            plaquette_buffer[replica_offset + plane_index_offset + offset + plaquette_type] += delta;
-            plaquette_buffer[replica_offset + plane_index_offset_inc + offset + plaquette_type] -= delta;
         }
     }
 }
@@ -825,45 +828,48 @@ extern "C" __global__ void global_update_sweep(int* plaquette_buffer,
 
     int plane_index_offset = a_index * strides[indexed_dim_one] + b_index * strides[indexed_dim_two];
 
-    float boltzman_weights[3] = {0.0,0.0,0.0};
+    // Choose metropolis proposal.
+    float rng = 2 * rng_buffer[globalThreadNum];
+    int delta = 0;
+    if ( rng <= 1.0 ) {
+        delta = 1;
+    } else {
+        delta = -1;
+        rng = rng - 1.0;
+    }
+
+    float energy_of_delta = 0.0;
     for (int i = 0; i < bounds[plane_one]; i++) {
         for (int j = 0; j < bounds[plane_two]; j++) {
             // Iterate over plane
             int offset = i*strides[plane_one] + j*strides[plane_two];
             int np = plaquette_buffer[replica_offset + plane_index_offset + offset + p];
-            for (int k = 0; k < 3; k++) {
-                boltzman_weights[k] += (abs(np+k-1) < potential_vector_size) ? potential_buffer[potential_offset + abs(np+k-1)] : 1000.0;
-            }
+            int new_np = np + delta;
+            energy_of_delta += (abs(new_np) < potential_vector_size) ? potential_buffer[potential_offset + abs(new_np)] : 1000.0;
+            energy_of_delta -= potential_buffer[potential_offset + abs(np)];
         }
     }
+
     // Add chemical potential
     int plane_area_per_type[] = {t*x, t*y, t*z, x*y, x*z, y*z};
-    boltzman_weights[0] += chemical_potential_buffer[potential_index] * plane_area_per_type[p];
-    boltzman_weights[2] -= chemical_potential_buffer[potential_index] * plane_area_per_type[p];
+    energy_of_delta -= delta * chemical_potential_buffer[potential_index] * plane_area_per_type[p];
 
-    float min_potential = min(min(boltzman_weights[0], boltzman_weights[1]), boltzman_weights[2]);
-    float total_weight = 0.0;
-    for (int i = 0; i < 3; i++) {
-        float pot = boltzman_weights[i] - min_potential;
-        boltzman_weights[i] = (pot < 100.0) ? exp(-pot) : 0.0;
-        total_weight += boltzman_weights[i];
+    // metropolis accept
+    bool accept_move = false;
+    if (energy_of_delta < 0.0) {
+        accept_move = true;
+    } else {
+        float boltzman_weight = energy_of_delta < 100.0 ? exp(-energy_of_delta) : 0.0;
+        accept_move = (rng < boltzman_weight);
     }
 
-    float rng = rng_buffer[globalThreadNum] * total_weight;
-    int j;
-    for (j = 0; j < 3; j++) {
-        rng -= boltzman_weights[j];
-        if (rng <= 0.0) {
-            break;
-        }
-    }
-
-    int delta = j-1;
-    for (int i = 0; i < bounds[plane_one]; i++) {
-        for (int j = 0; j < bounds[plane_two]; j++) {
-            // Iterate over plane
-            int offset = i*strides[plane_one] + j*strides[plane_two];
-            plaquette_buffer[replica_offset + plane_index_offset + offset + p] += delta;
+    if (accept_move) {
+        for (int i = 0; i < bounds[plane_one]; i++) {
+            for (int j = 0; j < bounds[plane_two]; j++) {
+                // Iterate over plane
+                int offset = i*strides[plane_one] + j*strides[plane_two];
+                plaquette_buffer[replica_offset + plane_index_offset + offset + p] += delta;
+            }
         }
     }
 }
@@ -1138,16 +1144,18 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
     int coords[4] = {t_index, x_index, y_index, z_index};
     int bounds[4] = {t, x, y, z};
 
-    // This starts as potentials, but changes to weights later
-    // Ideally would pick a larger number, but numerical imprecision can
-    // Lead to jumps of up to MAX_DELTA.
-    const int MAX_DELTA = 1;
-    float boltzman_weights[2*MAX_DELTA + 1];
-    for (int i = 0; i < 2*MAX_DELTA + 1; i++) {
-        boltzman_weights[i] = 0.0;
+    // Choose metropolis proposal.
+    float rng = 2 * rng_buffer[globalThreadNum];
+    int delta = 0;
+    if ( rng <= 1.0 ) {
+        delta = 1;
+    } else {
+        delta = -1;
+        rng = rng - 1.0;
     }
 
-    // Calculate potentials into boltzman_weights
+    // Calculate potentials
+    float energy_of_delta = 0.0;
     int potential_index = potential_redirect[replica_index];
     int potential_offset = potential_index * potential_vector_size;
     for (int i = 0; i<3; i++) {
@@ -1156,50 +1164,37 @@ extern "C" __global__ void single_local_update_plaquettes(int* plaquette_buffer,
         int coord_up_index = calculate_index_up_difference(bounds[normal_dim], coords[normal_dim], coords_delta[normal_dim]) + coord_index;
         int np = plaquette_buffer[replica_offset + coord_index*6 + plaquette_type];
         int np_up = plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type];
-        for (int delta = -MAX_DELTA; delta <= MAX_DELTA; delta++) {
-            int new_np = np + delta * sign_convention[cube_type][plaquette_type];
-            int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
-            boltzman_weights[delta+MAX_DELTA] += (abs(new_np) < potential_vector_size) ? potential_buffer[potential_offset + abs(new_np)] : 1000.0;
-            boltzman_weights[delta+MAX_DELTA] += (abs(new_np_up) < potential_vector_size) ? potential_buffer[potential_offset + abs(new_np_up)] : 1000.0;
-            // We dont need chemical potential since we always add as many even as odd increments.
-        }
-    }
-
-    float min_potential = boltzman_weights[0];
-    for (int i = 1; i <2*MAX_DELTA+1; i++) {
-        min_potential = min(min_potential, boltzman_weights[i]);
-    }
-
-    float total_weight = 0.0;
-    for (int i = 0; i < 2*MAX_DELTA+1; i++) {
-        float pot = boltzman_weights[i] - min_potential;
-        boltzman_weights[i] = pot < 100.0 ? exp(-pot) : 0.0;
-        total_weight += boltzman_weights[i];
-    }
-
-    // Now they are boltzman weights
-
-    float rng = rng_buffer[globalThreadNum] * total_weight;
-    int j;
-    for (j = 0; j < 2*MAX_DELTA+1; j++) {
-        rng -= boltzman_weights[j];
-        if (rng <= 0.0) {
-            break;
-        }
-    }
-
-    int delta = j-MAX_DELTA;
-
-    for (int i = 0; i<3; i++) {
-        int plaquette_type = planes_for_cube[cube_type][i];
-        int normal_dim = normal_dim_for_cube_planeindex[cube_type][i];
-        int coord_up_index = calculate_index_up_difference(bounds[normal_dim], coords[normal_dim], coords_delta[normal_dim]) + coord_index;
-        int np = plaquette_buffer[replica_offset + coord_index*6 + plaquette_type];
-        int np_up = plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type];
+        // Now the energy change.
         int new_np = np + delta * sign_convention[cube_type][plaquette_type];
         int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
+        energy_of_delta += (abs(new_np) < potential_vector_size) ? potential_buffer[potential_offset + abs(new_np)] : 1000.0;
+        energy_of_delta -= potential_buffer[potential_offset + abs(np)];
+        energy_of_delta += (abs(new_np_up) < potential_vector_size) ? potential_buffer[potential_offset + abs(new_np_up)] : 1000.0;
+        energy_of_delta -= potential_buffer[potential_offset + abs(np_up)];
+        // We dont need chemical potential since we always add as many even as odd increments.
+    }
 
-        plaquette_buffer[replica_offset + coord_index*6 + plaquette_type] = new_np;
-        plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type] = new_np_up;
+    // metropolis accept
+    bool accept_move = false;
+    if (energy_of_delta < 0.0) {
+        accept_move = true;
+    } else {
+        float boltzman_weight = energy_of_delta < 100.0 ? exp(-energy_of_delta) : 0.0;
+        accept_move = (rng < boltzman_weight);
+    }
+
+    if (accept_move) {
+        for (int i = 0; i<3; i++) {
+            int plaquette_type = planes_for_cube[cube_type][i];
+            int normal_dim = normal_dim_for_cube_planeindex[cube_type][i];
+            int coord_up_index = calculate_index_up_difference(bounds[normal_dim], coords[normal_dim], coords_delta[normal_dim]) + coord_index;
+            int np = plaquette_buffer[replica_offset + coord_index*6 + plaquette_type];
+            int np_up = plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type];
+            int new_np = np + delta * sign_convention[cube_type][plaquette_type];
+            int new_np_up = np_up - delta * sign_convention[cube_type][plaquette_type];
+
+            plaquette_buffer[replica_offset + coord_index*6 + plaquette_type] = new_np;
+            plaquette_buffer[replica_offset + coord_up_index*6 + plaquette_type] = new_np_up;
+        }
     }
 }

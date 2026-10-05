@@ -2241,7 +2241,11 @@ mod tests {
             None,
             None,
         )?;
-        state.run_global_update_sweep()?;
+
+        // Metropolis updates need to randomly choose the correct direction.
+        for _ in 0..32 {
+            state.run_global_update_sweep()?;
+        }
 
         let plaqs = state.get_plaquettes()?;
         // We should get global planes in replica 0 and nowhere else.
@@ -2460,27 +2464,19 @@ mod tests {
         let (r, d) = (3, 4);
 
         let mut initial_state = Array6::zeros((r, d, d, d, d, 6));
-        initial_state
-            .axis_iter_mut(Axis(0))
-            .enumerate()
-            .for_each(|(rr, mut x)| {
-                for i in 0..rr {
-                    x.slice_mut(s![.., .., i, i, 0])
-                        .iter_mut()
-                        .for_each(|x| *x = 1);
-                }
-            });
         let state = DualState::new_plaquettes(initial_state.clone());
         let mut state = CudaBackend::new(
             SiteIndex::new(d, d, d, d),
-            make_custom_simple_potentials(r, 4, |_, _| 0.0),
+            make_custom_simple_potentials(r, 2, |_, _| 0.0),
             Some(state),
             Some(31415),
             None,
             Some(Array1::from_vec((0..r).map(|_| 5.0).collect())),
         )?;
 
-        state.run_global_update_sweep()?;
+        for _ in 0..32 {
+            state.run_global_update_sweep()?;
+        }
 
         let initial_rep_winds = initial_state
             .sum_axis(Axis(1))
@@ -2509,27 +2505,19 @@ mod tests {
         let (r, d) = (3, 4);
 
         let mut initial_state = Array6::zeros((r, d, d, d, d, 6));
-        initial_state
-            .axis_iter_mut(Axis(0))
-            .enumerate()
-            .for_each(|(rr, mut x)| {
-                for i in 0..rr {
-                    x.slice_mut(s![.., .., i, i, 0])
-                        .iter_mut()
-                        .for_each(|x| *x = 1);
-                }
-            });
         let state = DualState::new_plaquettes(initial_state.clone());
         let mut state = CudaBackend::new(
             SiteIndex::new(d, d, d, d),
-            make_custom_simple_potentials(r, 4, |_, _| 0.0),
+            make_custom_simple_potentials(r, 2, |_, _| 0.0),
             Some(state),
             Some(31415),
             None,
             Some(Array1::from_vec((0..r).map(|_| -5.0).collect())),
         )?;
 
-        state.run_global_update_sweep()?;
+        for _ in 0..32 {
+            state.run_global_update_sweep()?;
+        }
 
         let initial_rep_winds = initial_state
             .sum_axis(Axis(1))
@@ -2794,7 +2782,10 @@ mod tests {
         let windings = state.get_winding_per_replica()?;
         assert_eq!(windings, arr2(&[[2, 0, 0, 0, 0, 0]]));
 
-        state.run_plane_shift_with_offset(0, false)?;
+        // Run enough times for metropolis to choose the right update direction.
+        for _ in 0..32 {
+            state.run_plane_shift_with_offset(0, false)?;
+        }
 
         let windings = state.get_winding_per_replica()?;
         assert_eq!(windings, arr2(&[[2, 0, 0, 0, 0, 0]]));
