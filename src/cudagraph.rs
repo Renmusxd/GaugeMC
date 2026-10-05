@@ -432,7 +432,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(self.nreplicas as u32))
+                .launch(Self::get_launch_config(self.nreplicas as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -488,7 +488,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(self.nreplicas as u32))
+                .launch(Self::get_launch_config(self.nreplicas as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -559,7 +559,7 @@ impl CudaBackend {
                 builder.arg(&yz);
                 unsafe {
                     builder
-                        .launch(LaunchConfig::for_num_elems(self.nreplicas as u32))
+                        .launch(Self::get_launch_config(self.nreplicas as u32))
                         .map_err(CudaError::from)
                 }?;
 
@@ -599,7 +599,7 @@ impl CudaBackend {
                 builder.arg(&yz);
                 unsafe {
                     builder
-                        .launch(LaunchConfig::for_num_elems(self.nreplicas as u32))
+                        .launch(Self::get_launch_config(self.nreplicas as u32))
                         .map_err(CudaError::from)
                 }?;
 
@@ -959,7 +959,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(update_planes as u32))
+                .launch(Self::get_launch_config(update_planes as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -985,7 +985,7 @@ impl CudaBackend {
 
         let (t, x, y, z) = (self.bounds.t, self.bounds.x, self.bounds.y, self.bounds.z);
         let planes = [y * z, x * z, x * y, t * z, t * y, t * x];
-        let needed_threads = planes[plaquette_type as usize] / 2;
+        let needed_threads = self.nreplicas * planes[plaquette_type as usize] / 2;
 
         // Can we not subslice it?
         self.cuda_rng
@@ -1010,7 +1010,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(needed_threads as u32))
+                .launch(Self::get_launch_config(needed_threads as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -1039,7 +1039,7 @@ impl CudaBackend {
         builder.arg(&self.bounds.z);
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                .launch(Self::get_launch_config(threads_to_sum as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -1124,7 +1124,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(num_threads as u32))
+                .launch(Self::get_launch_config(num_threads as u32))
                 .map_err(CudaError::from)
         }?;
         Ok(())
@@ -1183,7 +1183,7 @@ impl CudaBackend {
         builder.arg(&self.bounds.z);
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                .launch(Self::get_launch_config(threads_to_sum as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -1200,7 +1200,7 @@ impl CudaBackend {
         builder.arg(&num_steps);
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                .launch(Self::get_launch_config(threads_to_sum as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -1257,7 +1257,7 @@ impl CudaBackend {
         builder.arg(&self.bounds.z);
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                .launch(Self::get_launch_config(threads_to_sum as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -1272,7 +1272,7 @@ impl CudaBackend {
             builder.arg(&n);
             unsafe {
                 builder
-                    .launch(LaunchConfig::for_num_elems(threads_to_sum as u32))
+                    .launch(Self::get_launch_config(threads_to_sum as u32))
                     .map_err(CudaError::from)
             }?;
         }
@@ -1350,7 +1350,7 @@ impl CudaBackend {
         builder.arg(&self.bounds.z);
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(n as u32))
+                .launch(Self::get_launch_config(n as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -1390,7 +1390,7 @@ impl CudaBackend {
         builder.arg(&self.bounds.z);
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(n as u32))
+                .launch(Self::get_launch_config(n as u32))
                 .map_err(CudaError::from)
         }?;
 
@@ -1447,7 +1447,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(num_edges as u32))
+                .launch(Self::get_launch_config(num_edges as u32))
                 .map_err(CudaError::from)
         }
         .map(|_| ())
@@ -1477,7 +1477,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(num_sites as u32))
+                .launch(Self::get_launch_config(num_sites as u32))
                 .map_err(CudaError::from)
         }
         .map(|_| ())
@@ -1505,7 +1505,7 @@ impl CudaBackend {
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(num_edges as u32))
+                .launch(Self::get_launch_config(num_edges as u32))
                 .map_err(CudaError::from)
         }
         .map(|_| ())
